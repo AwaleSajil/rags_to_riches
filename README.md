@@ -97,53 +97,49 @@ graph TD
 
 ## Quick Start
 
-### Option 1: Docker (Recommended)
+### Docker (Recommended)
 
-1. **Run the application**
-   ```bash
-   ./docker-run.sh
-   ```
-   Choose option 1 to build and run.
+```bash
+./docker-run.sh
+```
+Choose option 1 to build and run, then open http://localhost:8501
 
-2. **Access the app**
-   Open browser: http://localhost:8501
+### Local Development
 
-3. **Enter your API key**
-   - Select your LLM provider (Google or OpenAI)
-   - Choose your model
-   - Enter your API key in the sidebar
-   - Click "Authenticate"
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-**Note:** No `.env` file is required! API keys are entered through the web interface.
+Open http://localhost:8501
 
-### Option 2: Local Development
+## Getting Started Resources
 
-1. **Install dependencies**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
+### 📚 API Keys
+- **Google Gemini**: [Get API key from Google AI Studio](https://aistudio.google.com/app/apikey)
+- **OpenAI**: [Get API key from OpenAI Platform](https://platform.openai.com/api-keys)
 
-2. **Run Streamlit app**
-   ```bash
-   streamlit run app.py
-   ```
-
-3. **Access the app**
-   Open browser: http://localhost:8501
+### 📥 Download Transaction History
+- **Chase Credit Card**: [Video Guide](https://www.youtube.com/watch?v=gtAFaP9Lts8)
+- **Discover Credit Card**: [Video Guide](https://www.youtube.com/watch?v=cry6-H5b0PQ)
 
 ## Usage
 
-1. **Authenticate**: Enter your API key in the sidebar
-2. **Upload CSV**: Upload one or more transaction CSV files
-3. **Ask Questions**: Chat with your financial data:
-   - "How much did I spend on restaurants last month?"
-   - "What are my largest expenses?"
-   - "Show me all transactions over $100"
-   - "Analyze my spending patterns"
+1. Enter your API key in the sidebar
+2. Upload CSV transaction files
+3. Ask questions in natural language
 
-## CSV Format Support
+### Example Questions
+
+- "How much did I spend on restaurants last month?"
+- "What are my top 5 spending categories?"
+- "Show me all transactions over $100"
+- "Find all Starbucks transactions"
+- "Analyze my spending patterns"
+
+## Supported CSV Formats
 
 MoneyRAG automatically handles different CSV formats including:
 - **Chase Bank**: Negative values for spending
@@ -153,97 +149,20 @@ MoneyRAG automatically handles different CSV formats including:
 Required information (can have any column names):
 - Date
 - Merchant/Description
-- Amount
-- Category (optional)
+- ASupported CSV Formats
 
-## Project Structure
-
-```
-money_rag/
-├── app.py                 # Streamlit UI
-├── money_rag.py          # Core RAG engine
-├── mcp_server.py         # MCP server with tools
-├── requirements.txt      # Python dependencies
-├── Dockerfile           # Container definition
-├── docker-compose.yml   # Docker orchestration
-├── docker-run.sh        # Helper script
-└── utils/
-    └── data_ingestion.py # Data processing utilities
-```
-
-## Docker Commands
-
-### Using the Helper Script
-```bash
-./docker-run.sh
-```
-Interactive menu with options:
-- Build and run
-- Start/stop
-- View logs
-- Clean up
-
-### Manual Docker Compose Commands
-
-**Build and start:**
-```bash
-docker-compose up -d --build
-```
-
-**Stop:**
-```bash
-docker-compose down
-```
-
-**View logs:**
-```bash
-docker-compose logs -f
-```
-
-**Rebuild after code changes:**
-```bash
-docker-compose build --no-cache
-docker-compose up -d
-```
+MoneyRAG automatically handles different CSV formats:
+- Chase Bank, Discover, and custom formats
+- LLM-based column mapping (works with any column names)
+- Required: Date, Merchant/Description, Amount
 
 ## Configuration
 
-### API Keys
+**Supported Models:**
+- Google: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-1.5-pro
+- OpenAI: gpt-4o, gpt-4o-mini
 
-**API keys are entered through the Streamlit UI** - no environment variables needed!
-
-For standalone MCP server or development, optionally create a `.env` file:
-```bash
-cp .env.example .env
-# Edit with your keys (optional)
-```
-
-### Supported Models
-
-**Google (via Google AI Studio):**
-- gemini-2.0-flash-exp
-- gemini-1.5-flash
-- gemini-1.5-pro
-
-**OpenAI:**
-- gpt-4o
-- gpt-4o-mini
-
-### Data Storage
-
-- **SQLite**: Structured transaction data (session-based)
-- **Qdrant**: Vector embeddings for semantic search (session-based)
-- **Temporary**: All data is ephemeral per session
-
-## Troubleshooting
-
-### Container won't start
-```bash
-docker-compose logs
-```
-
-### Check container health
-```bash
+**Note:** API keys entered through UI, no environment variables needed.
 docker ps
 docker inspect money-rag-app | grep Health
 ```
@@ -328,19 +247,43 @@ python -c "from money_rag import MoneyRAG; ..."
 
 ## Technologies
 
-- **LangChain**: Agent orchestration and tool integration
-- **LangGraph**: Conversational agent with memory
-- **MCP**: Model Context Protocol via langchain-mcp-adapters
-- **Qdrant**: Vector database for semantic search
-- **SQLite**: Relational database for structured queries
-- **Streamlit**: Web UI framework
-- **FastMCP**: MCP server implementation
-- **DuckDuckGo**: Web search for merchant enrichment
+**Core Framework:**
+- **LangChain** (>=1.2.3): Agent orchestration and tool integration
+- **LangGraph** (>=1.0.6): Conversational agent with memory
+- **langchain-mcp-adapters** (>=0.2.1): Model Context Protocol integration
+
+**LLM Providers:**
+- **langchain-google-genai** (>=2.0.0): Google Gemini integration
+- **langchain-openai** (>=1.1.7): OpenAI GPT integration
+
+**Storage & Search:**
+- **Qdrant** (>=1.16.2): Vector database for semantic search
+- **SQLite** (via SQLAlchemy >=2.0.45): Relational database for structured queries
+
+**Tools & Services:**
+- **FastMCP** (>=2.14.3): MCP server implementation
+- **DuckDuckGo Search** (>=8.1.1): Web search for merchant enrichment
+**Container issues:**
+```bash
+docker-compose logs
+docker-compose down -v  # Reset everything
+./docker-run.sh         # Rebuild
+```
+
+**Permission issues:**
+```bash
+chmod +x docker-run.sh
+```
+
+## Technologies
+
+- **LangChain & LangGraph**: Agent orchestration
+- **Google Gemini / OpenAI GPT**: LLM providers
+- **Qdrant**: Vector database
+- **SQLite**: Structured storage
+- **FastMCP**: Model Context Protocol
+- **Streamlit**: Web interface
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Please open an issue or submit a pull request.
