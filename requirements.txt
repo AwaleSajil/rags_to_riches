@@ -1,0 +1,9 @@
+python-dotenv
+langchain
+langchain-openai
+pandas
+tabulate
+langchain-google-vertexai
+mcp 
+langchain-mcp
+langchain-community
