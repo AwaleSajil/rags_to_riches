@@ -6,55 +6,66 @@ from qdrant_client import QdrantClient
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from dotenv import load_dotenv
 import os
+from typing import Optional
 
 import shutil
+
+from textwrap import dedent
 
 # Load environment variables (API keys, etc.)
 load_dotenv()
 
 # Define paths to your data
-# For Hugging Face Spaces (Ephemeral):
-# We use a temporary directory that gets wiped on restart.
-# If DATA_DIR is set (e.g., by your deployment config), use it.
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_data"))
-QDRANT_PATH = os.path.join(DATA_DIR, "qdrant_db")
-DB_PATH = os.path.join(DATA_DIR, "money_rag.db")
 
 # Initialize the MCP Server
 mcp = FastMCP("Money RAG Financial Analyst")
 
-import sqlite3
+import psycopg2
+from supabase import create_client, Client
+
+def get_db_connection():
+    """Returns a psycopg2 connection to Supabase Postgres."""
+    # Supabase provides postgres connection strings, but typically doesn't default in plain OS vars unless you build it
+    # Supabase gives a postgres:// connection string in the dashboard under Database Settings.
+    # Alternatively we can build it manually or just use the Supabase python client.
+    # To support raw LLM SQL, we use psycopg2 instead of Supabase client.
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL must be defined to construct raw SQL connections.")
+    return psycopg2.connect(db_url)
+
+def get_current_user_id() -> str:
+    user_id = os.environ.get("CURRENT_USER_ID")
+    if not user_id:
+        raise ValueError("CURRENT_USER_ID not injected into MCP environment!")
+    return user_id
 
 def get_schema_info() -> str:
-    """Get database schema information."""
-    if not os.path.exists(DB_PATH):
-        return "Database file does not exist yet. Please upload data."
+    """Get database schema information for Postgres tables."""
+    return dedent("""
+    Here is the PostgreSQL database schema for the authenticated user's data.
+    
+    CRITICAL RULE:
+    You MUST add `WHERE user_id = '{current_user_id}'` to EVERY SINGLE query you write.
+    Never query data without filtering by user_id!
+    
+    TABLE: "Transaction"
+    Columns:
+      - id (UUID)
+      - user_id (UUID)
+      - trans_date (DATE)
+      - description (TEXT)
+      - amount (DECIMAL)
+      - category (VARCHAR)
 
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        # Get all tables
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-
-        schema_info = []
-        for (table_name,) in tables:
-            schema_info.append(f"\nTable: {table_name}")
-
-            # Get column info for each table
-            cursor.execute(f"PRAGMA table_info({table_name});")
-            columns = cursor.fetchall()
-
-            schema_info.append("Columns:")
-            for col in columns:
-                col_id, col_name, col_type, not_null, default_val, pk = col
-                schema_info.append(f"  - {col_name} ({col_type})")
-
-        conn.close()
-        return "\n".join(schema_info)
-    except Exception as e:
-        return f"Error reading schema: {e}"
+    TABLE: "TransactionDetail"
+    Columns:
+      - id (UUID)
+      - transaction_id (UUID)
+      - item_description (TEXT)
+      - item_total_price (DECIMAL)
+    """)
 
 
 @mcp.resource("schema://database/tables")
@@ -64,7 +75,17 @@ def get_database_schema() -> str:
 
 @mcp.tool()
 def query_database(query: str) -> str:
-    """Execute a SELECT query on the money_rag SQLite database.
+    """
+    Execute a raw SQL query against the Postgres database.
+    The main table is named "Transaction" (you MUST INCLUDE QUOTES in your SQL!).
+    IMPORTANT STRICT SCHEMA:
+    - id (UUID)
+    - user_id (UUID text)
+    - trans_date (DATE)
+    - description (TEXT)
+    - amount (NUMERIC)
+    - category (TEXT)
+    - enriched_info (TEXT)
 
     Args:
         query: The SQL SELECT query to execute
@@ -78,33 +99,32 @@ def query_database(query: str) -> str:
     - 'amount' column: positive values = spending, negative values = payments/refunds
 
     Example queries:
-    - Find Walmart spending: SELECT SUM(amount) FROM transactions WHERE description LIKE '%Walmart%' AND amount > 0;
-    - List recent transactions: SELECT transaction_date, description, amount, category FROM transactions ORDER BY transaction_date DESC LIMIT 5;
-    - Spending by category: SELECT category, SUM(amount) FROM transactions WHERE amount > 0 GROUP BY category;
+    - Find Walmart spending: SELECT SUM(amount) FROM "Transaction" WHERE description LIKE '%Walmart%' AND amount > 0;
+    - List recent transactions: SELECT trans_date, description, amount, category FROM "Transaction" ORDER BY trans_date DESC LIMIT 5;
+    - Spending by category: SELECT category, SUM(amount) FROM "Transaction" WHERE amount > 0 GROUP BY category;
     """
-    if not os.path.exists(DB_PATH):
-        return "Database file does not exist yet. Please upload data."
-
     # Security: Only allow SELECT queries
     query_upper = query.strip().upper()
-    if not query_upper.startswith("SELECT") and not query_upper.startswith("PRAGMA"):
-        return "Error: Only SELECT and PRAGMA queries are allowed"
+    if not query_upper.startswith("SELECT") and not query_upper.startswith("WITH"):
+        return "Error: Only SELECT queries are allowed"
 
     # Forbidden operations
-    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE", "ATTACH", "DETACH"]
-    # Check for forbidden words as standalone words to avoid false positives (e.g. "update_date" column)
-    # Simple check: space-surrounded or end-of-string
+    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE"]
     if any(f" {word} " in f" {query_upper} " for word in forbidden):
         return f"Error: Query contains forbidden operation. Only SELECT queries allowed."
 
+    user_id = get_current_user_id()
+    if user_id not in query:
+        return f"Error: You forgot to include the security filter (WHERE user_id = '{user_id}') in your query! Try again."
+
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(query)
         results = cursor.fetchall()
         
         # Get column names to make result more readable
-        column_names = [description[0] for description in cursor.description] if cursor.description else []
+        column_names = [desc[0] for desc in cursor.description] if cursor.description else []
         
         conn.close()
 
@@ -118,28 +138,20 @@ def query_database(query: str) -> str:
             formatted_results.append(str(row))
 
         return "\n".join(formatted_results)
-    except sqlite3.Error as e:
-        return f"Error: {str(e)}"
+    except psycopg2.Error as e:
+        return f"Database Error: {str(e)}"
 
 def get_vector_store():
     """Initialize connection to the Qdrant vector store"""
     # Initialize Embedding Model using Google AI Studio
-    embeddings = GoogleGenerativeAIEmbeddings(model="text-embedding-004")
+    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
-    # Connect to Qdrant (Persistent Disk Mode at specific path)
-    # We ensure the directory exists so Qdrant can write to it.
-    os.makedirs(QDRANT_PATH, exist_ok=True)
+    # Connect to Qdrant Cloud
+    client = QdrantClient(
+        url=os.getenv("QDRANT_URL"),
+        api_key=os.getenv("QDRANT_API_KEY"),
+    )
     
-    client = QdrantClient(path=QDRANT_PATH)
-    
-    # Check if collection exists (it might be empty in a new ephemeral session)
-    collections = client.get_collections().collections
-    collection_names = [c.name for c in collections]
-    
-    if "transactions" not in collection_names:
-        # In a real app, you would probably trigger ingestion here or handle the empty state
-        pass
-
     return QdrantVectorStore(
         client=client,
         collection_name="transactions",
@@ -159,20 +171,22 @@ def semantic_search(query: str, top_k: int = 5) -> str:
         top_k: Number of results to return (default 5).
     """
     try:
+        user_id = get_current_user_id()
         vector_store = get_vector_store()
         
-        # Safety check: if no data has been ingested yet
-        if not os.path.exists(QDRANT_PATH) or not os.listdir(QDRANT_PATH):
-             return "No matching transactions found (Database is empty. Please upload data first)."
+        # Apply strict multi-tenant filtering based on the payload we injected in money_rag.py
+        from qdrant_client.http import models
+        filter = models.Filter(
+            must=[models.FieldCondition(key="metadata.user_id", match=models.MatchValue(value=user_id))]
+        )
 
-        results = vector_store.similarity_search(query, k=top_k)
+        results = vector_store.similarity_search(query, k=top_k, filter=filter)
         
         if not results:
             return "No matching transactions found."
             
         output = []
         for doc in results:
-            # Format the output clearly for the LLM/User
             amount = doc.metadata.get('amount', 'N/A')
             date = doc.metadata.get('transaction_date', 'N/A')
             output.append(f"Date: {date} | Match: {doc.page_content} | Amount: {amount}")
@@ -184,25 +198,29 @@ def semantic_search(query: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
-def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_col: str, title: str) -> str:
+def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_col: str, title: str, color_col: Optional[str] = None) -> str:
     """
-    Generate an interactive Plotly chart from the money_rag SQLite database.
-    Use this proactively whenever a visual representation of data would be helpful.
-    
-    CRITICAL INSTRUCTIONS:
-    1. Write a valid SQLite SELECT query. 
-    2. Aggregate data appropriately (e.g., use GROUP BY for pie/bar charts).
-    3. Pass the exact column names from your query to x_col and y_col.
-    
+    Generate an interactive Plotly chart using SQL data.
+    IMPORTANT: The table name MUST be "Transaction" exactly with quotes.
+
     Args:
-        sql_query: The SQL SELECT query (e.g. "SELECT category, SUM(amount) as total FROM transactions GROUP BY category")
-        chart_type: Must be exactly "bar", "pie", or "line"
-        x_col: Column name from query for X-axis (or labels for pie)
-        y_col: Column name from query for Y-axis (or values for pie)
-        title: Title of the chart
+        sql_query: The SQL SELECT query to retrieve the data for the chart from the "Transaction" table.
+            - Must use 'user_id' filter.
+        chart_type: The type of chart: 'bar', 'line', 'pie', 'scatter'
+        x_col: The name of the column to use for the X axis (or labels for pie charts)
+        y_col: The name of the column to use for the Y axis (or values for pie charts)
+        title: The title of the chart
+        color_col: (Optional) Column to use for color grouping
+
+    Returns:
+        A natural language summary confirming chart generation.
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
+        user_id = get_current_user_id()
+        if user_id not in sql_query:
+            return f'{{"error": "You forgot the WHERE user_id = \\"{user_id}\\" security clause!"}}'
+            
+        conn = get_db_connection()
         df = pd.read_sql_query(sql_query, conn)
         conn.close()
         if df.empty:
@@ -226,17 +244,7 @@ def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_co
         return f'{{"error": "Failed to generate chart: {str(e)}"}}'
 
 
-# A helper to clear data (useful for session reset)
-@mcp.tool()
-def clear_database() -> str:
-    """Clear all stored transaction data to reset the session."""
-    try:
-        if os.path.exists(DATA_DIR):
-            shutil.rmtree(DATA_DIR)
-            os.makedirs(DATA_DIR)
-        return "Database cleared successfully."
-    except Exception as e:
-        return f"Error clearing database: {e}"
+
 
 if __name__ == "__main__":
     # Runs the server over stdio

@@ -3,129 +3,565 @@ import asyncio
 import os
 import json
 import plotly.io as pio
+from supabase import create_client, Client, ClientOptions
+from dotenv import load_dotenv
+
 from money_rag import MoneyRAG
 
-st.set_page_config(page_title="MoneyRAG", layout="wide")
+load_dotenv()
 
-# Sidebar for Authentication
-with st.sidebar:
-    st.header("Authentication")
-    provider = st.selectbox("LLM Provider", ["Google", "OpenAI"])
-    
-    if provider == "Google":
-        models = ["gemini-3-flash-preview", "gemini-3-pro-image-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
-        embeddings = ["gemini-embedding-001"]
-    else:
-        models = ["gpt-5-mini", "gpt-5-nano", "gpt-4o-mini", "gpt-4o"]
-        embeddings = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"]
-        
-    model_name = st.selectbox("Choose Decoder Model", models)
-    embed_name = st.selectbox("Choose Embedding Model", embeddings)
-    api_key = st.text_input("API Key", type="password")
-    
-    auth_button = st.button("Authenticate")
-    if auth_button and api_key:
-        st.session_state.rag = MoneyRAG(provider, model_name, embed_name, api_key)
-        st.success("Authenticated!")
-    
-    st.divider()
-    st.caption("**Contributors:**")
-    st.caption("👤 [Sajil Awale](https://github.com/AwaleSajil)")
-    st.caption("👤 [Simran KC](https://github.com/iamsims)")
+st.set_page_config(page_title="MoneyRAG", layout="wide", initial_sidebar_state="expanded")
 
-# Main Window
-st.title("MoneyRAG 💰")
-st.subheader("Where is my money?")
-st.markdown("""
-This app helps you analyze your personal finances using AI. 
-Upload your bank/credit card CSV statements to chat with your data semantically.
-""")
+# Initialize Supabase Client per request (NO CACHE) to ensure thread-safe auth headers
+def get_supabase() -> Client:
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if "access_token" in st.session_state:
+        opts = ClientOptions(headers={"Authorization": f"Bearer {st.session_state.access_token}"})
+        return create_client(url, key, options=opts)
+    return create_client(url, key)
 
-# Guides Section
-col1, col2 = st.columns(2)
+supabase = get_supabase()
 
-with col1:
-    with st.expander("📚 How to get API keys"):
-        st.markdown("**Google Gemini API:**")
-        st.markdown("🔗 [Get API key from Google AI Studio](https://aistudio.google.com/app/apikey)")
-        st.markdown("")
-        st.markdown("**OpenAI API:**")
-        st.markdown("🔗 [Get API key from OpenAI Platform](https://platform.openai.com/api-keys)")
+def inject_css():
+    st.html("""
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+    /* ── Global Reset & Font ── */
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif !important;
+    }
+    #MainMenu, footer, header { visibility: hidden; }
+    .block-container { padding-top: 2rem !important; }
 
-with col2:
-    with st.expander("📥 How to download transaction history"):
-        st.markdown("**Chase Credit Card:**")
-        st.video("https://www.youtube.com/watch?v=gtAFaP9Lts8")
-        st.markdown("")
-        st.markdown("**Discover Credit Card:**")
-        st.video("https://www.youtube.com/watch?v=cry6-H5b0PQ")
+    /* ── Background ── */
+    .stApp {
+        background: #0a0a0f;
+        color: #e2e8f0;
+    }
 
-# Architecture Diagram
-with st.expander("🏗️ How MoneyRAG Works"):
-    st.image("architecture.svg", use_container_width=True)
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f0f1a 0%, #0d0d16 100%) !important;
+        border-right: 1px solid rgba(99,102,241,0.15) !important;
+    }
+    [data-testid="stSidebar"] * { color: #cbd5e1 !important; }
 
-st.divider()
+    /* ── Nav buttons ── */
+    div[data-testid="stSidebarContent"] .nav-btn > div > button {
+        width: 100% !important;
+        text-align: left !important;
+        border: none !important;
+        border-radius: 10px !important;
+        background: transparent !important;
+        color: #94a3b8 !important;
+        padding: 0.65rem 1rem !important;
+        font-size: 0.9rem !important;
+        font-weight: 500 !important;
+        transition: all 0.2s ease !important;
+        margin-bottom: 2px !important;
+    }
+    div[data-testid="stSidebarContent"] .nav-btn > div > button:hover {
+        background: rgba(99,102,241,0.1) !important;
+        color: #a5b4fc !important;
+    }
+    div[data-testid="stSidebarContent"] .nav-btn-active > div > button {
+        background: linear-gradient(135deg, rgba(99,102,241,0.25), rgba(139,92,246,0.2)) !important;
+        color: #a5b4fc !important;
+        border: 1px solid rgba(99,102,241,0.3) !important;
+        font-weight: 600 !important;
+    }
 
-if "rag" in st.session_state:
-    uploaded_files = st.file_uploader("Upload CSV transactions", accept_multiple_files=True, type=['csv'])
-    
-    if uploaded_files:
-        if st.button("Ingest Data"):
-            temp_paths = []
-            for uploaded_file in uploaded_files:
-                path = os.path.join(st.session_state.rag.temp_dir, uploaded_file.name)
-                with open(path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                temp_paths.append(path)
-            
-            with st.spinner("Ingesting and vectorizing..."):
-                asyncio.run(st.session_state.rag.setup_session(temp_paths))
-            st.success("Data ready for chat!")
+    /* ── Primary Buttons ── */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+        border: none !important;
+        border-radius: 10px !important;
+        color: white !important;
+        font-weight: 600 !important;
+        padding: 0.6rem 1.2rem !important;
+        transition: all 0.2s ease !important;
+        box-shadow: 0 4px 15px rgba(99,102,241,0.3) !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 6px 20px rgba(99,102,241,0.45) !important;
+    }
 
-    # Chat Interface
-    st.divider()
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    /* ── Secondary Buttons ── */
+    .stButton > button[kind="secondary"] {
+        background: rgba(255,255,255,0.05) !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: 10px !important;
+        color: #cbd5e1 !important;
+        font-weight: 500 !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button[kind="secondary"]:hover {
+        background: rgba(255,255,255,0.08) !important;
+        border-color: rgba(99,102,241,0.35) !important;
+    }
 
-    # Helper function to cleverly render either text or a Plotly chart
-    def render_content(content):
-        # We might have mixed text and charts delimited by ===CHART=== ... ===ENDCHART===
-        if isinstance(content, str) and "===CHART===" in content:
-            parts = content.split("===CHART===")
-            # Render first text part
-            st.markdown(parts[0].strip())
-            
-            for part in parts[1:]:
-                if "===ENDCHART===" in part:
-                    chart_json, remaining_text = part.split("===ENDCHART===")
+    /* ── Inputs ── */
+    .stTextInput input, .stSelectbox > div > div {
+        background: rgba(255,255,255,0.04) !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: 10px !important;
+        color: #e2e8f0 !important;
+        transition: border 0.2s ease !important;
+    }
+    .stTextInput input:focus { border-color: #6366f1 !important; box-shadow: 0 0 0 2px rgba(99,102,241,0.2) !important; }
+
+    /* ── Glass Cards ── */
+    .glass-card {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: 1.75rem;
+        backdrop-filter: blur(12px);
+        transition: border 0.2s ease;
+    }
+    .glass-card:hover { border-color: rgba(99,102,241,0.25); }
+
+    /* ── Hero ── */
+    .hero { text-align: center; padding: 4rem 1rem 2rem; }
+    .hero .badge {
+        display: inline-block;
+        background: linear-gradient(135deg, rgba(99,102,241,0.2), rgba(139,92,246,0.2));
+        border: 1px solid rgba(99,102,241,0.35);
+        color: #a5b4fc;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        padding: 0.3rem 0.9rem;
+        border-radius: 99px;
+        margin-bottom: 1.25rem;
+    }
+    .hero h1 {
+        font-size: clamp(2.5rem, 6vw, 4rem);
+        font-weight: 800;
+        letter-spacing: -2px;
+        line-height: 1.1;
+        background: linear-gradient(135deg, #e2e8f0 30%, #a5b4fc);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 1rem;
+    }
+    .hero p { font-size: 1.1rem; color: #64748b; max-width: 440px; margin: 0 auto; line-height: 1.7; }
+
+    /* ── Divider ── */
+    hr { border-color: rgba(255,255,255,0.07) !important; }
+
+    /* ── Expanders ── */
+    [data-testid="stExpander"] {
+        background: rgba(255,255,255,0.03) !important;
+        border: 1px solid rgba(255,255,255,0.07) !important;
+        border-radius: 12px !important;
+    }
+
+    /* ── Alerts ── */
+    [data-testid="stAlert"] { border-radius: 10px !important; }
+
+    /* ── Chat bubbles ── */
+    [data-testid="stChatMessage"] { border-radius: 12px !important; }
+    </style>
+    """)
+
+def login_register_page():
+    inject_css()
+
+    st.html("""
+    <div class="hero">
+        <div class="badge">✦ AI-Powered Finance</div>
+        <h1>MoneyRAG</h1>
+        <p>Your personal finance analyst. Upload bank statements, ask questions, get insights — powered by AI.</p>
+    </div>
+    """)
+
+    col_l, col1, col2, col_r = st.columns([1, 2, 2, 1])
+
+    with col1:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.markdown("### Sign In")
+        email = st.text_input("Email", key="login_email", placeholder="you@example.com", label_visibility="collapsed")
+        password = st.text_input("Password", type="password", key="login_pass", placeholder="Password", label_visibility="collapsed")
+        if st.button("Sign In →", use_container_width=True, type="primary"):
+            if email and password:
+                with st.spinner(""):
                     try:
-                        fig = pio.from_json(chart_json.strip())
-                        st.plotly_chart(fig, use_container_width=True)
+                        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                        st.session_state.user = res.user
+                        st.session_state.access_token = res.session.access_token
+                        st.query_params["t"] = res.session.access_token
+                        try:
+                            supabase.table("User").upsert({
+                                "id": res.user.id,
+                                "email": email,
+                                "hashed_password": "managed_by_supabase_auth" 
+                            }).execute()
+                        except Exception as sync_e:
+                            print(f"Warning: Could not sync user: {sync_e}")
+                        st.rerun()
                     except Exception as e:
-                        st.error("Failed to render chart.")
-                    
-                    if remaining_text.strip():
-                        st.markdown(remaining_text.strip())
+                        st.error(f"Login failed: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with col2:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.markdown("### Create Account")
+        reg_email = st.text_input("Email", key="reg_email", placeholder="you@example.com", label_visibility="collapsed")
+        reg_password = st.text_input("Password", type="password", key="reg_pass", placeholder="Password", label_visibility="collapsed")
+        if st.button("Create Account →", use_container_width=True):
+            if reg_email and reg_password:
+                with st.spinner(""):
+                    try:
+                        res = supabase.auth.sign_up({"email": reg_email, "password": reg_password})
+                        if res.user:
+                            try:
+                                supabase.table("User").upsert({
+                                    "id": res.user.id, "email": reg_email,
+                                    "hashed_password": "managed_by_supabase_auth"
+                                }).execute()
+                            except Exception:
+                                pass
+                        st.success("Account created! Sign in on the left.")
+                    except Exception as e:
+                        st.error(f"Signup failed: {str(e)}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.divider()
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        with st.expander("📚 API Keys"):
+            st.markdown("**Google:** [AI Studio](https://aistudio.google.com/app/apikey)")
+            st.markdown("**OpenAI:** [Platform](https://platform.openai.com/api-keys)")
+    with col4:
+        with st.expander("📥 Export Transactions"):
+            st.markdown("**Chase:** [Video guide](https://www.youtube.com/watch?v=gtAFaP9Lts8)")
+            st.markdown("**Discover:** [Video guide](https://www.youtube.com/watch?v=cry6-H5b0PQ)")
+    with col5:
+        with st.expander("🏗️ Architecture"):
+            st.image("architecture.svg", use_container_width=True)
+
+def load_user_config():
+    try:
+        # Always get a fresh client with the current auth token
+        client = get_supabase()
+        res = client.table("AccountConfig").select("*").eq("user_id", st.session_state.user.id).execute()
+        if res.data:
+            return res.data[0]
+    except Exception as e:
+        print(f"Failed to load config: {e}")
+    return None
+
+def main_app_view():
+    inject_css()
+    
+    # Use session state for active nav tab
+    if "nav" not in st.session_state:
+        st.session_state.nav = "Chat"
+
+    with st.sidebar:
+        st.markdown(f"**MoneyRAG** 💰")
+        st.caption(st.session_state.user.email)
+        st.divider()
+        
+        # Modern nav buttons using st.button styled via CSS
+        for label, icon in [("Chat", "💬"), ("Ingest Data", "📥"), ("Account Config", "⚙️")]:
+            is_active = st.session_state.nav == label
+            css_class = "nav-btn-active" if is_active else "nav-btn"
+            st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
+            if st.button(f"{icon}  {label}", key=f"nav_{label}", use_container_width=True):
+                st.session_state.nav = label
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        st.divider()
+        if st.button("Log Out", use_container_width=True):
+            supabase.auth.sign_out()
+            if "t" in st.query_params:
+                del st.query_params["t"]
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+        st.divider()
+        st.caption("[Sajil Awale](https://github.com/AwaleSajil) · [Simran KC](https://github.com/iamsims)")
+
+    nav = st.session_state.nav
+
+    # Always reload config fresh (cached None from unauthenticated loads will persist otherwise)
+    config = load_user_config()
+
+    if nav == "Account Config":
+        st.header("⚙️ Account Configuration")
+        st.write("Configure your AI providers and models here.")
+        
+        current_provider = config['llm_provider'] if config else "Google"
+        current_key = config['api_key'] if config else ""
+        current_decode = config.get('decode_model', "gemini-3-flash-preview") if config else "gemini-3-flash-preview"
+        current_embed = config.get('embedding_model', "gemini-embedding-001") if config else "gemini-embedding-001"
+        # Provider Selection - Default to Google
+        provider = st.selectbox("LLM Provider", ["Google", "OpenAI"], index=0 if (not config or config['llm_provider'] == "Google") else 1)
+        
+        if provider == "Google":
+            models = ["gemini-3-flash-preview", "gemini-3-pro-image-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+            embeddings = ["gemini-embedding-001"]
         else:
-            st.markdown(content)
+            models = ["gpt-5-mini", "gpt-5-nano", "gpt-4o-mini", "gpt-4o"]
+            embeddings = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"]
 
-    # Render previous messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            render_content(message["content"])
+        with st.form("config_form"):
+            api_key = st.text_input("API Key", type="password", value=current_key)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                # Default to gemini-3 if no config exists
+                m_default_val = current_decode if config else "gemini-3-flash-preview"
+                m_idx = models.index(m_default_val) if m_default_val in models else 0
+                final_decode = st.selectbox("Select Model", models, index=m_idx)
 
-    # Handle new user input
-    if prompt := st.chat_input("Ask about your spending..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+            with col2:
+                e_idx = embeddings.index(current_embed) if (config and current_embed in embeddings) else 0
+                final_embed = st.selectbox("Select Embedding Model", embeddings, index=e_idx)
+            
+            submitted = st.form_submit_button("Save Configuration", type="primary", use_container_width=True)
+            if submitted:
+                if not api_key:
+                    st.error("API Key is required.")
+                else:
+                    try:
+                        record = {
+                            "user_id": st.session_state.user.id,
+                            "llm_provider": provider,
+                            "api_key": api_key,
+                            "decode_model": final_decode,
+                            "embedding_model": final_embed
+                        }
+                        if config:
+                            supabase.table("AccountConfig").update(record).eq("id", config['id']).execute()
+                        else:
+                            supabase.table("AccountConfig").insert(record).execute()
+                        
+                        st.session_state.user_config = load_user_config()
+                        # Reinitialize RAG with new config
+                        if "rag" in st.session_state:
+                            del st.session_state.rag
+                            
+                        st.success("Configuration saved successfully!")
+                    except Exception as e:
+                        st.error(f"Failed to save configuration: {e}")
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = asyncio.run(st.session_state.rag.chat(prompt))
-                render_content(response)
+    elif nav == "Ingest Data":
+        st.header("📥 Ingest Data")
+        
+        uploaded_files = st.file_uploader("Upload CSV transactions", accept_multiple_files=True, type=['csv'])
+        if uploaded_files:
+            if st.button("Ingest Selected Files", type="primary"):
+                if not config:
+                    st.error("Please set up your Account Config first!")
+                    return
                 
-        st.session_state.messages.append({"role": "assistant", "content": response})
+                # Initialize RAG if needed
+                if "rag" not in st.session_state:
+                    st.session_state.rag = MoneyRAG(
+                        llm_provider=config["llm_provider"], 
+                        model_name=config.get("decode_model", "gemini-2.5-pro"), 
+                        embedding_model_name=config.get("embedding_model", "gemini-embedding-001"), 
+                        api_key=config["api_key"],
+                        user_id=st.session_state.user.id,
+                        access_token=st.session_state.access_token
+                    )
 
-else:
-    st.info("Please authenticate in the sidebar to start.")
+                csv_files_info = []
+                user_id = st.session_state.user.id
+                
+                with st.spinner("Uploading to Supabase Storage & Processing..."):
+                    for uploaded_file in uploaded_files:
+                        # 1. Save temp locally for pandas parsing
+                        local_path = os.path.join(st.session_state.rag.temp_dir, uploaded_file.name)
+                        with open(local_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        
+                        # 2. Upload raw file to Supabase Object Storage
+                        s3_key = f"{user_id}/csvs/{uploaded_file.name}"
+                        try:
+                            supabase.storage.from_("money-rag-files").upload(
+                                file=local_path,
+                                path=s3_key,
+                                file_options={"content-type": "text/csv", "upsert": "true"}
+                            )
+                            
+                            # 3. Log the upload in the CSVFile table
+                            csv_record = supabase.table("CSVFile").insert({
+                                "user_id": user_id,
+                                "filename": uploaded_file.name,
+                                "s3_key": s3_key
+                            }).execute()
+                            
+                            csv_id = csv_record.data[0]['id']
+                            csv_files_info.append({"path": local_path, "csv_id": csv_id})
+                            
+                        except Exception as e:
+                            st.error(f"Error uploading {uploaded_file.name}: {e}")
+                            continue
+
+                    # 4. Trigger the LLM parsing, routing CSV data to Supabase Postgres
+                    if csv_files_info:
+                        asyncio.run(st.session_state.rag.setup_session(csv_files_info))
+                        st.success("Data uploaded, parsed, and vectorized securely!")
+                        st.rerun()
+
+        st.divider()
+        st.subheader("Your Uploaded Files")
+        try:
+            res = supabase.table("CSVFile").select("*").eq("user_id", st.session_state.user.id).execute()
+            files = res.data
+            
+            if not files:
+                st.info("No files uploaded yet.")
+            else:
+                for f in files:
+                    col_file, col_del = st.columns([4, 1])
+                    with col_file:
+                        st.write(f"📄 **{f['filename']}** (Uploaded: {f['upload_date'][:10]})")
+                    with col_del:
+                        if st.button("Delete", key=f"del_{f['id']}"):
+                            st.session_state[f"confirm_del_{f['id']}"] = True
+
+                        if st.session_state.get(f"confirm_del_{f['id']}", False):
+                            st.warning("Are you sure? This permanently deletes the file from Cloud Storage, the SQL Database, and the Vector Index.")
+                            col_y, col_n = st.columns(2)
+                            with col_y:
+                                if st.button("Yes, Delete", key=f"yes_{f['id']}", type="primary"):
+                                    with st.spinner("Purging file data..."):
+                                        try:
+                                            # Delete from storage
+                                            supabase.storage.from_("money-rag-files").remove([f['s3_key']])
+                                        except Exception as e:
+                                            print(f"Warning storage delete failed: {e}")
+                                        
+                                        # Use initialized RAG to delete from Vectors and Postgres
+                                        if "rag" not in st.session_state and config:
+                                            st.session_state.rag = MoneyRAG(
+                                                llm_provider=config["llm_provider"], 
+                                                model_name=config.get("decode_model", "gemini-2.5-pro"), 
+                                                embedding_model_name=config.get("embedding_model", "gemini-embedding-001"), 
+                                                api_key=config["api_key"],
+                                                user_id=st.session_state.user.id,
+                                                access_token=st.session_state.access_token
+                                            )
+                                        if "rag" in st.session_state:
+                                            asyncio.run(st.session_state.rag.delete_file(f['id']))
+                                        else:
+                                            # Fallback if no RAG config to just delete from Postgres at least
+                                            supabase.table("Transaction").delete().eq("source_csv_id", f['id']).execute()
+                                            supabase.table("CSVFile").delete().eq("id", f['id']).execute()
+                                    
+                                    del st.session_state[f"confirm_del_{f['id']}"]
+                                    st.success(f"Deleted {f['filename']}!")
+                                    st.rerun()
+                                    
+                            with col_n:
+                                if st.button("Cancel", key=f"cancel_{f['id']}"):
+                                    del st.session_state[f"confirm_del_{f['id']}"]
+                                    st.rerun()
+                            
+        except Exception as e:
+            st.error(f"Failed to load files: {e}")
+
+    elif nav == "Chat":
+        st.header("💬 Financial Assistant")
+        if not config:
+            st.warning("Please configure your Account Config (API Key) first!")
+            return
+            
+        if "rag" not in st.session_state:
+            st.session_state.rag = MoneyRAG(
+                llm_provider=config["llm_provider"], 
+                model_name=config.get("decode_model", "gemini-2.5-pro"), 
+                embedding_model_name=config.get("embedding_model", "gemini-embedding-001"), 
+                api_key=config["api_key"],
+                user_id=st.session_state.user.id,
+                access_token=st.session_state.access_token
+            )
+
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        # Show file ingestion status
+        try:
+            client = get_supabase()
+            files_res = client.table("CSVFile").select("id, filename").eq("user_id", st.session_state.user.id).execute()
+            file_count = len(files_res.data) if files_res.data else 0
+            if file_count == 0:
+                st.warning("⚠️ No data loaded yet. Go to **Ingest Data** to upload a CSV file before chatting.")
+            else:
+                names = ", ".join(f['filename'] for f in files_res.data[:3])
+                suffix = f" + {file_count - 3} more" if file_count > 3 else ""
+                st.info(f"📊 **{file_count} file{'s' if file_count > 1 else ''} loaded:** {names}{suffix}")
+        except Exception:
+            pass  # Don't break chat if the status check fails
+
+
+        # Helper function to cleverly render either text or a Plotly chart
+        def render_content(content):
+            if isinstance(content, str) and "===CHART===" in content:
+                parts = content.split("===CHART===")
+                st.markdown(parts[0].strip())
+                
+                for part in parts[1:]:
+                    if "===ENDCHART===" in part:
+                        chart_json, remaining_text = part.split("===ENDCHART===")
+                        try:
+                            fig = pio.from_json(chart_json.strip())
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.error("Failed to render chart.")
+                        
+                        if remaining_text.strip():
+                            st.markdown(remaining_text.strip())
+            else:
+                st.markdown(content)
+
+        # Render previous messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                render_content(message["content"])
+
+        # Handle new user input
+        if prompt := st.chat_input("Ask about your spending..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        response = asyncio.run(st.session_state.rag.chat(prompt))
+                        render_content(response)
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+                    except Exception as e:
+                        st.error(f"Error during chat: {e}")
+
+if __name__ == "__main__":
+    # Attempt to restore session from query params if page was refreshed
+    if "user" not in st.session_state:
+        token_from_url = st.query_params.get("t")
+        if token_from_url:
+            try:
+                res = supabase.auth.get_user(token_from_url)
+                if res and res.user:
+                    st.session_state.user = res.user
+                    st.session_state.access_token = token_from_url
+            except Exception:
+                # Token is invalid/expired - clear it from the URL too
+                if "t" in st.query_params:
+                    del st.query_params["t"]
+
+    if "user" not in st.session_state:
+        login_register_page()
+    else:
+        main_app_view()
