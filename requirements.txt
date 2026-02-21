@@ -7,3 +7,5 @@ langchain-google-vertexai
 mcp 
 langchain-mcp
 langchain-community
+qdrant-client
+langchain-qdrant
