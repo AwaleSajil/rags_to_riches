@@ -84,15 +84,19 @@ class MoneyRAG:
     async def setup_session(self, uploaded_files: List[dict]):
         """Ingests CSVs and Bills, then sets up DBs."""
         # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
+        all_duplicates = []
         for file_info in uploaded_files:
             ext = file_info["path"].lower().split('.')[-1]
             if ext in ['png', 'jpg', 'jpeg']:
-                await self._ingest_bill(file_info["path"], file_info.get("file_id"))
+                dups = await self._ingest_bill(file_info["path"], file_info.get("file_id"))
             else:
-                await self._ingest_csv(file_info["path"], file_info.get("file_id"))
+                dups = await self._ingest_csv(file_info["path"], file_info.get("file_id"))
+            if dups:
+                all_duplicates.extend(dups)
         
         self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
         self.vector_store = self._sync_to_qdrant()
+        return all_duplicates
 
     async def _ingest_csv(self, file_path, csv_id=None):
         import hashlib
@@ -220,6 +224,20 @@ Return ONLY valid JSON with exactly these two fields:
             r['content_hash'] = generate_hash(r)
             r['source'] = 'csv'
 
+        # Detect duplicates before upserting
+        hashes = [r['content_hash'] for r in records]
+        existing_hashes = set()
+        for i in range(0, len(hashes), 100):
+            batch_hashes = hashes[i:i+100]
+            existing_res = self.supabase.table("Transaction").select("content_hash").in_("content_hash", batch_hashes).execute()
+            if existing_res.data:
+                existing_hashes.update(row['content_hash'] for row in existing_res.data)
+                
+        duplicates = [
+            {"date": r['trans_date'], "merchant": r.get('merchant_name', r.get('description', '')), "amount": r['amount']} 
+            for r in records if r['content_hash'] in existing_hashes
+        ]
+
         batch_size = 100
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
@@ -236,6 +254,8 @@ Return ONLY valid JSON with exactly these two fields:
                     self.supabase.table("Transaction").insert(batch).execute()
                 except Exception as ex:
                     print(f"Failed fallback insert: {ex}")
+                    
+        return duplicates
 
     async def _ingest_bill(self, file_path, file_id=None):
         import base64
@@ -275,19 +295,64 @@ Return ONLY valid JSON with exactly these two fields:
             
         print(f"   ✅ Extracted {extracted.get('merchant_name')} for {extracted.get('total_amount')}")
         
-        # Save the raw OCR JSON back to the BillFile record so we don't lose the raw extraction
+        # Save the raw OCR JSON back to the BillFile record safely via psycopg2
         if file_id:
             try:
-                self.supabase.table("BillFile").update({"raw_ocr_string": json.dumps(extracted)}).eq("id", file_id).execute()
+                import psycopg2
+                db_url = os.environ.get("DATABASE_URL")
+                if db_url:
+                    conn = psycopg2.connect(db_url)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        'UPDATE "BillFile" SET raw_ocr_string = %s WHERE id = %s',
+                        (json.dumps(extracted), file_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                    print("   ✅ Saved raw OCR to BillFile seamlessly.")
+                else:
+                    print("   ⚠️ DATABASE_URL not set, skipping raw OCR save.")
             except Exception as e:
                 print(f"   ⚠️ Failed to save raw_ocr_string to BillFile: {e}")
         
         # Calculate content_hash
         date_str = str(extracted.get('date', '')).strip()
         amount_str = str(round(float(extracted.get('total_amount', 0)), 2))
-        merch = str(extracted.get('merchant_name', '')).lower().strip().split()[0] if extracted.get('merchant_name') else ""
-        merch = ''.join(c for c in merch if c.isalnum())
-        hash_input = f"{date_str}{amount_str}{merch}"
+        
+        # Enrich parent merchant via Web Search
+        raw_merchant = extracted.get('merchant_name', 'Unknown')
+        print(f"      🔍 Web searching to enrich merchant: {raw_merchant}...")
+        try:
+            search_result = await self.search_tool.ainvoke(f"What type of business / store is '{raw_merchant}'?")
+            
+            # Reusing the CSV enrichment prompt format
+            extract_prompt = ChatPromptTemplate.from_template("""
+You are a financial data assistant. Given a raw bank transaction description and a web search snippet about the merchant, extract structured information.
+
+Transaction description: {description}
+Web search result: {search_result}
+
+Return ONLY valid JSON with exactly these two fields:
+{{
+  "merchant_name": "<clean 1-4 word business name, e.g. 'Chipotle', 'Amazon', 'Spotify'>",
+  "enriched_info": "<one sentence describing what type of business this is>"
+}}
+""")
+            extract_chain_enrich = extract_prompt | self.llm | JsonOutputParser()
+            enriched_data = await extract_chain_enrich.ainvoke({
+                "description": raw_merchant,
+                "search_result": search_result[:500]
+            })
+            enriched_info = enriched_data.get("enriched_info", search_result[:200])
+            clean_merchant = enriched_data.get("merchant_name", raw_merchant)
+        except Exception as e:
+            print(f"      ⚠️ Parent enrichment failed: {e}")
+            enriched_info = ""
+            clean_merchant = raw_merchant
+
+        merch_hash = str(clean_merchant).lower().strip().split()[0] if clean_merchant else ""
+        merch_hash = ''.join(c for c in merch_hash if c.isalnum())
+        hash_input = f"{date_str}{amount_str}{merch_hash}"
         content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
         
         # Build transaction record
@@ -296,14 +361,20 @@ Return ONLY valid JSON with exactly these two fields:
             "trans_date": date_str,
             # In this app, spending is traditionally positive, so let's keep it strictly positive for bills
             "amount": abs(float(extracted.get('total_amount', 0))), 
-            "description": extracted.get('merchant_name', 'Unknown'),
-            "merchant_name": extracted.get('merchant_name', 'Unknown'),
+            "description": raw_merchant,
+            "merchant_name": clean_merchant,
             "category": extracted.get('category', 'Uncategorized'),
             "content_hash": content_hash,
-            "source": 'bill'
+            "source": 'bill',
+            "enriched_info": enriched_info
         }
         if file_id:
             tx_record["source_bill_file_id"] = file_id
+            
+        # Check duplicate before upserting
+        existing_res = self.supabase.table("Transaction").select("id").eq("content_hash", content_hash).eq("user_id", self.user_id).execute()
+        is_duplicate = len(existing_res.data) > 0
+        duplicates = [{"date": tx_record['trans_date'], "merchant": tx_record['merchant_name'], "amount": tx_record['amount']}] if is_duplicate else []
             
         # Optional: Enrich line items
         sem = asyncio.Semaphore(5)
@@ -325,24 +396,47 @@ Return ONLY valid JSON with exactly these two fields:
 
         # Upsert Transaction
         try:
+            print(f"   [DEBUG] Preparing to Upsert Transaction with source_bill_file_id: {file_id}")
+            if file_id:
+                import psycopg2
+                conn_tmp = psycopg2.connect(os.environ.get("DATABASE_URL"))
+                cur_tmp = conn_tmp.cursor()
+                cur_tmp.execute("SELECT count(*) FROM \"BillFile\" WHERE id = %s", (file_id,))
+                cnt = cur_tmp.fetchone()[0]
+                conn_tmp.close()
+                print(f"   [DEBUG] BillFile presence check via Psycopg2: {cnt} rows found.")
+                
             upsert_res = self.supabase.table("Transaction").upsert([tx_record], on_conflict="content_hash").execute()
+            print("   [DEBUG] Upsert successful!")
         except Exception as e:
             print(f"   ⚠️ Upsert failed (migration not run?), falling back to insert: {e}")
             tx_record.pop('merchant_name', None)
             tx_record.pop('content_hash', None)
             tx_record.pop('source', None)
-            upsert_res = self.supabase.table("Transaction").insert([tx_record]).execute()
+            try:
+                upsert_res = self.supabase.table("Transaction").insert([tx_record]).execute()
+            except Exception as e2:
+                print(f"   ❌ Fallback insert completely failed: {e2}")
             
         # Get the transaction ID to link details (upsert doesn't always return data on conflict update, so explicit select is safest)
         try:
-            fetch_res = self.supabase.table("Transaction").select("id").eq("content_hash", content_hash).eq("user_id", self.user_id).execute()
+            fetch_res = self.supabase.table("Transaction").select("id, created_at").eq("content_hash", content_hash).eq("user_id", self.user_id).execute()
             if fetch_res.data:
                 tx_id = fetch_res.data[0]['id']
+                # If we just upserted, we can loosely guess it was a duplicate if it's older than ~1 minute prior
+                # But a cleaner way is just tracking if it already existed BEFORE upsert! 
+                # Let's just return a standard duplicate dict structure for Bills right now if it was an update.
             else:
                 tx_id = None
         except Exception as e:
             print(f"   ⚠️ Failed to fetch transaction ID: {e}")
             tx_id = None
+            
+        # Check duplicate by looking at content_hash before upsert?
+        # Since we already ran the upsert, any existing row is updated.
+        # Actually we should have checked duplicate before the upsert. Let's just track it here by assuming anything with source='both' or existing is dup.
+        # For simplicity, let's just use the `fetch_res` info or we can do a preemptive check in future. For bills, there's exactly 1 record.
+        # Let's just query before the upsert! Wait, we already did the upsert on line 389.
         
         if tx_id and line_items:
             details = []
@@ -363,6 +457,8 @@ Return ONLY valid JSON with exactly these two fields:
                 print(f"   ✅ Saved {len(details)} line items.")
             except Exception as e:
                 print(f"   ⚠️ Failed to insert details (table might not exist): {e}")
+
+        return duplicates
 
     def _sync_to_qdrant(self):
         # client = QdrantClient(path=self.qdrant_path)
@@ -395,6 +491,18 @@ Return ONLY valid JSON with exactly these two fields:
         client.create_payload_index(
             collection_name=collection,
             field_name="metadata.user_id",
+            field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
+        )
+        
+        # Create Payload Indexes for file relationships so we can safely delete vectors by file origin
+        client.create_payload_index(
+            collection_name=collection,
+            field_name="metadata.source_csv_id",
+            field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
+        )
+        client.create_payload_index(
+            collection_name=collection,
+            field_name="metadata.bill_file_id",
             field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
         )
         
@@ -433,6 +541,9 @@ Return ONLY valid JSON with exactly these two fields:
                 meta_cols.append('source_csv_id')
                 
             meta = {k: row[k] for k in meta_cols if k in row and pd.notna(row[k])}
+            if 'source_bill_file_id' in row and pd.notna(row['source_bill_file_id']):
+                meta['bill_file_id'] = row['source_bill_file_id']
+                
             meta['user_id'] = self.user_id
             meta['transaction_date'] = str(meta.pop('trans_date'))
             meta['vector_type'] = 'transaction'
@@ -459,6 +570,8 @@ Return ONLY valid JSON with exactly these two fields:
                 }
                 if 'source_csv_id' in parent_row and pd.notna(parent_row['source_csv_id']):
                     meta['source_csv_id'] = parent_row['source_csv_id']
+                if 'source_bill_file_id' in parent_row and pd.notna(parent_row['source_bill_file_id']):
+                    meta['bill_file_id'] = parent_row['source_bill_file_id']
                     
                 metadatas.append(meta)
                 # Use the detail_id for the Qdrant point ID to avoid UUID collisions with parents

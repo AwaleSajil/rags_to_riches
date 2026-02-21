@@ -444,9 +444,23 @@ def main_app_view():
 
                     # 4. Trigger the parsing, routing data to Supabase Postgres
                     if uploaded_files_info:
-                        asyncio.run(st.session_state.rag.setup_session(uploaded_files_info))
-                        st.success("Data uploaded, parsed, and vectorized securely!")
+                        duplicates = asyncio.run(st.session_state.rag.setup_session(uploaded_files_info))
+                        st.session_state.last_ingest_success = True
+                        st.session_state.last_ingest_duplicates = duplicates
                         st.rerun()
+
+        if st.session_state.get("last_ingest_success"):
+            st.success("Data uploaded, parsed, and vectorized securely!")
+            dups = st.session_state.get("last_ingest_duplicates", [])
+            if dups:
+                st.warning(f"Found {len(dups)} duplicate transaction(s) that were merged/skipped.")
+                with st.expander("View Duplicates"):
+                    st.dataframe(dups)
+            
+            if st.button("Dismiss"):
+                st.session_state.last_ingest_success = False
+                st.session_state.last_ingest_duplicates = []
+                st.rerun()
 
         st.divider()
         st.subheader("Your Uploaded Files")
