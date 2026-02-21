@@ -141,40 +141,86 @@ class MoneyRAG:
 
         # --- Async Enrichment Step ---
         print(f"   ✨ Enriching descriptions for {os.path.basename(file_path)}...")
-        unique_descriptions = standard_df['description'].unique()
+        unique_descriptions = standard_df['description'].unique().tolist()
         sem = asyncio.Semaphore(5)
+
+        extract_prompt = ChatPromptTemplate.from_template("""
+You are a financial data assistant. Given a raw bank transaction description and a web search snippet about the merchant, extract structured information.
+
+Transaction description: {description}
+Web search result: {search_result}
+
+Return ONLY valid JSON with exactly these two fields:
+{{
+  "merchant_name": "<clean 1-4 word business name, e.g. 'Chipotle', 'Amazon', 'Spotify'>",
+  "enriched_info": "<one sentence describing what type of business this is>"
+}}
+""")
+        extract_chain = extract_prompt | self.llm | JsonOutputParser()
 
         async def get_merchant_info(description):
             if description in self.merchant_cache:
                 return self.merchant_cache[description]
-            
             async with sem:
                 try:
-                    await asyncio.sleep(0.05) # Jitter
+                    await asyncio.sleep(0.05)
                     print(f"      🔍 Web searching: {description}...")
-                    result = await self.search_tool.ainvoke(f"What type of business / store is '{description}'?")
+                    search_result = await self.search_tool.ainvoke(
+                        f"What type of business / store is '{description}'?"
+                    )
+                    # Extract structured merchant name + description in one LLM call
+                    structured = await extract_chain.ainvoke({
+                        "description": description,
+                        "search_result": search_result[:500],
+                    })
+                    result = {
+                        "merchant_name": structured.get("merchant_name", description),
+                        "enriched_info": structured.get("enriched_info", search_result[:200]),
+                    }
                     self.merchant_cache[description] = result
                     return result
                 except Exception as e:
-                    print(f"      ⚠️ Search failed for {description}: {e}")
-                    return "Unknown"
+                    print(f"      ⚠️ Enrichment failed for {description}: {e}")
+                    return {"merchant_name": description, "enriched_info": ""}
 
         tasks = [get_merchant_info(desc) for desc in unique_descriptions]
         enrichment_results = await asyncio.gather(*tasks)
-        
+
         desc_map = dict(zip(unique_descriptions, enrichment_results))
-        standard_df['enriched_info'] = standard_df['description'].map(desc_map).fillna("")
+        standard_df['enriched_info'] = standard_df['description'].map(
+            lambda d: desc_map.get(d, {}).get("enriched_info", "")
+        )
+        standard_df['merchant_name'] = standard_df['description'].map(
+            lambda d: desc_map.get(d, {}).get("merchant_name", d)
+        )
+
+        print(f"   ✅ Enriched {len(unique_descriptions)} unique merchants.")
+
 
         # Save to Supabase transactions table instead of local SQLite
         # Use simplejson roundtrip to guarantee all Pandas NaNs, NaTs, and weird floats become strict JSON nulls
         import json
         records = json.loads(standard_df.to_json(orient='records'))
-        
+
         batch_size = 100
+        merchant_col_missing = False
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
-            # If insertion fails, it raises an exception so Streamlit surfaces the error
-            self.supabase.table("Transaction").insert(batch).execute()
+            if merchant_col_missing:
+                for r in batch:
+                    r.pop('merchant_name', None)
+            try:
+                self.supabase.table("Transaction").insert(batch).execute()
+            except Exception as e:
+                if 'merchant_name' in str(e):
+                    # Column not added yet — strip it and retry this batch
+                    print("⚠️  merchant_name column not found. Run add_merchant_name.sql in Supabase. Inserting without it.")
+                    merchant_col_missing = True
+                    for r in batch:
+                        r.pop('merchant_name', None)
+                    self.supabase.table("Transaction").insert(batch).execute()
+                else:
+                    raise
 
     def _sync_to_qdrant(self):
         # client = QdrantClient(path=self.qdrant_path)
@@ -212,18 +258,23 @@ class MoneyRAG:
         
         vs = QdrantVectorStore(client=client, collection_name=collection, embedding=self.embeddings)
         
-        # Use description + category + enrichment for vectorization
+        # Build rich text for vectorization: merchant_name + category + enriched description
         texts = []
         for _, row in df.iterrows():
+            merchant = row.get('merchant_name', '') or row.get('description', '')
+            category = row.get('category', 'Uncategorized')
             enriched = row.get('enriched_info', '')
-            base_text = f"{row['description']} ({row['category']})"
-            if enriched and enriched != "Unknown" and enriched != "":
-                texts.append(f"{base_text} - {enriched}")
+            base_text = f"{merchant} ({category})"
+            if enriched:
+                texts.append(f"{base_text} — {enriched}")
             else:
                 texts.append(base_text)
         
-        # Inject critical user_id payload to Qdrant so we can filter on it during retrieval
-        metadatas = df[['id', 'amount', 'category', 'trans_date']].copy()
+        # Inject metadata into Qdrant payload (user_id for security, merchant_name for filtering)
+        meta_cols = ['id', 'amount', 'category', 'trans_date']
+        if 'merchant_name' in df.columns:
+            meta_cols.append('merchant_name')
+        metadatas = df[meta_cols].copy()
         if 'source_csv_id' in df.columns:
             metadatas['source_csv_id'] = df['source_csv_id']
         metadatas = metadatas.to_dict('records')
@@ -262,7 +313,7 @@ class MoneyRAG:
             print(f"Error purging file data: {e}")
 
     async def chat(self, query: str):
-        # 1. Initialize MCP client dynamically to guarantee fresh bindings
+        """Async generator that yields status events + final response."""
         server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
         
         mcp_client = MultiServerMCPClient(
@@ -277,10 +328,8 @@ class MoneyRAG:
         )
 
         try:
-            # 2. Extract tools from the safely established subprocess
             mcp_tools = await mcp_client.get_tools()
 
-            # 3. Create the LangGraph agent for this turn, preserving historical memory cache
             system_prompt = (
                 "You are a financial analyst. Use the provided tools to query the database "
                 "and perform semantic searches. Spending is POSITIVE (>0). "
@@ -299,40 +348,58 @@ class MoneyRAG:
 
             config = {"configurable": {"thread_id": "session_1"}}
             
-            # Clear out any previous chart so we don't carry over stale plots
             chart_path = os.path.join(self.temp_dir, "latest_chart.json")
             if os.path.exists(chart_path):
                 os.remove(chart_path)
-            
-            # 4. Invoke the agent against the LLM, triggering our nested Tools locally
-            result = await agent.ainvoke(
+
+            # Stream events so we can yield live tool-call updates
+            final_content = ""
+            async for event in agent.astream_events(
                 {"messages": [{"role": "user", "content": query}]},
                 config,
-            )
-            
-            # Extract content - handle both string and list formats
-            content = result["messages"][-1].content
-            
-            # If content is a list (Gemini format), extract text from blocks
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                final_text = "\n".join(text_parts)
-            else:
-                final_text = content
-                
-            # Check for generated chart
+                version="v2",
+            ):
+                kind = event.get("event")
+
+                if kind == "on_tool_start":
+                    tool_name = event.get("name", "tool")
+                    tool_input = event.get("data", {}).get("input", {})
+                    # Summarise long inputs
+                    if isinstance(tool_input, dict):
+                        snippet = ", ".join(f"{k}={str(v)[:60]}" for k, v in tool_input.items())
+                    else:
+                        snippet = str(tool_input)[:120]
+                    yield {"type": "tool_start", "name": tool_name, "input": snippet}
+
+                elif kind == "on_tool_end":
+                    tool_name = event.get("name", "tool")
+                    output = event.get("data", {}).get("output", "")
+                    snippet = str(output)[:200].replace("\n", " ")
+                    yield {"type": "tool_end", "name": tool_name, "snippet": snippet}
+
+                elif kind == "on_chain_end":
+                    # Capture the final AI message from the root chain
+                    output = event.get("data", {}).get("output", {})
+                    if isinstance(output, dict) and "messages" in output:
+                        last_msg = output["messages"][-1]
+                        content = last_msg.content if hasattr(last_msg, "content") else ""
+                        if isinstance(content, list):
+                            final_content = "\n".join(
+                                b.get("text", "") for b in content
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        elif content:
+                            final_content = content
+
+            # Build final response (with optional chart)
             if os.path.exists(chart_path):
                 with open(chart_path, "r") as f:
                     chart_json = f.read()
-                return f"{final_text}\n\n===CHART===\n{chart_json}\n===ENDCHART==="
-                
-            return final_text
+                yield {"type": "final", "content": f"{final_content}\n\n===CHART===\n{chart_json}\n===ENDCHART==="}
+            else:
+                yield {"type": "final", "content": final_content}
             
         finally:
-            # 5. Destroy the subprocess safely so we don't leak FastMCP zombies across Streamlit reruns
             try:
                 await mcp_client.close()
             except Exception as close_e:

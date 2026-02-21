@@ -28,61 +28,47 @@ def inject_css():
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
-    /* ── Global Reset & Font ── */
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif !important;
-    }
+    /* ── Global ── */
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
     #MainMenu, footer, header { visibility: hidden; }
     .block-container { padding-top: 2rem !important; }
 
     /* ── Background ── */
-    .stApp {
-        background: #0a0a0f;
-        color: #e2e8f0;
-    }
+    .stApp { background: #f8f9ff; color: #1e1e3a; }
 
     /* ── Sidebar ── */
     [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f0f1a 0%, #0d0d16 100%) !important;
-        border-right: 1px solid rgba(99,102,241,0.15) !important;
+        background: white !important;
+        border-right: 1px solid #e8eaf6 !important;
+        box-shadow: 2px 0 12px rgba(99,102,241,0.06) !important;
     }
-    [data-testid="stSidebar"] * { color: #cbd5e1 !important; }
+    [data-testid="stSidebar"] * { color: #374151 !important; }
 
-    /* ── Nav buttons ── */
+    /* ── Sidebar Nav Buttons ── */
     div[data-testid="stSidebarContent"] .nav-btn > div > button {
-        width: 100% !important;
-        text-align: left !important;
-        border: none !important;
-        border-radius: 10px !important;
-        background: transparent !important;
-        color: #94a3b8 !important;
-        padding: 0.65rem 1rem !important;
-        font-size: 0.9rem !important;
-        font-weight: 500 !important;
-        transition: all 0.2s ease !important;
-        margin-bottom: 2px !important;
+        width: 100% !important; text-align: left !important;
+        border: none !important; border-radius: 10px !important;
+        background: transparent !important; color: #6b7280 !important;
+        padding: 0.65rem 1rem !important; font-size: 0.9rem !important;
+        font-weight: 500 !important; transition: all 0.18s ease !important;
     }
     div[data-testid="stSidebarContent"] .nav-btn > div > button:hover {
-        background: rgba(99,102,241,0.1) !important;
-        color: #a5b4fc !important;
+        background: #f0f1ff !important; color: #6366f1 !important;
     }
     div[data-testid="stSidebarContent"] .nav-btn-active > div > button {
-        background: linear-gradient(135deg, rgba(99,102,241,0.25), rgba(139,92,246,0.2)) !important;
-        color: #a5b4fc !important;
-        border: 1px solid rgba(99,102,241,0.3) !important;
+        background: linear-gradient(135deg, #eef2ff, #f5f3ff) !important;
+        color: #6366f1 !important;
+        border: 1px solid #c7d2fe !important;
         font-weight: 600 !important;
     }
 
     /* ── Primary Buttons ── */
     .stButton > button[kind="primary"] {
         background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
-        border: none !important;
-        border-radius: 10px !important;
-        color: white !important;
-        font-weight: 600 !important;
-        padding: 0.6rem 1.2rem !important;
+        border: none !important; border-radius: 10px !important;
+        color: white !important; font-weight: 600 !important;
         transition: all 0.2s ease !important;
-        box-shadow: 0 4px 15px rgba(99,102,241,0.3) !important;
+        box-shadow: 0 4px 14px rgba(99,102,241,0.35) !important;
     }
     .stButton > button[kind="primary"]:hover {
         transform: translateY(-1px) !important;
@@ -91,81 +77,116 @@ def inject_css():
 
     /* ── Secondary Buttons ── */
     .stButton > button[kind="secondary"] {
-        background: rgba(255,255,255,0.05) !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
-        border-radius: 10px !important;
-        color: #cbd5e1 !important;
-        font-weight: 500 !important;
-        transition: all 0.2s ease !important;
+        background: white !important;
+        border: 1px solid #e5e7eb !important;
+        border-radius: 10px !important; color: #374151 !important;
+        font-weight: 500 !important; transition: all 0.18s ease !important;
     }
     .stButton > button[kind="secondary"]:hover {
-        background: rgba(255,255,255,0.08) !important;
-        border-color: rgba(99,102,241,0.35) !important;
+        border-color: #6366f1 !important; color: #6366f1 !important;
+        background: #f0f1ff !important;
     }
 
     /* ── Inputs ── */
-    .stTextInput input, .stSelectbox > div > div {
-        background: rgba(255,255,255,0.04) !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
+    .stTextInput input,
+    .stTextInput input[type="password"],
+    .stTextArea textarea,
+    .stNumberInput input,
+    input[type="text"], input[type="password"], input[type="email"], textarea {
+        background: white !important;
+        border: 1.5px solid #e5e7eb !important;
         border-radius: 10px !important;
-        color: #e2e8f0 !important;
-        transition: border 0.2s ease !important;
+        color: #1e1e3a !important;
+        transition: border-color 0.2s, box-shadow 0.2s !important;
     }
-    .stTextInput input:focus { border-color: #6366f1 !important; box-shadow: 0 0 0 2px rgba(99,102,241,0.2) !important; }
+    .stTextInput input:focus, .stTextArea textarea:focus,
+    input[type="text"]:focus, input[type="password"]:focus, input[type="email"]:focus {
+        border-color: #6366f1 !important;
+        box-shadow: 0 0 0 3px rgba(99,102,241,0.15) !important;
+        outline: none !important;
+    }
+    ::placeholder { color: #9ca3af !important; opacity: 1 !important; }
 
-    /* ── Glass Cards ── */
+    /* ── Selectbox ── */
+    .stSelectbox > div > div, .stSelectbox [data-baseweb="select"] > div {
+        background: white !important;
+        border: 1.5px solid #e5e7eb !important;
+        border-radius: 10px !important; color: #1e1e3a !important;
+    }
+    [data-baseweb="popover"] > div, [data-baseweb="menu"] {
+        background: white !important;
+        border: 1px solid #e5e7eb !important;
+        border-radius: 10px !important;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1) !important;
+    }
+    [data-baseweb="option"]:hover { background: #f0f1ff !important; }
+
+    /* ── Cards ── */
     .glass-card {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
+        background: white;
+        border: 1px solid #e8eaf6;
         border-radius: 16px;
         padding: 1.75rem;
-        backdrop-filter: blur(12px);
-        transition: border 0.2s ease;
+        box-shadow: 0 4px 20px rgba(99,102,241,0.07);
+        transition: box-shadow 0.2s, border-color 0.2s;
     }
-    .glass-card:hover { border-color: rgba(99,102,241,0.25); }
+    .glass-card:hover { border-color: #c7d2fe; box-shadow: 0 6px 28px rgba(99,102,241,0.12); }
 
     /* ── Hero ── */
     .hero { text-align: center; padding: 4rem 1rem 2rem; }
     .hero .badge {
         display: inline-block;
-        background: linear-gradient(135deg, rgba(99,102,241,0.2), rgba(139,92,246,0.2));
-        border: 1px solid rgba(99,102,241,0.35);
-        color: #a5b4fc;
-        font-size: 0.78rem;
-        font-weight: 600;
-        letter-spacing: 0.1em;
-        text-transform: uppercase;
-        padding: 0.3rem 0.9rem;
-        border-radius: 99px;
-        margin-bottom: 1.25rem;
+        background: #eef2ff; border: 1px solid #c7d2fe; color: #6366f1;
+        font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em;
+        text-transform: uppercase; padding: 0.3rem 0.9rem;
+        border-radius: 99px; margin-bottom: 1.25rem;
     }
     .hero h1 {
-        font-size: clamp(2.5rem, 6vw, 4rem);
-        font-weight: 800;
-        letter-spacing: -2px;
-        line-height: 1.1;
-        background: linear-gradient(135deg, #e2e8f0 30%, #a5b4fc);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        font-size: clamp(2.5rem, 6vw, 4rem); font-weight: 800;
+        letter-spacing: -2px; line-height: 1.1;
+        background: linear-gradient(135deg, #4f46e5 20%, #7c3aed);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         margin-bottom: 1rem;
     }
-    .hero p { font-size: 1.1rem; color: #64748b; max-width: 440px; margin: 0 auto; line-height: 1.7; }
+    .hero p { font-size: 1.1rem; color: #6b7280; max-width: 440px; margin: 0 auto; line-height: 1.7; }
 
     /* ── Divider ── */
-    hr { border-color: rgba(255,255,255,0.07) !important; }
+    hr { border-color: #e8eaf6 !important; }
 
     /* ── Expanders ── */
     [data-testid="stExpander"] {
-        background: rgba(255,255,255,0.03) !important;
-        border: 1px solid rgba(255,255,255,0.07) !important;
+        background: white !important;
+        border: 1px solid #e8eaf6 !important;
         border-radius: 12px !important;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04) !important;
     }
 
     /* ── Alerts ── */
     [data-testid="stAlert"] { border-radius: 10px !important; }
 
-    /* ── Chat bubbles ── */
-    [data-testid="stChatMessage"] { border-radius: 12px !important; }
+    /* ── Chat ── */
+    [data-testid="stChatMessage"] {
+        border-radius: 12px !important;
+        border: 1px solid #e8eaf6 !important;
+    }
+
+    /* ── Chat Input Bar ── */
+    [data-testid="stChatInput"] {
+        background: white !important;
+        border: 1.5px solid #e5e7eb !important;
+        border-radius: 14px !important;
+        box-shadow: 0 2px 12px rgba(99,102,241,0.08) !important;
+    }
+    [data-testid="stChatInput"]:focus-within {
+        border-color: #6366f1 !important;
+        box-shadow: 0 0 0 3px rgba(99,102,241,0.15), 0 2px 12px rgba(99,102,241,0.08) !important;
+    }
+    [data-testid="stChatInput"] textarea {
+        background: transparent !important;
+        border: none !important;
+        color: #1e1e3a !important;
+        box-shadow: none !important;
+    }
     </style>
     """)
 
@@ -538,13 +559,40 @@ def main_app_view():
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        response = asyncio.run(st.session_state.rag.chat(prompt))
-                        render_content(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                    except Exception as e:
-                        st.error(f"Error during chat: {e}")
+                try:
+                    # Drain the async generator, collecting all events first
+                    async def run_chat_stream():
+                        events = []
+                        async for event in st.session_state.rag.chat(prompt):
+                            events.append(event)
+                        return events
+
+                    with st.spinner("Thinking..."):
+                        events = asyncio.run(run_chat_stream())
+
+                    # Show tool-call trace in a collapsible expander
+                    tool_events = [e for e in events if e["type"] in ("tool_start", "tool_end")]
+                    final_event = next((e for e in events if e["type"] == "final"), None)
+
+                    if tool_events:
+                        tool_names = list(dict.fromkeys(
+                            e["name"].replace("money_rag_", "").replace("_", " ").title()
+                            for e in tool_events if e["type"] == "tool_start"
+                        ))
+                        with st.expander(f"🔍 Used: {', '.join(tool_names)}", expanded=False):
+                            for e in tool_events:
+                                if e["type"] == "tool_start":
+                                    st.markdown(f"**▶ `{e['name']}`**")
+                                    if e.get("input"):
+                                        st.caption(f"Input: {e['input']}")
+                                else:
+                                    st.caption(f"↳ {e.get('snippet', '')}")
+
+                    response = final_event["content"] if final_event else "No response."
+                    render_content(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                except Exception as e:
+                    st.error(f"Error during chat: {e}")
 
 if __name__ == "__main__":
     # Attempt to restore session from query params if page was refreshed
