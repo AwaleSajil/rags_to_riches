@@ -55,7 +55,7 @@ with col2:
 
 # Architecture Diagram
 with st.expander("🏗️ How MoneyRAG Works"):
-    st.image("architecture.png", use_container_width=True)
+    st.image("architecture.svg", use_container_width=True)
 
 st.divider()
 
