@@ -496,11 +496,14 @@ Return ONLY valid JSON with exactly these two fields:
         except Exception as e:
             print(f"Error purging file data: {e}")
 
-    async def chat(self, query: str):
-        """Async generator that yields status events + final response."""
+    async def _ensure_mcp(self):
+        """Lazily start the MCP client + agent once, reuse across chat calls."""
+        if self.mcp_client is not None and self.agent is not None:
+            return
+
         server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
-        
-        mcp_client = MultiServerMCPClient(
+
+        self.mcp_client = MultiServerMCPClient(
             {
                 "money_rag": {
                     "transport": "stdio",
@@ -511,86 +514,91 @@ Return ONLY valid JSON with exactly these two fields:
             }
         )
 
-        try:
-            mcp_tools = await mcp_client.get_tools()
+        mcp_tools = await self.mcp_client.get_tools()
 
-            system_prompt = (
-                "You are a financial analyst. Use the provided tools to query the database "
-                "and perform semantic searches. Spending is POSITIVE (>0). "
-                "Always explain your findings clearly."
-                "IMPORTANT: Whenever possible and relevant (e.g. when discussing trends, comparing categories, or showing breakdowns), "
-                "you MUST proactively use the 'generate_interactive_chart' tool to generate visual plots (bar, pie, or line charts) to accompany your analysis. "
-                "WARNING: You MUST use the actual tool call to generate the chart. DO NOT simply output a json block with chart parameters as your final text answer."
-            )
-            
-            agent = create_agent(
-                model=self.llm,
-                tools=mcp_tools,
-                system_prompt=system_prompt,
-                checkpointer=self.memory,
-            )
+        system_prompt = (
+            "You are a financial analyst. Use the provided tools to query the database "
+            "and perform semantic searches. Spending is POSITIVE (>0). "
+            "Always explain your findings clearly."
+            "IMPORTANT: Whenever possible and relevant (e.g. when discussing trends, comparing categories, or showing breakdowns), "
+            "you MUST proactively use the 'generate_interactive_chart' tool to generate visual plots (bar, pie, or line charts) to accompany your analysis. "
+            "WARNING: You MUST use the actual tool call to generate the chart. DO NOT simply output a json block with chart parameters as your final text answer."
+        )
 
-            config = {"configurable": {"thread_id": "session_1"}}
-            
-            chart_path = os.path.join(self.temp_dir, "latest_chart.json")
-            if os.path.exists(chart_path):
-                os.remove(chart_path)
+        self.agent = create_agent(
+            model=self.llm,
+            tools=mcp_tools,
+            system_prompt=system_prompt,
+            checkpointer=self.memory,
+        )
 
-            # Stream events so we can yield live tool-call updates
-            final_content = ""
-            async for event in agent.astream_events(
-                {"messages": [{"role": "user", "content": query}]},
-                config,
-                version="v2",
-            ):
-                kind = event.get("event")
+    async def chat(self, query: str):
+        """Async generator that yields status events + final response."""
+        await self._ensure_mcp()
 
-                if kind == "on_tool_start":
-                    tool_name = event.get("name", "tool")
-                    tool_input = event.get("data", {}).get("input", {})
-                    # Summarise long inputs
-                    if isinstance(tool_input, dict):
-                        snippet = ", ".join(f"{k}={str(v)[:60]}" for k, v in tool_input.items())
-                    else:
-                        snippet = str(tool_input)[:120]
-                    yield {"type": "tool_start", "name": tool_name, "input": snippet}
+        config = {"configurable": {"thread_id": "session_1"}}
 
-                elif kind == "on_tool_end":
-                    tool_name = event.get("name", "tool")
-                    output = event.get("data", {}).get("output", "")
-                    snippet = str(output)[:200].replace("\n", " ")
-                    yield {"type": "tool_end", "name": tool_name, "snippet": snippet}
+        chart_path = os.path.join(self.temp_dir, "latest_chart.json")
+        if os.path.exists(chart_path):
+            os.remove(chart_path)
 
-                elif kind == "on_chain_end":
-                    # Capture the final AI message from the root chain
-                    output = event.get("data", {}).get("output", {})
-                    if isinstance(output, dict) and "messages" in output:
-                        last_msg = output["messages"][-1]
-                        content = last_msg.content if hasattr(last_msg, "content") else ""
-                        if isinstance(content, list):
-                            final_content = "\n".join(
-                                b.get("text", "") for b in content
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            )
-                        elif content:
-                            final_content = content
+        # Stream events so we can yield live tool-call updates
+        final_content = ""
+        async for event in self.agent.astream_events(
+            {"messages": [{"role": "user", "content": query}]},
+            config,
+            version="v2",
+        ):
+            kind = event.get("event")
 
-            # Build final response (with optional chart)
-            if os.path.exists(chart_path):
-                with open(chart_path, "r") as f:
-                    chart_json = f.read()
-                yield {"type": "final", "content": f"{final_content}\n\n===CHART===\n{chart_json}\n===ENDCHART==="}
-            else:
-                yield {"type": "final", "content": final_content}
-            
-        finally:
-            try:
-                await mcp_client.close()
-            except Exception as close_e:
-                print(f"Warning on closing MCP Client: {close_e}")
+            if kind == "on_tool_start":
+                tool_name = event.get("name", "tool")
+                tool_input = event.get("data", {}).get("input", {})
+                # Summarise long inputs
+                if isinstance(tool_input, dict):
+                    snippet = ", ".join(f"{k}={str(v)[:60]}" for k, v in tool_input.items())
+                else:
+                    snippet = str(tool_input)[:120]
+                yield {"type": "tool_start", "name": tool_name, "input": snippet}
+
+            elif kind == "on_tool_end":
+                tool_name = event.get("name", "tool")
+                output = event.get("data", {}).get("output", "")
+                snippet = str(output)[:200].replace("\n", " ")
+                yield {"type": "tool_end", "name": tool_name, "snippet": snippet}
+
+            elif kind == "on_chain_end":
+                # Capture the final AI message from the root chain
+                output = event.get("data", {}).get("output", {})
+                if isinstance(output, dict) and "messages" in output:
+                    last_msg = output["messages"][-1]
+                    content = last_msg.content if hasattr(last_msg, "content") else ""
+                    if isinstance(content, list):
+                        final_content = "\n".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    elif content:
+                        final_content = content
+
+        # Build final response (with optional chart)
+        if os.path.exists(chart_path):
+            with open(chart_path, "r") as f:
+                chart_json = f.read()
+            yield {"type": "final", "content": f"{final_content}\n\n===CHART===\n{chart_json}\n===ENDCHART==="}
+        else:
+            yield {"type": "final", "content": final_content}
 
     async def cleanup(self):
         """Delete temporary session files and close MCP client."""
+        if self.mcp_client is not None:
+            try:
+                await self.mcp_client.close()
+            except Exception as e:
+                print(f"Warning on closing MCP Client: {e}")
+            self.mcp_client = None
+            self.agent = None
+
         if os.path.exists(self.temp_dir):
             try:
                 shutil.rmtree(self.temp_dir)

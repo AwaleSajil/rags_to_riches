@@ -1,0 +1,8 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic-settings>=2.7.0
+python-multipart>=0.0.18
+
+# The following are also needed (already in ../requirements.txt):
+# langchain, langgraph, qdrant-client, supabase, pandas, plotly, etc.
+# Install both: pip install -r requirements.txt -r backend/requirements.txt
