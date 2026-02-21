@@ -58,13 +58,19 @@ def get_schema_info() -> str:
       - description (TEXT)
       - amount (DECIMAL)
       - category (VARCHAR)
+      - merchant_name (TEXT)
 
     TABLE: "TransactionDetail"
     Columns:
       - id (UUID)
       - transaction_id (UUID)
+      - user_id (UUID)
       - item_description (TEXT)
+      - item_quantity (DECIMAL)
+      - item_unit_price (DECIMAL)
       - item_total_price (DECIMAL)
+      - tax_amount (DECIMAL)
+      - enriched_info (TEXT)
     """)
 
 
@@ -79,12 +85,22 @@ def query_database(query: str) -> str:
     Execute a raw SQL query against the Postgres database.
     The main table is named "Transaction" (you MUST INCLUDE QUOTES in your SQL!).
     IMPORTANT STRICT SCHEMA:
+    Table: "Transaction"
     - id (UUID)
     - user_id (UUID text)
     - trans_date (DATE)
     - description (TEXT)
+    - merchant_name (TEXT)
     - amount (NUMERIC)
     - category (TEXT)
+    
+    Table: "TransactionDetail"
+    - id (UUID)
+    - transaction_id (UUID)
+    - user_id (UUID text)
+    - item_description (TEXT)
+    - item_quantity (NUMERIC)
+    - item_total_price (NUMERIC)
     - enriched_info (TEXT)
 
     Args:

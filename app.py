@@ -378,7 +378,7 @@ def main_app_view():
     elif nav == "Ingest Data":
         st.header("📥 Ingest Data")
         
-        uploaded_files = st.file_uploader("Upload CSV transactions", accept_multiple_files=True, type=['csv'])
+        uploaded_files = st.file_uploader("Upload CSV transactions or Receipt Images", accept_multiple_files=True, type=['csv', 'png', 'jpg', 'jpeg'])
         if uploaded_files:
             if st.button("Ingest Selected Files", type="primary"):
                 if not config:
@@ -396,51 +396,72 @@ def main_app_view():
                         access_token=st.session_state.access_token
                     )
 
-                csv_files_info = []
+                uploaded_files_info = []
                 user_id = st.session_state.user.id
                 
                 with st.spinner("Uploading to Supabase Storage & Processing..."):
                     for uploaded_file in uploaded_files:
-                        # 1. Save temp locally for pandas parsing
+                        # 1. Save temp locally for parsing
                         local_path = os.path.join(st.session_state.rag.temp_dir, uploaded_file.name)
                         with open(local_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
                         
                         # 2. Upload raw file to Supabase Object Storage
-                        s3_key = f"{user_id}/csvs/{uploaded_file.name}"
+                        is_image = uploaded_file.name.lower().endswith(('.png', '.jpg', '.jpeg'))
+                        folder = "bills" if is_image else "csvs"
+                        s3_key = f"{user_id}/{folder}/{uploaded_file.name}"
+                        content_type = "image/jpeg" if is_image else "text/csv"
+                        if uploaded_file.name.lower().endswith('.png'):
+                            content_type = "image/png"
+
                         try:
                             supabase.storage.from_("money-rag-files").upload(
                                 file=local_path,
                                 path=s3_key,
-                                file_options={"content-type": "text/csv", "upsert": "true"}
+                                file_options={"content-type": content_type, "upsert": "true"}
                             )
                             
-                            # 3. Log the upload in the CSVFile table
-                            csv_record = supabase.table("CSVFile").insert({
-                                "user_id": user_id,
-                                "filename": uploaded_file.name,
-                                "s3_key": s3_key
-                            }).execute()
-                            
-                            csv_id = csv_record.data[0]['id']
-                            csv_files_info.append({"path": local_path, "csv_id": csv_id})
+                            # 3. Log the upload in the correct table depending on type
+                            if is_image:
+                                file_record = supabase.table("BillFile").insert({
+                                    "user_id": user_id,
+                                    "filename": uploaded_file.name,
+                                    "s3_key": s3_key
+                                }).execute()
+                            else:
+                                file_record = supabase.table("CSVFile").insert({
+                                    "user_id": user_id,
+                                    "filename": uploaded_file.name,
+                                    "s3_key": s3_key
+                                }).execute()
+                                
+                            file_id = file_record.data[0]['id']
+                            uploaded_files_info.append({"path": local_path, "file_id": file_id})
                             
                         except Exception as e:
                             st.error(f"Error uploading {uploaded_file.name}: {e}")
                             continue
 
-                    # 4. Trigger the LLM parsing, routing CSV data to Supabase Postgres
-                    if csv_files_info:
-                        asyncio.run(st.session_state.rag.setup_session(csv_files_info))
+                    # 4. Trigger the parsing, routing data to Supabase Postgres
+                    if uploaded_files_info:
+                        asyncio.run(st.session_state.rag.setup_session(uploaded_files_info))
                         st.success("Data uploaded, parsed, and vectorized securely!")
                         st.rerun()
 
         st.divider()
         st.subheader("Your Uploaded Files")
         try:
-            res = supabase.table("CSVFile").select("*").eq("user_id", st.session_state.user.id).execute()
-            files = res.data
+            res_csv = supabase.table("CSVFile").select("*").eq("user_id", st.session_state.user.id).execute()
+            res_bill = supabase.table("BillFile").select("*").eq("user_id", st.session_state.user.id).execute()
             
+            files = []
+            if res_csv.data:
+                for d in res_csv.data: d['type'] = 'csv'
+                files.extend(res_csv.data)
+            if res_bill.data:
+                for d in res_bill.data: d['type'] = 'bill'
+                files.extend(res_bill.data)
+                
             if not files:
                 st.info("No files uploaded yet.")
             else:
@@ -463,7 +484,7 @@ def main_app_view():
                                             supabase.storage.from_("money-rag-files").remove([f['s3_key']])
                                         except Exception as e:
                                             print(f"Warning storage delete failed: {e}")
-                                        
+                                            
                                         # Use initialized RAG to delete from Vectors and Postgres
                                         if "rag" not in st.session_state and config:
                                             st.session_state.rag = MoneyRAG(
@@ -475,12 +496,14 @@ def main_app_view():
                                                 access_token=st.session_state.access_token
                                             )
                                         if "rag" in st.session_state:
-                                            asyncio.run(st.session_state.rag.delete_file(f['id']))
+                                            asyncio.run(st.session_state.rag.delete_file(f['id'], f['type']))
                                         else:
-                                            # Fallback if no RAG config to just delete from Postgres at least
-                                            supabase.table("Transaction").delete().eq("source_csv_id", f['id']).execute()
-                                            supabase.table("CSVFile").delete().eq("id", f['id']).execute()
-                                    
+                                            table = "CSVFile" if f['type'] == 'csv' else "BillFile"
+                                            # Fallback if no RAG config
+                                            if f['type'] == 'csv':
+                                                supabase.table("Transaction").delete().eq("source_csv_id", f['id']).execute()
+                                            supabase.table(table).delete().eq("id", f['id']).execute()
+                                            
                                     del st.session_state[f"confirm_del_{f['id']}"]
                                     st.success(f"Deleted {f['filename']}!")
                                     st.rerun()
@@ -515,12 +538,16 @@ def main_app_view():
         # Show file ingestion status
         try:
             client = get_supabase()
-            files_res = client.table("CSVFile").select("id, filename").eq("user_id", st.session_state.user.id).execute()
-            file_count = len(files_res.data) if files_res.data else 0
+            files_csv = client.table("CSVFile").select("id, filename").eq("user_id", st.session_state.user.id).execute()
+            files_bill = client.table("BillFile").select("id, filename").eq("user_id", st.session_state.user.id).execute()
+            
+            all_files = (files_csv.data or []) + (files_bill.data or [])
+            file_count = len(all_files)
+            
             if file_count == 0:
-                st.warning("⚠️ No data loaded yet. Go to **Ingest Data** to upload a CSV file before chatting.")
+                st.warning("⚠️ No data loaded yet. Go to **Ingest Data** to upload a CSV or Bill file before chatting.")
             else:
-                names = ", ".join(f['filename'] for f in files_res.data[:3])
+                names = ", ".join(f['filename'] for f in all_files[:3])
                 suffix = f" + {file_count - 3} more" if file_count > 3 else ""
                 st.info(f"📊 **{file_count} file{'s' if file_count > 1 else ''} loaded:** {names}{suffix}")
         except Exception:

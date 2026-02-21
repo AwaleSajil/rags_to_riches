@@ -81,16 +81,23 @@ class MoneyRAG:
         self.merchant_cache = {}  # Session-based cache for merchant enrichment
         self.memory = InMemorySaver()  # Session-based cache for chat memory
 
-    async def setup_session(self, csv_files: List[dict]):
-        """Ingests CSVs and sets up DBs."""
-        # csv_files format: [{"path": "/temp/file.csv", "csv_id": "uuid"}, ...]
-        for file_info in csv_files:
-            await self._ingest_csv(file_info["path"], file_info.get("csv_id"))
+    async def setup_session(self, uploaded_files: List[dict]):
+        """Ingests CSVs and Bills, then sets up DBs."""
+        # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
+        for file_info in uploaded_files:
+            ext = file_info["path"].lower().split('.')[-1]
+            if ext in ['png', 'jpg', 'jpeg']:
+                await self._ingest_bill(file_info["path"], file_info.get("file_id"))
+            else:
+                await self._ingest_csv(file_info["path"], file_info.get("file_id"))
         
         self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
         self.vector_store = self._sync_to_qdrant()
 
     async def _ingest_csv(self, file_path, csv_id=None):
+        import hashlib
+        import json
+        
         df = pd.read_csv(file_path)
         headers = df.columns.tolist()
         sample_data = df.head(10).to_json()
@@ -197,30 +204,165 @@ Return ONLY valid JSON with exactly these two fields:
         print(f"   ✅ Enriched {len(unique_descriptions)} unique merchants.")
 
 
-        # Save to Supabase transactions table instead of local SQLite
-        # Use simplejson roundtrip to guarantee all Pandas NaNs, NaTs, and weird floats become strict JSON nulls
-        import json
+        # Save to Supabase transactions table
         records = json.loads(standard_df.to_json(orient='records'))
 
+        # Calculate content_hash and source for deduplication
+        def generate_hash(row):
+            date_str = str(row['trans_date']).strip()
+            amount_str = str(round(float(row['amount']), 2))
+            merch = str(row.get('merchant_name', row['description'])).lower().strip().split()[0]
+            merch = ''.join(c for c in merch if c.isalnum())
+            hash_input = f"{date_str}{amount_str}{merch}"
+            return hashlib.sha256(hash_input.encode()).hexdigest()
+
+        for r in records:
+            r['content_hash'] = generate_hash(r)
+            r['source'] = 'csv'
+
         batch_size = 100
-        merchant_col_missing = False
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
-            if merchant_col_missing:
+            try:
+                # Upsert based on content_hash
+                self.supabase.table("Transaction").upsert(batch, on_conflict="content_hash").execute()
+            except Exception as e:
+                # Fallback if DB migration hasn't been run yet (no content_hash / merchant_name)
                 for r in batch:
                     r.pop('merchant_name', None)
-            try:
-                self.supabase.table("Transaction").insert(batch).execute()
-            except Exception as e:
-                if 'merchant_name' in str(e):
-                    # Column not added yet — strip it and retry this batch
-                    print("⚠️  merchant_name column not found. Run add_merchant_name.sql in Supabase. Inserting without it.")
-                    merchant_col_missing = True
-                    for r in batch:
-                        r.pop('merchant_name', None)
+                    r.pop('content_hash', None)
+                    r.pop('source', None)
+                try:
                     self.supabase.table("Transaction").insert(batch).execute()
-                else:
-                    raise
+                except Exception as ex:
+                    print(f"Failed fallback insert: {ex}")
+
+    async def _ingest_bill(self, file_path, file_id=None):
+        import base64
+        import hashlib
+        import json
+        from langchain_core.messages import HumanMessage
+        
+        print(f"   📸 Processing bill image: {os.path.basename(file_path)}...")
+        with open(file_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        ext = file_path.lower().split('.')[-1]
+        mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
+
+        schema = {
+            "date": "YYYY-MM-DD",
+            "total_amount": 123.45,
+            "merchant_name": "Merchant",
+            "category": "Dining",
+            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "tax_amount": 0.0, "item_total_price": 10.0}]
+        }
+        
+        prompt = f"Extract structured data from this receipt/bill. Return strictly valid JSON exactly matching this schema: {json.dumps(schema)}"
+        message = HumanMessage(
+            content=[
+                 {"type": "text", "text": prompt},
+                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded_string}"}}
+            ]
+        )
+        
+        extract_chain = self.llm | JsonOutputParser()
+        try:
+            extracted = await extract_chain.ainvoke([message])
+        except Exception as e:
+            print(f"   ❌ Vision extraction failed: {e}")
+            return
+            
+        print(f"   ✅ Extracted {extracted.get('merchant_name')} for {extracted.get('total_amount')}")
+        
+        # Save the raw OCR JSON back to the BillFile record so we don't lose the raw extraction
+        if file_id:
+            try:
+                self.supabase.table("BillFile").update({"raw_ocr_string": json.dumps(extracted)}).eq("id", file_id).execute()
+            except Exception as e:
+                print(f"   ⚠️ Failed to save raw_ocr_string to BillFile: {e}")
+        
+        # Calculate content_hash
+        date_str = str(extracted.get('date', '')).strip()
+        amount_str = str(round(float(extracted.get('total_amount', 0)), 2))
+        merch = str(extracted.get('merchant_name', '')).lower().strip().split()[0] if extracted.get('merchant_name') else ""
+        merch = ''.join(c for c in merch if c.isalnum())
+        hash_input = f"{date_str}{amount_str}{merch}"
+        content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+        
+        # Build transaction record
+        tx_record = {
+            "user_id": self.user_id,
+            "trans_date": date_str,
+            # In this app, spending is traditionally positive, so let's keep it strictly positive for bills
+            "amount": abs(float(extracted.get('total_amount', 0))), 
+            "description": extracted.get('merchant_name', 'Unknown'),
+            "merchant_name": extracted.get('merchant_name', 'Unknown'),
+            "category": extracted.get('category', 'Uncategorized'),
+            "content_hash": content_hash,
+            "source": 'bill'
+        }
+        if file_id:
+            tx_record["source_bill_file_id"] = file_id
+            
+        # Optional: Enrich line items
+        sem = asyncio.Semaphore(5)
+        async def enrich_item(item):
+            name = item.get('item_description', '')
+            async with sem:
+                try:
+                    await asyncio.sleep(0.05)
+                    res = await self.search_tool.ainvoke(f"What type of product is '{name}'?")
+                    item['enriched_info'] = res[:200]
+                except Exception:
+                    item['enriched_info'] = ""
+            return item
+            
+        line_items = extracted.get('line_items', [])
+        print(f"   ✨ Enriching {len(line_items)} line items...")
+        tasks = [enrich_item(i) for i in line_items]
+        line_items = await asyncio.gather(*tasks)
+
+        # Upsert Transaction
+        try:
+            upsert_res = self.supabase.table("Transaction").upsert([tx_record], on_conflict="content_hash").execute()
+        except Exception as e:
+            print(f"   ⚠️ Upsert failed (migration not run?), falling back to insert: {e}")
+            tx_record.pop('merchant_name', None)
+            tx_record.pop('content_hash', None)
+            tx_record.pop('source', None)
+            upsert_res = self.supabase.table("Transaction").insert([tx_record]).execute()
+            
+        # Get the transaction ID to link details (upsert doesn't always return data on conflict update, so explicit select is safest)
+        try:
+            fetch_res = self.supabase.table("Transaction").select("id").eq("content_hash", content_hash).eq("user_id", self.user_id).execute()
+            if fetch_res.data:
+                tx_id = fetch_res.data[0]['id']
+            else:
+                tx_id = None
+        except Exception as e:
+            print(f"   ⚠️ Failed to fetch transaction ID: {e}")
+            tx_id = None
+        
+        if tx_id and line_items:
+            details = []
+            for item in line_items:
+                details.append({
+                    "transaction_id": tx_id,
+                    "user_id": self.user_id,
+                    "bill_file_id": file_id,
+                    "item_description": item.get('item_description', ''),
+                    "item_quantity": item.get('item_quantity', 1),
+                    "item_unit_price": item.get('item_unit_price', item.get('item_total_price', 0)),
+                    "tax_amount": item.get('tax_amount', 0),
+                    "item_total_price": item.get('item_total_price', 0),
+                    "enriched_info": item.get('enriched_info', '')
+                })
+            try:
+                self.supabase.table("TransactionDetail").insert(details).execute()
+                print(f"   ✅ Saved {len(details)} line items.")
+            except Exception as e:
+                print(f"   ⚠️ Failed to insert details (table might not exist): {e}")
 
     def _sync_to_qdrant(self):
         # client = QdrantClient(path=self.qdrant_path)
@@ -258,8 +400,22 @@ Return ONLY valid JSON with exactly these two fields:
         
         vs = QdrantVectorStore(client=client, collection_name=collection, embedding=self.embeddings)
         
-        # Build rich text for vectorization: merchant_name + category + enriched description
+        # Try to fetch TransactionDetail
+        try:
+            detail_res = self.supabase.table("TransactionDetail").select("*").execute()
+            details_df = pd.DataFrame(detail_res.data)
+        except Exception:
+            details_df = pd.DataFrame()
+            
+        if not details_df.empty:
+            # Filter line items to only those belonging to this user's transactions
+            details_df = details_df[details_df['transaction_id'].isin(df['id'])]
+            
         texts = []
+        metadatas = []
+        vector_ids = []
+        
+        # 1. Build vectors for parent transactions
         for _, row in df.iterrows():
             merchant = row.get('merchant_name', '') or row.get('description', '')
             category = row.get('category', 'Uncategorized')
@@ -269,42 +425,70 @@ Return ONLY valid JSON with exactly these two fields:
                 texts.append(f"{base_text} — {enriched}")
             else:
                 texts.append(base_text)
-        
-        # Inject metadata into Qdrant payload (user_id for security, merchant_name for filtering)
-        meta_cols = ['id', 'amount', 'category', 'trans_date']
-        if 'merchant_name' in df.columns:
-            meta_cols.append('merchant_name')
-        metadatas = df[meta_cols].copy()
-        if 'source_csv_id' in df.columns:
-            metadatas['source_csv_id'] = df['source_csv_id']
-        metadatas = metadatas.to_dict('records')
-        
-        vector_ids = []
-        for m in metadatas: 
-            vector_ids.append(str(m['id'])) # Keep original Postgres UUID as Vector ID to prevent duplication
-            m['user_id'] = self.user_id # Secure payload identifier
-            m['transaction_date'] = str(m['trans_date']) # Rename for agent consistency
-            del m['trans_date']
-            
+                
+            meta_cols = ['id', 'amount', 'category', 'trans_date']
+            if 'merchant_name' in row:
+                meta_cols.append('merchant_name')
+            if 'source_csv_id' in row:
+                meta_cols.append('source_csv_id')
+                
+            meta = {k: row[k] for k in meta_cols if k in row and pd.notna(row[k])}
+            meta['user_id'] = self.user_id
+            meta['transaction_date'] = str(meta.pop('trans_date'))
+            meta['vector_type'] = 'transaction'
+            metadatas.append(meta)
+            vector_ids.append(str(row['id']))
+
+        # 2. Build explicit separate vectors for every line item
+        if not details_df.empty:
+            for _, d_row in details_df.iterrows():
+                parent_row = df[df['id'] == d_row['transaction_id']].iloc[0]
+                merchant = parent_row.get('merchant_name', parent_row.get('description', ''))
+                texts.append(f"Line item from {merchant}: {d_row['item_description']} — {d_row.get('enriched_info', '')}")
+                
+                # Keep parent ID in standard 'id' field so the SQL agent resolves it nicely
+                meta = {
+                    'id': str(parent_row['id']),
+                    'detail_id': str(d_row['id']),
+                    'amount': float(d_row['item_total_price'] if pd.notna(d_row.get('item_total_price')) else 0),
+                    'category': parent_row.get('category', 'Uncategorized'),
+                    'user_id': self.user_id,
+                    'transaction_date': str(parent_row['trans_date']),
+                    'vector_type': 'line_item',
+                    'merchant_name': str(merchant)
+                }
+                if 'source_csv_id' in parent_row and pd.notna(parent_row['source_csv_id']):
+                    meta['source_csv_id'] = parent_row['source_csv_id']
+                    
+                metadatas.append(meta)
+                # Use the detail_id for the Qdrant point ID to avoid UUID collisions with parents
+                vector_ids.append(str(d_row['id']))
+                
         vs.add_texts(texts=texts, metadatas=metadatas, ids=vector_ids)
         return vs
 
-    async def delete_file(self, csv_id: str):
+    async def delete_file(self, file_id: str, file_type: str = 'csv'):
         """Force delete a file and all its transactions from Postgres and Qdrant."""
         try:
             # 1. Delete from Postgres (Transactions cascade automatically if foreign keyed... but we'll manually ensure they wipe just in case)
-            self.supabase.table("Transaction").delete().eq("source_csv_id", csv_id).execute()
-            self.supabase.table("CSVFile").delete().eq("id", csv_id).execute()
+            if file_type == 'csv':
+                self.supabase.table("Transaction").delete().eq("source_csv_id", file_id).execute()
+                self.supabase.table("CSVFile").delete().eq("id", file_id).execute()
+            else:
+                self.supabase.table("TransactionDetail").delete().eq("bill_file_id", file_id).execute()
+                self.supabase.table("BillFile").delete().eq("id", file_id).execute()
             
             # 2. Delete from Qdrant via payload filter
             client = QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
+            filter_key = "metadata.source_csv_id" if file_type == 'csv' else "metadata.bill_file_id"
+            
             client.delete(
                 collection_name="transactions",
                 points_selector=qdrant_models.Filter(
                     must=[
                         qdrant_models.FieldCondition(
-                            key="metadata.source_csv_id",
-                            match=qdrant_models.MatchValue(value=csv_id)
+                            key=filter_key,
+                            match=qdrant_models.MatchValue(value=file_id)
                         )
                     ]
                 )
