@@ -71,3 +71,5 @@ notebooks/
 frontend/node_modules/
 frontend/dist/
 frontend/.expo/
+frontend/.env
+frontend/.env.*
