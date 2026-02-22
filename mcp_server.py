@@ -157,23 +157,6 @@ def query_database(query: str) -> str:
     except psycopg2.Error as e:
         return f"Database Error: {str(e)}"
 
-def get_vector_store():
-    """Initialize connection to the Qdrant vector store"""
-    # Initialize Embedding Model using Google AI Studio
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
-
-    # Connect to Qdrant Cloud
-    client = QdrantClient(
-        url=os.getenv("QDRANT_URL"),
-        api_key=os.getenv("QDRANT_API_KEY"),
-    )
-    
-    return QdrantVectorStore(
-        client=client,
-        collection_name="transactions",
-        embedding=embeddings,
-    )
-
 @mcp.tool()
 def semantic_search(query: str, top_k: int = 5) -> str:
     """
@@ -188,29 +171,28 @@ def semantic_search(query: str, top_k: int = 5) -> str:
     """
     try:
         user_id = get_current_user_id()
-        vector_store = get_vector_store()
         
-        # Apply strict multi-tenant filtering based on the payload we injected in money_rag.py
-        from qdrant_client.http import models
-        filter = models.Filter(
-            must=[models.FieldCondition(key="metadata.user_id", match=models.MatchValue(value=user_id))]
-        )
-
-        results = vector_store.similarity_search(query, k=top_k, filter=filter)
+        from backend.vector_db_client import get_vector_client
+        vdb = get_vector_client()
+        embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+        
+        results = vdb.semantic_search(query, user_id=user_id, top_k=top_k, embeddings_model=embeddings)
         
         if not results:
             return "No matching transactions found."
             
         output = []
         for doc in results:
-            amount = doc.metadata.get('amount', 'N/A')
-            date = doc.metadata.get('transaction_date', 'N/A')
-            output.append(f"Date: {date} | Match: {doc.page_content} | Amount: {amount}")
+            meta = doc['metadata']
+            amount = meta.get('amount', 'N/A')
+            date = meta.get('transaction_date', 'N/A')
+            output.append(f"Date: {date} | Match: {doc['page_content']} | Amount: {amount}")
             
         return "\n".join(output)
         
     except Exception as e:
-        return f"Error performing search: {str(e)}"
+        import traceback
+        return f"Error performing search: {str(e)}\n{traceback.format_exc()}"
 
 
 @mcp.tool()

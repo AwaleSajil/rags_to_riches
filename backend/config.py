@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     DATABRICKS_SERVER_HOSTNAME: str | None = None
     DATABRICKS_HTTP_PATH: str | None = None
     DATABRICKS_TOKEN: str | None = None
+    
+    VECTOR_DB_STACK: str = "qdrant"
+    ACTIAN_ADDRESS: str | None = None
+    ACTIAN_API_KEY: str | None = None
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")

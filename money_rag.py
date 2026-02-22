@@ -14,15 +14,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.tools import tool
 from langchain_community.utilities import SQLDatabase
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
 from langgraph.runtime import get_runtime
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_mcp_adapters.client import MultiServerMCPClient  
-from qdrant_client.http import models as qdrant_models
+from backend.vector_db_client import get_vector_client
 
 # Import specific embeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -71,10 +68,10 @@ class MoneyRAG:
         self.temp_dir = tempfile.mkdtemp()
         os.environ["DATA_DIR"] = self.temp_dir # Harmonize with mcp_server.py 
         self.db_path = os.path.join(self.temp_dir, "money_rag.db")
-        self.qdrant_path = os.path.join(self.temp_dir, "qdrant_db")
+        self.db_path = os.path.join(self.temp_dir, "money_rag.db")
         
         self.db: Optional[SQLDatabase] = None
-        self.vector_store: Optional[QdrantVectorStore] = None
+        self.vector_store_client = None
         self.agent = None
         self.mcp_client: Optional[MultiServerMCPClient] = None
         self.search_tool = DuckDuckGoSearchRun()
@@ -101,7 +98,7 @@ class MoneyRAG:
 
         try:
             self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
-            self.vector_store = self._sync_to_qdrant()
+            self.vector_store_client = self._sync_to_vectordb()
         except Exception as e:
             raise RuntimeError(f"Failed to sync to vector store: {e}") from e
         return all_duplicates
@@ -491,125 +488,23 @@ Return ONLY valid JSON with exactly these two fields:
 
         return duplicates
 
-    def _sync_to_qdrant(self):
-        # client = QdrantClient(path=self.qdrant_path)
-        client = QdrantClient(
-            url=os.getenv("QDRANT_URL"),
-            api_key=os.getenv("QDRANT_API_KEY"),
-        )
-        collection = "transactions"
-        
+    def _sync_to_vectordb(self):
         # Fetch only THIS USER'S transactions from Supabase to sync into VectorDB
         res = self.supabase.table("Transaction").select("*").eq("user_id", self.user_id).execute()
         df = pd.DataFrame(res.data)
-        
-        # Check for empty dataframe
-        if df.empty:
-            raise ValueError("No transactions found in database for this user. Please upload files first.")
-        
-        # Dynamically detect embedding dimension
-        sample_embedding = self.embeddings.embed_query("test")
-        embedding_dim = len(sample_embedding)
-
-        # Safely create the collection only if it doesn't already exist to preserve multi-tenant pool
-        if not client.collection_exists(collection):
-            client.create_collection(
-                collection_name=collection,
-                vectors_config=qdrant_models.VectorParams(size=embedding_dim, distance=qdrant_models.Distance.COSINE),
-            )
-        
-        # Security: Create a strict Payload Index on the user_id field so we can filter by it securely!
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="metadata.user_id",
-            field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
-        )
-        
-        # Create Payload Indexes for file relationships so we can safely delete vectors by file origin
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="metadata.source_csv_id",
-            field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
-        )
-        client.create_payload_index(
-            collection_name=collection,
-            field_name="metadata.bill_file_id",
-            field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
-        )
-        
-        vs = QdrantVectorStore(client=client, collection_name=collection, embedding=self.embeddings)
         
         # Try to fetch TransactionDetail
         try:
             detail_res = self.supabase.table("TransactionDetail").select("*").execute()
             details_df = pd.DataFrame(detail_res.data)
+            if not details_df.empty:
+                # Filter line items to only those belonging to this user's transactions
+                details_df = details_df[details_df['transaction_id'].isin(df['id'])]
         except Exception:
             details_df = pd.DataFrame()
             
-        if not details_df.empty:
-            # Filter line items to only those belonging to this user's transactions
-            details_df = details_df[details_df['transaction_id'].isin(df['id'])]
-            
-        texts = []
-        metadatas = []
-        vector_ids = []
-        
-        # 1. Build vectors for parent transactions
-        for _, row in df.iterrows():
-            merchant = row.get('merchant_name', '') or row.get('description', '')
-            category = row.get('category', 'Uncategorized')
-            enriched = row.get('enriched_info', '')
-            base_text = f"{merchant} ({category})"
-            if enriched:
-                texts.append(f"{base_text} — {enriched}")
-            else:
-                texts.append(base_text)
-                
-            meta_cols = ['id', 'amount', 'category', 'trans_date']
-            if 'merchant_name' in row:
-                meta_cols.append('merchant_name')
-            if 'source_csv_id' in row:
-                meta_cols.append('source_csv_id')
-                
-            meta = {k: row[k] for k in meta_cols if k in row and pd.notna(row[k])}
-            if 'source_bill_file_id' in row and pd.notna(row['source_bill_file_id']):
-                meta['bill_file_id'] = row['source_bill_file_id']
-                
-            meta['user_id'] = self.user_id
-            meta['transaction_date'] = str(meta.pop('trans_date'))
-            meta['vector_type'] = 'transaction'
-            metadatas.append(meta)
-            vector_ids.append(str(row['id']))
-
-        # 2. Build explicit separate vectors for every line item
-        if not details_df.empty:
-            for _, d_row in details_df.iterrows():
-                parent_row = df[df['id'] == d_row['transaction_id']].iloc[0]
-                merchant = parent_row.get('merchant_name', parent_row.get('description', ''))
-                texts.append(f"Line item from {merchant}: {d_row['item_description']} — {d_row.get('enriched_info', '')}")
-                
-                # Keep parent ID in standard 'id' field so the SQL agent resolves it nicely
-                meta = {
-                    'id': str(parent_row['id']),
-                    'detail_id': str(d_row['id']),
-                    'amount': float(d_row['item_total_price'] if pd.notna(d_row.get('item_total_price')) else 0),
-                    'category': parent_row.get('category', 'Uncategorized'),
-                    'user_id': self.user_id,
-                    'transaction_date': str(parent_row['trans_date']),
-                    'vector_type': 'line_item',
-                    'merchant_name': str(merchant)
-                }
-                if 'source_csv_id' in parent_row and pd.notna(parent_row['source_csv_id']):
-                    meta['source_csv_id'] = parent_row['source_csv_id']
-                if 'source_bill_file_id' in parent_row and pd.notna(parent_row['source_bill_file_id']):
-                    meta['bill_file_id'] = parent_row['source_bill_file_id']
-                    
-                metadatas.append(meta)
-                # Use the detail_id for the Qdrant point ID to avoid UUID collisions with parents
-                vector_ids.append(str(d_row['id']))
-                
-        vs.add_texts(texts=texts, metadatas=metadatas, ids=vector_ids)
-        return vs
+        vdb = get_vector_client()
+        return vdb.sync_transactions(df, details_df, self.user_id, self.embeddings)
 
     async def delete_file(self, file_id: str, file_type: str = 'csv'):
         """Force delete a file and all its transactions from Postgres and Qdrant."""
@@ -622,21 +517,9 @@ Return ONLY valid JSON with exactly these two fields:
                 self.supabase.table("TransactionDetail").delete().eq("bill_file_id", file_id).execute()
                 self.supabase.table("BillFile").delete().eq("id", file_id).execute()
             
-            # 2. Delete from Qdrant via payload filter
-            client = QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
-            filter_key = "metadata.source_csv_id" if file_type == 'csv' else "metadata.bill_file_id"
-            
-            client.delete(
-                collection_name="transactions",
-                points_selector=qdrant_models.Filter(
-                    must=[
-                        qdrant_models.FieldCondition(
-                            key=filter_key,
-                            match=qdrant_models.MatchValue(value=file_id)
-                        )
-                    ]
-                )
-            )
+            # 2. Delete from Vector Database
+            vdb = get_vector_client()
+            vdb.delete_file_vectors(file_id, file_type)
         except Exception as e:
             print(f"Error purging file data: {e}")
 
