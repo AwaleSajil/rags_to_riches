@@ -26,6 +26,7 @@ ddgs>=7.0.0
 # --- Vector DB & Data ---
 qdrant-client>=1.16.2
 langchain-qdrant>=1.1.0
+actiancortex @ https://github.com/hackmamba-io/actian-vectorAI-db-beta/raw/refs/heads/main/actiancortex-0.1.0b1-py3-none-any.whl
 sqlalchemy>=2.0.45
 pandas>=2.3.3
 redis>=7.1.0

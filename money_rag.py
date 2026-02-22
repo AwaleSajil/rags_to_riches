@@ -36,17 +36,28 @@ class MoneyRAG:
         self.model_name = model_name
         self.embedding_model_name = embedding_model_name
         self.user_id = user_id
-        
-        # Initialize Supabase Client
+        self._db_stack = os.environ.get("POSTGRESSQL_STACK", "supabase").lower()
+
+        # Initialize Supabase Client (always needed for auth, storage; also for data if stack=supabase)
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
-        
+
         # Security: Inject the logged-in user's JWT so RLS policies pass!
         if access_token:
             opts = ClientOptions(headers={"Authorization": f"Bearer {access_token}"})
             self.supabase = create_client(url, key, options=opts)
         else:
             self.supabase = create_client(url, key)
+
+        # Initialize Databricks connection if needed
+        self._databricks_conn = None
+        if self._db_stack == "databricks":
+            from databricks import sql
+            self._databricks_conn = sql.connect(
+                server_hostname=os.environ.get("DATABRICKS_SERVER_HOSTNAME"),
+                http_path=os.environ.get("DATABRICKS_HTTP_PATH"),
+                access_token=os.environ.get("DATABRICKS_TOKEN"),
+            )
         
         # Set API Keys
         if self.llm_provider == "google":
@@ -77,6 +88,124 @@ class MoneyRAG:
         self.search_tool = DuckDuckGoSearchRun()
         self.merchant_cache = {}  # Session-based cache for merchant enrichment
         self.memory = InMemorySaver()  # Session-based cache for chat memory
+
+    # --- Database abstraction helpers (Supabase vs Databricks) ---
+
+    def _db_select(self, table: str, columns: str = "*", filters: dict = None) -> List[dict]:
+        """SELECT rows from a table. Returns list of dicts."""
+        if self._db_stack == "databricks":
+            where_parts = []
+            values = []
+            if filters:
+                for k, v in filters.items():
+                    where_parts.append(f"{k} = ?")
+                    values.append(v)
+            where = " AND ".join(where_parts) if where_parts else "1=1"
+            with self._databricks_conn.cursor() as cur:
+                cur.execute(f"SELECT {columns} FROM {table} WHERE {where}", values)
+                rows = cur.fetchall()
+                if not rows:
+                    return []
+                col_names = [desc[0] for desc in cur.description]
+                return [dict(zip(col_names, r)) for r in rows]
+        else:
+            q = self.supabase.table(table).select(columns)
+            if filters:
+                for k, v in filters.items():
+                    q = q.eq(k, v)
+            res = q.execute()
+            return res.data or []
+
+    def _db_select_in(self, table: str, columns: str, field: str, values_list: list) -> List[dict]:
+        """SELECT rows WHERE field IN (...)."""
+        if not values_list:
+            return []
+        if self._db_stack == "databricks":
+            placeholders = ",".join(["?"] * len(values_list))
+            with self._databricks_conn.cursor() as cur:
+                cur.execute(f"SELECT {columns} FROM {table} WHERE {field} IN ({placeholders})", values_list)
+                rows = cur.fetchall()
+                if not rows:
+                    return []
+                col_names = [desc[0] for desc in cur.description]
+                return [dict(zip(col_names, r)) for r in rows]
+        else:
+            res = self.supabase.table(table).select(columns).in_(field, values_list).execute()
+            return res.data or []
+
+    def _db_upsert(self, table: str, records: List[dict], conflict_key: str = None):
+        """Upsert records into a table."""
+        if self._db_stack == "databricks":
+            for rec in records:
+                cols = list(rec.keys())
+                placeholders = ",".join(["?"] * len(cols))
+                col_str = ",".join(cols)
+                # Check if exists by conflict_key
+                if conflict_key and conflict_key in rec:
+                    with self._databricks_conn.cursor() as cur:
+                        cur.execute(f"SELECT id FROM {table} WHERE {conflict_key} = ?", [rec[conflict_key]])
+                        existing = cur.fetchone()
+                        if existing:
+                            set_parts = ",".join(f"{c} = ?" for c in cols if c != conflict_key)
+                            vals = [rec[c] for c in cols if c != conflict_key] + [rec[conflict_key]]
+                            cur.execute(f"UPDATE {table} SET {set_parts} WHERE {conflict_key} = ?", vals)
+                        else:
+                            cur.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", [rec[c] for c in cols])
+                else:
+                    with self._databricks_conn.cursor() as cur:
+                        cur.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", [rec[c] for c in cols])
+            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
+        else:
+            if conflict_key:
+                self.supabase.table(table).upsert(records, on_conflict=conflict_key).execute()
+            else:
+                self.supabase.table(table).insert(records).execute()
+
+    def _db_insert(self, table: str, records: List[dict]):
+        """Insert records into a table."""
+        if self._db_stack == "databricks":
+            for rec in records:
+                cols = list(rec.keys())
+                placeholders = ",".join(["?"] * len(cols))
+                col_str = ",".join(cols)
+                with self._databricks_conn.cursor() as cur:
+                    cur.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", [rec[c] for c in cols])
+            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
+        else:
+            self.supabase.table(table).insert(records).execute()
+
+    def _db_delete(self, table: str, filters: dict):
+        """Delete rows matching filters."""
+        if self._db_stack == "databricks":
+            where_parts = []
+            values = []
+            for k, v in filters.items():
+                where_parts.append(f"{k} = ?")
+                values.append(v)
+            where = " AND ".join(where_parts)
+            with self._databricks_conn.cursor() as cur:
+                cur.execute(f"DELETE FROM {table} WHERE {where}", values)
+            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
+        else:
+            q = self.supabase.table(table).delete()
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            q.execute()
+
+    def _db_update(self, table: str, data: dict, filters: dict):
+        """Update rows matching filters."""
+        if self._db_stack == "databricks":
+            set_parts = ",".join(f"{k} = ?" for k in data.keys())
+            where_parts = [f"{k} = ?" for k in filters.keys()]
+            vals = list(data.values()) + list(filters.values())
+            with self._databricks_conn.cursor() as cur:
+                cur.execute(f"UPDATE {table} SET {set_parts} WHERE {' AND '.join(where_parts)}", vals)
+            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
+        else:
+            q = self.supabase.table(table).update(data)
+            for k, v in filters.items():
+                q = q.eq(k, v)
+            q.execute()
 
     async def setup_session(self, uploaded_files: List[dict]):
         """Ingests CSVs and Bills, then sets up DBs."""
@@ -257,12 +386,11 @@ Return ONLY valid JSON with exactly these two fields:
         existing_hashes = set()
         for i in range(0, len(hashes), 100):
             batch_hashes = hashes[i:i+100]
-            existing_res = self.supabase.table("Transaction").select("content_hash").in_("content_hash", batch_hashes).execute()
-            if existing_res.data:
-                existing_hashes.update(row['content_hash'] for row in existing_res.data)
-                
+            existing_rows = self._db_select_in("Transaction", "content_hash", "content_hash", batch_hashes)
+            existing_hashes.update(row['content_hash'] for row in existing_rows)
+
         duplicates = [
-            {"date": r['trans_date'], "merchant": r.get('merchant_name', r.get('description', '')), "amount": r['amount']} 
+            {"date": r['trans_date'], "merchant": r.get('merchant_name', r.get('description', '')), "amount": r['amount']}
             for r in records if r['content_hash'] in existing_hashes
         ]
 
@@ -270,8 +398,7 @@ Return ONLY valid JSON with exactly these two fields:
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             try:
-                # Upsert based on content_hash
-                self.supabase.table("Transaction").upsert(batch, on_conflict="content_hash").execute()
+                self._db_upsert("Transaction", batch, conflict_key="content_hash")
             except Exception as e:
                 # Fallback if DB migration hasn't been run yet (no content_hash / merchant_name)
                 for r in batch:
@@ -279,10 +406,10 @@ Return ONLY valid JSON with exactly these two fields:
                     r.pop('content_hash', None)
                     r.pop('source', None)
                 try:
-                    self.supabase.table("Transaction").insert(batch).execute()
+                    self._db_insert("Transaction", batch)
                 except Exception as ex:
                     print(f"Failed fallback insert: {ex}")
-                    
+
         return duplicates
 
     async def _ingest_bill(self, file_path, file_id=None):
@@ -323,23 +450,11 @@ Return ONLY valid JSON with exactly these two fields:
             
         print(f"   ✅ Extracted {extracted.get('merchant_name')} for {extracted.get('total_amount')}")
         
-        # Save the raw OCR JSON back to the BillFile record safely via psycopg2
+        # Save the raw OCR JSON back to the BillFile record
         if file_id:
             try:
-                import psycopg2
-                db_url = os.environ.get("DATABASE_URL")
-                if db_url:
-                    conn = psycopg2.connect(db_url)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        'UPDATE "BillFile" SET raw_ocr_string = %s WHERE id = %s',
-                        (json.dumps(extracted), file_id)
-                    )
-                    conn.commit()
-                    conn.close()
-                    print("   ✅ Saved raw OCR to BillFile seamlessly.")
-                else:
-                    print("   ⚠️ DATABASE_URL not set, skipping raw OCR save.")
+                self._db_update("BillFile", {"raw_ocr_string": json.dumps(extracted)}, {"id": file_id})
+                print("   ✅ Saved raw OCR to BillFile seamlessly.")
             except Exception as e:
                 print(f"   ⚠️ Failed to save raw_ocr_string to BillFile: {e}")
         
@@ -400,8 +515,8 @@ Return ONLY valid JSON with exactly these two fields:
             tx_record["source_bill_file_id"] = file_id
             
         # Check duplicate before upserting
-        existing_res = self.supabase.table("Transaction").select("id").eq("content_hash", content_hash).eq("user_id", self.user_id).execute()
-        is_duplicate = len(existing_res.data) > 0
+        existing_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
+        is_duplicate = len(existing_rows) > 0
         duplicates = [{"date": tx_record['trans_date'], "merchant": tx_record['merchant_name'], "amount": tx_record['amount']}] if is_duplicate else []
             
         # Optional: Enrich line items
@@ -426,15 +541,10 @@ Return ONLY valid JSON with exactly these two fields:
         try:
             print(f"   [DEBUG] Preparing to Upsert Transaction with source_bill_file_id: {file_id}")
             if file_id:
-                import psycopg2
-                conn_tmp = psycopg2.connect(os.environ.get("DATABASE_URL"))
-                cur_tmp = conn_tmp.cursor()
-                cur_tmp.execute("SELECT count(*) FROM \"BillFile\" WHERE id = %s", (file_id,))
-                cnt = cur_tmp.fetchone()[0]
-                conn_tmp.close()
-                print(f"   [DEBUG] BillFile presence check via Psycopg2: {cnt} rows found.")
-                
-            upsert_res = self.supabase.table("Transaction").upsert([tx_record], on_conflict="content_hash").execute()
+                bill_check = self._db_select("BillFile", "id", {"id": file_id})
+                print(f"   [DEBUG] BillFile presence check: {len(bill_check)} rows found.")
+
+            self._db_upsert("Transaction", [tx_record], conflict_key="content_hash")
             print("   [DEBUG] Upsert successful!")
         except Exception as e:
             print(f"   ⚠️ Upsert failed (migration not run?), falling back to insert: {e}")
@@ -442,30 +552,18 @@ Return ONLY valid JSON with exactly these two fields:
             tx_record.pop('content_hash', None)
             tx_record.pop('source', None)
             try:
-                upsert_res = self.supabase.table("Transaction").insert([tx_record]).execute()
+                self._db_insert("Transaction", [tx_record])
             except Exception as e2:
                 print(f"   ❌ Fallback insert completely failed: {e2}")
-            
-        # Get the transaction ID to link details (upsert doesn't always return data on conflict update, so explicit select is safest)
+
+        # Get the transaction ID to link details
         try:
-            fetch_res = self.supabase.table("Transaction").select("id, created_at").eq("content_hash", content_hash).eq("user_id", self.user_id).execute()
-            if fetch_res.data:
-                tx_id = fetch_res.data[0]['id']
-                # If we just upserted, we can loosely guess it was a duplicate if it's older than ~1 minute prior
-                # But a cleaner way is just tracking if it already existed BEFORE upsert! 
-                # Let's just return a standard duplicate dict structure for Bills right now if it was an update.
-            else:
-                tx_id = None
+            fetch_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
+            tx_id = fetch_rows[0]['id'] if fetch_rows else None
         except Exception as e:
             print(f"   ⚠️ Failed to fetch transaction ID: {e}")
             tx_id = None
-            
-        # Check duplicate by looking at content_hash before upsert?
-        # Since we already ran the upsert, any existing row is updated.
-        # Actually we should have checked duplicate before the upsert. Let's just track it here by assuming anything with source='both' or existing is dup.
-        # For simplicity, let's just use the `fetch_res` info or we can do a preemptive check in future. For bills, there's exactly 1 record.
-        # Let's just query before the upsert! Wait, we already did the upsert on line 389.
-        
+
         if tx_id and line_items:
             details = []
             for item in line_items:
@@ -481,7 +579,7 @@ Return ONLY valid JSON with exactly these two fields:
                     "enriched_info": item.get('enriched_info', '')
                 })
             try:
-                self.supabase.table("TransactionDetail").insert(details).execute()
+                self._db_insert("TransactionDetail", details)
                 print(f"   ✅ Saved {len(details)} line items.")
             except Exception as e:
                 print(f"   ⚠️ Failed to insert details (table might not exist): {e}")
@@ -489,35 +587,33 @@ Return ONLY valid JSON with exactly these two fields:
         return duplicates
 
     def _sync_to_vectordb(self):
-        # Fetch only THIS USER'S transactions from Supabase to sync into VectorDB
-        res = self.supabase.table("Transaction").select("*").eq("user_id", self.user_id).execute()
-        df = pd.DataFrame(res.data)
-        
+        # Fetch only THIS USER'S transactions to sync into VectorDB
+        rows = self._db_select("Transaction", "*", {"user_id": self.user_id})
+        df = pd.DataFrame(rows)
+
         # Try to fetch TransactionDetail
         try:
-            detail_res = self.supabase.table("TransactionDetail").select("*").execute()
-            details_df = pd.DataFrame(detail_res.data)
-            if not details_df.empty:
-                # Filter line items to only those belonging to this user's transactions
+            detail_rows = self._db_select("TransactionDetail", "*", {"user_id": self.user_id})
+            details_df = pd.DataFrame(detail_rows)
+            if not details_df.empty and not df.empty:
                 details_df = details_df[details_df['transaction_id'].isin(df['id'])]
         except Exception:
             details_df = pd.DataFrame()
-            
+
         vdb = get_vector_client()
         return vdb.sync_transactions(df, details_df, self.user_id, self.embeddings)
 
     async def delete_file(self, file_id: str, file_type: str = 'csv'):
-        """Force delete a file and all its transactions from Postgres and Qdrant."""
+        """Force delete a file and all its transactions from the database and vector store."""
         try:
-            # 1. Delete from Postgres (Transactions cascade automatically if foreign keyed... but we'll manually ensure they wipe just in case)
             if file_type == 'csv':
-                self.supabase.table("Transaction").delete().eq("source_csv_id", file_id).execute()
-                self.supabase.table("CSVFile").delete().eq("id", file_id).execute()
+                self._db_delete("Transaction", {"source_csv_id": file_id})
+                self._db_delete("CSVFile", {"id": file_id})
             else:
-                self.supabase.table("TransactionDetail").delete().eq("bill_file_id", file_id).execute()
-                self.supabase.table("BillFile").delete().eq("id", file_id).execute()
-            
-            # 2. Delete from Vector Database
+                self._db_delete("TransactionDetail", {"bill_file_id": file_id})
+                self._db_delete("BillFile", {"id": file_id})
+
+            # Delete from Vector Database
             vdb = get_vector_client()
             vdb.delete_file_vectors(file_id, file_type)
         except Exception as e:

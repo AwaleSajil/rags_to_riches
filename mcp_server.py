@@ -1,14 +1,10 @@
 import pandas as pd
 import plotly.express as px
 from fastmcp import FastMCP
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from dotenv import load_dotenv
 import os
 from typing import Optional
-
-import shutil
 
 from textwrap import dedent
 
@@ -21,19 +17,26 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__
 # Initialize the MCP Server
 mcp = FastMCP("Money RAG Financial Analyst")
 
-import psycopg2
 from supabase import create_client, Client
 
+# Database stack detection
+DB_STACK = os.environ.get("POSTGRESSQL_STACK", "supabase").lower()
+
 def get_db_connection():
-    """Returns a psycopg2 connection to Supabase Postgres."""
-    # Supabase provides postgres connection strings, but typically doesn't default in plain OS vars unless you build it
-    # Supabase gives a postgres:// connection string in the dashboard under Database Settings.
-    # Alternatively we can build it manually or just use the Supabase python client.
-    # To support raw LLM SQL, we use psycopg2 instead of Supabase client.
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise ValueError("DATABASE_URL must be defined to construct raw SQL connections.")
-    return psycopg2.connect(db_url)
+    """Returns a database connection (psycopg2 for Supabase, databricks.sql for Databricks)."""
+    if DB_STACK == "databricks":
+        from databricks import sql
+        return sql.connect(
+            server_hostname=os.environ.get("DATABRICKS_SERVER_HOSTNAME"),
+            http_path=os.environ.get("DATABRICKS_HTTP_PATH"),
+            access_token=os.environ.get("DATABRICKS_TOKEN"),
+        )
+    else:
+        import psycopg2
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise ValueError("DATABASE_URL must be defined to construct raw SQL connections.")
+        return psycopg2.connect(db_url)
 
 def get_current_user_id() -> str:
     user_id = os.environ.get("CURRENT_USER_ID")
@@ -41,35 +44,51 @@ def get_current_user_id() -> str:
         raise ValueError("CURRENT_USER_ID not injected into MCP environment!")
     return user_id
 
+def _quote_table(name: str) -> str:
+    """Quote a table name appropriately for the current DB stack."""
+    if DB_STACK == "databricks":
+        return name  # Databricks uses unquoted or backtick-quoted names
+    return f'"{name}"'  # Postgres uses double-quoted identifiers
+
+def _execute_query(conn, query: str):
+    """Execute a query and return (rows, column_names). Works with both psycopg2 and Databricks."""
+    cursor = conn.cursor()
+    cursor.execute(query)
+    results = cursor.fetchall()
+    column_names = [desc[0] for desc in cursor.description] if cursor.description else []
+    return results, column_names
+
 def get_schema_info() -> str:
-    """Get database schema information for Postgres tables."""
-    return dedent("""
-    Here is the PostgreSQL database schema for the authenticated user's data.
-    
+    """Get database schema information."""
+    tbl = _quote_table("Transaction")
+    dtbl = _quote_table("TransactionDetail")
+    return dedent(f"""
+    Here is the database schema for the authenticated user's data.
+
     CRITICAL RULE:
-    You MUST add `WHERE user_id = '{current_user_id}'` to EVERY SINGLE query you write.
+    You MUST add `WHERE user_id = '{{current_user_id}}'` to EVERY SINGLE query you write.
     Never query data without filtering by user_id!
-    
-    TABLE: "Transaction"
+
+    TABLE: {tbl}
     Columns:
-      - id (UUID)
-      - user_id (UUID)
+      - id (UUID/STRING)
+      - user_id (UUID/STRING)
       - trans_date (DATE)
       - description (TEXT)
-      - amount (DECIMAL)
-      - category (VARCHAR)
+      - amount (DECIMAL/DOUBLE)
+      - category (VARCHAR/STRING)
       - merchant_name (TEXT)
 
-    TABLE: "TransactionDetail"
+    TABLE: {dtbl}
     Columns:
-      - id (UUID)
-      - transaction_id (UUID)
-      - user_id (UUID)
+      - id (UUID/STRING)
+      - transaction_id (UUID/STRING)
+      - user_id (UUID/STRING)
       - item_description (TEXT)
-      - item_quantity (DECIMAL)
-      - item_unit_price (DECIMAL)
-      - item_total_price (DECIMAL)
-      - tax_amount (DECIMAL)
+      - item_quantity (DECIMAL/DOUBLE)
+      - item_unit_price (DECIMAL/DOUBLE)
+      - item_total_price (DECIMAL/DOUBLE)
+      - tax_amount (DECIMAL/DOUBLE)
       - enriched_info (TEXT)
     """)
 
@@ -82,25 +101,24 @@ def get_database_schema() -> str:
 @mcp.tool()
 def query_database(query: str) -> str:
     """
-    Execute a raw SQL query against the Postgres database.
-    The main table is named "Transaction" (you MUST INCLUDE QUOTES in your SQL!).
+    Execute a raw SQL query against the database.
     IMPORTANT STRICT SCHEMA:
-    Table: "Transaction"
-    - id (UUID)
-    - user_id (UUID text)
+    Table: Transaction
+    - id (UUID/STRING)
+    - user_id (UUID/STRING)
     - trans_date (DATE)
     - description (TEXT)
     - merchant_name (TEXT)
-    - amount (NUMERIC)
+    - amount (NUMERIC/DOUBLE)
     - category (TEXT)
-    
-    Table: "TransactionDetail"
-    - id (UUID)
-    - transaction_id (UUID)
-    - user_id (UUID text)
+
+    Table: TransactionDetail
+    - id (UUID/STRING)
+    - transaction_id (UUID/STRING)
+    - user_id (UUID/STRING)
     - item_description (TEXT)
-    - item_quantity (NUMERIC)
-    - item_total_price (NUMERIC)
+    - item_quantity (NUMERIC/DOUBLE)
+    - item_total_price (NUMERIC/DOUBLE)
     - enriched_info (TEXT)
 
     Args:
@@ -111,13 +129,13 @@ def query_database(query: str) -> str:
 
     Important Notes:
     - Only SELECT queries are allowed (read-only)
-    - Use 'description' column for text search 
+    - Use 'description' column for text search
     - 'amount' column: positive values = spending, negative values = payments/refunds
 
     Example queries:
-    - Find Walmart spending: SELECT SUM(amount) FROM "Transaction" WHERE description LIKE '%Walmart%' AND amount > 0;
-    - List recent transactions: SELECT trans_date, description, amount, category FROM "Transaction" ORDER BY trans_date DESC LIMIT 5;
-    - Spending by category: SELECT category, SUM(amount) FROM "Transaction" WHERE amount > 0 GROUP BY category;
+    - Find Walmart spending: SELECT SUM(amount) FROM Transaction WHERE description LIKE '%Walmart%' AND amount > 0;
+    - List recent transactions: SELECT trans_date, description, amount, category FROM Transaction ORDER BY trans_date DESC LIMIT 5;
+    - Spending by category: SELECT category, SUM(amount) FROM Transaction WHERE amount > 0 GROUP BY category;
     """
     # Security: Only allow SELECT queries
     query_upper = query.strip().upper()
@@ -135,18 +153,12 @@ def query_database(query: str) -> str:
 
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(query)
-        results = cursor.fetchall()
-        
-        # Get column names to make result more readable
-        column_names = [desc[0] for desc in cursor.description] if cursor.description else []
-        
+        results, column_names = _execute_query(conn, query)
         conn.close()
 
         if not results:
             return "No results found"
-            
+
         # Format results nicely
         formatted_results = []
         formatted_results.append(f"Columns: {', '.join(column_names)}")
@@ -154,7 +166,7 @@ def query_database(query: str) -> str:
             formatted_results.append(str(row))
 
         return "\n".join(formatted_results)
-    except psycopg2.Error as e:
+    except Exception as e:
         return f"Database Error: {str(e)}"
 
 @mcp.tool()
@@ -219,8 +231,9 @@ def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_co
             return f'{{"error": "You forgot the WHERE user_id = \\"{user_id}\\" security clause!"}}'
             
         conn = get_db_connection()
-        df = pd.read_sql_query(sql_query, conn)
+        results, columns = _execute_query(conn, sql_query)
         conn.close()
+        df = pd.DataFrame(results, columns=columns)
         if df.empty:
             return '{"error": "No data found for this query."}'
         if chart_type == "bar":
@@ -306,14 +319,12 @@ def get_bill_images(sql_query: str) -> str:
             return f'{{"error": "You forgot the WHERE user_id = \\"{user_id}\\" security clause!"}}'
             
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(sql_query)
-        results = cursor.fetchall()
+        results, _ = _execute_query(conn, sql_query)
         conn.close()
-        
+
         if not results:
             return '{"error": "No bills found for this query."}'
-            
+
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
         supabase = create_client(url, key)

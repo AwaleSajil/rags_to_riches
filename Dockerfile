@@ -27,9 +27,9 @@ RUN npx expo export --platform web
 # ---- Stage 2: Python backend ----
 FROM python:3.11-slim
 
-# System deps for psycopg2-binary and general build tools
+# System deps for psycopg2-binary, grpcio (actiancortex), and general build tools
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libpq-dev && \
+    apt-get install -y --no-install-recommends gcc g++ libpq-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
