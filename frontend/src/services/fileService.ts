@@ -56,6 +56,16 @@ export async function uploadFiles(
   return result;
 }
 
+export interface IngestionStatus {
+  status: "idle" | "processing" | "complete" | "failed";
+  error?: string | null;
+  duplicates?: { date: string; merchant: string; amount: number }[];
+}
+
+export async function getIngestionStatus(): Promise<IngestionStatus> {
+  return apiJson<IngestionStatus>("/files/ingestion-status");
+}
+
 export async function deleteFile(
   fileId: string,
   fileType: string

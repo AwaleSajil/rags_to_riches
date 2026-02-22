@@ -57,12 +57,14 @@ export function useChat() {
             log.info("Final response (hook)", {
               contentLength: data.content?.length,
               chartCount: data.charts?.length || 0,
+              imageCount: data.images?.length || 0,
               toolTraceCount: toolTraces.length,
             });
             const assistantMsg: ChatMessage = {
               role: "assistant",
               content: data.content,
               charts: data.charts?.length ? data.charts : undefined,
+              images: data.images?.length ? data.images : undefined,
               toolTraces: toolTraces.length ? [...toolTraces] : undefined,
             };
             setMessages((prev) => [...prev, assistantMsg]);

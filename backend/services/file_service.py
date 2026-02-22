@@ -172,10 +172,19 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
             logger.debug("Subprocess stderr:\n%s", stderr.decode())
 
         if proc.returncode == 0:
-            ingestion_status[user_id] = {"status": "complete", "error": None}
+            duplicates = []
+            if stdout:
+                for line in reversed(stdout.decode().strip().split("\n")):
+                    try:
+                        result = json.loads(line)
+                        duplicates = result.get("duplicates", [])
+                        break
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+            ingestion_status[user_id] = {"status": "complete", "error": None, "duplicates": duplicates}
             logger.info(
-                "Background ingestion complete for user_id=%s — PID=%d, %.1fms",
-                user_id, proc.pid, elapsed_ms,
+                "Background ingestion complete for user_id=%s — PID=%d, %.1fms, %d duplicates",
+                user_id, proc.pid, elapsed_ms, len(duplicates),
             )
             await rag_manager.invalidate(user_id)
         else:

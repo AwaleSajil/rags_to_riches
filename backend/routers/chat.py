@@ -60,11 +60,29 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
                             content = pre + rest
                             logger.warning("Found ===CHART=== without matching ===ENDCHART===")
                             break
+
+                    images = []
+                    # Extract image URLs from ===IMAGES===...===ENDIMAGES=== markers
+                    while "===IMAGES===" in content:
+                        pre, rest = content.split("===IMAGES===", 1)
+                        if "===ENDIMAGES===" in rest:
+                            images_json, content = rest.split("===ENDIMAGES===", 1)
+                            try:
+                                urls = json.loads(images_json.strip())
+                                images.extend(urls)
+                                logger.debug("Extracted %d image URLs", len(urls))
+                            except json.JSONDecodeError:
+                                logger.warning("Failed to parse images JSON")
+                        else:
+                            content = pre + rest
+                            logger.warning("Found ===IMAGES=== without matching ===ENDIMAGES===")
+                            break
+
                     logger.debug(
-                        "Final response: %d charts extracted, content length=%d",
-                        len(charts), len(content.strip()),
+                        "Final response: %d charts, %d images extracted, content length=%d",
+                        len(charts), len(images), len(content.strip()),
                     )
-                    yield f"event: final\ndata: {json.dumps({'content': content.strip(), 'charts': charts})}\n\n"
+                    yield f"event: final\ndata: {json.dumps({'content': content.strip(), 'charts': charts, 'images': images})}\n\n"
                 else:
                     yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
 

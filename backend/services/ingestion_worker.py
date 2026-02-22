@@ -47,12 +47,15 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
 
     logger.debug("Calling rag.setup_session with %d files", len(uploaded_files_info))
     session_start = time.perf_counter()
-    await rag.setup_session(uploaded_files_info)
+    duplicates = await rag.setup_session(uploaded_files_info)
     session_ms = (time.perf_counter() - session_start) * 1000
     logger.info(
-        "Ingestion worker complete — user_id=%s, %d files processed in %.1fms",
-        user_id, len(uploaded_files_info), session_ms,
+        "Ingestion worker complete — user_id=%s, %d files processed in %.1fms, %d duplicates",
+        user_id, len(uploaded_files_info), session_ms, len(duplicates or []),
     )
+
+    # Output result as JSON on stdout for the parent process to parse
+    print(json.dumps({"duplicates": duplicates or []}))
 
 
 if __name__ == "__main__":

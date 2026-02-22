@@ -20,10 +20,13 @@ export default function IngestScreen() {
     files,
     isLoading,
     isUploading,
+    isIngesting,
     isDeleting,
     error,
+    duplicates,
     uploadFiles,
     deleteFile,
+    clearDuplicates,
   } = useFiles();
 
   const [pickedFiles, setPickedFiles] = useState<
@@ -103,11 +106,11 @@ export default function IngestScreen() {
     });
     const ok = await uploadFiles(pickedFiles);
     if (ok) {
-      log.info("Ingest successful");
+      log.info("Upload successful, ingestion processing in background");
       setPickedFiles([]);
       setSnackbar({
         visible: true,
-        message: "Data uploaded, parsed, and vectorized!",
+        message: "Files uploaded! Ingestion processing in background...",
         error: false,
       });
     } else {
@@ -192,6 +195,45 @@ export default function IngestScreen() {
             </View>
           )}
         </GlassCard>
+
+        {/* Ingestion Status */}
+        {isIngesting && (
+          <GlassCard>
+            <View style={styles.ingestingRow}>
+              <Text style={styles.ingestingText}>Ingesting files... This may take a minute.</Text>
+            </View>
+          </GlassCard>
+        )}
+
+        {/* Duplicate Warnings */}
+        {duplicates.length > 0 && (
+          <GlassCard>
+            <Text style={styles.duplicateTitle}>
+              {duplicates.length} duplicate transaction(s) detected
+            </Text>
+            <Text style={styles.duplicateSubtitle}>
+              These were merged/skipped during ingestion:
+            </Text>
+            {duplicates.slice(0, 10).map((d, i) => (
+              <Text key={i} style={styles.duplicateItem}>
+                {d.date} - {d.merchant} - ${Number(d.amount).toFixed(2)}
+              </Text>
+            ))}
+            {duplicates.length > 10 && (
+              <Text style={styles.duplicateSubtitle}>
+                ...and {duplicates.length - 10} more
+              </Text>
+            )}
+            <Button
+              mode="text"
+              onPress={clearDuplicates}
+              compact
+              style={styles.dismissButton}
+            >
+              Dismiss
+            </Button>
+          </GlassCard>
+        )}
 
         <Divider style={styles.divider} />
 
@@ -298,5 +340,36 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     fontSize: 14,
     marginTop: 8,
+  },
+  ingestingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  ingestingText: {
+    fontSize: 14,
+    color: colors.primary,
+    fontWeight: "600",
+  },
+  duplicateTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#b45309",
+    marginBottom: 4,
+  },
+  duplicateSubtitle: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    marginBottom: 8,
+  },
+  duplicateItem: {
+    fontSize: 13,
+    color: colors.text,
+    paddingLeft: 8,
+    paddingVertical: 2,
+  },
+  dismissButton: {
+    alignSelf: "flex-start",
+    marginTop: 4,
   },
 });

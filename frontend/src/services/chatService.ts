@@ -8,7 +8,7 @@ const log = createLogger("ChatService");
 export interface ChatEventCallbacks {
   onToolStart: (data: { name: string; input: string }) => void;
   onToolEnd: (data: { name: string; snippet: string }) => void;
-  onFinal: (data: { content: string; charts: string[] }) => void;
+  onFinal: (data: { content: string; charts: string[]; images: string[] }) => void;
   onDone: () => void;
   onError: (error: string) => void;
 }

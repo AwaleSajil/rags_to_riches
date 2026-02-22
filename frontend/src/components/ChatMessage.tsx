@@ -1,5 +1,5 @@
 import React from "react";
-import { StyleSheet, View } from "react-native";
+import { Image, ScrollView, StyleSheet, View } from "react-native";
 import { Text } from "react-native-paper";
 import Markdown from "react-native-markdown-display";
 import { ToolTrace } from "./ToolTrace";
@@ -28,6 +28,18 @@ export function ChatMessage({ message }: ChatMessageProps) {
         {message.charts?.map((chartJson, i) => (
           <PlotlyChart key={i} chartJson={chartJson} />
         ))}
+        {message.images && message.images.length > 0 && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.imageRow}>
+            {message.images.map((url, i) => (
+              <Image
+                key={i}
+                source={{ uri: url }}
+                style={styles.receiptImage}
+                resizeMode="contain"
+              />
+            ))}
+          </ScrollView>
+        )}
       </View>
     </View>
   );
@@ -58,6 +70,16 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: 4,
     borderWidth: 1,
     borderColor: colors.surfaceBorder,
+  },
+  imageRow: {
+    marginTop: 8,
+  },
+  receiptImage: {
+    width: 200,
+    height: 280,
+    borderRadius: 8,
+    marginRight: 8,
+    backgroundColor: colors.surfaceBorder,
   },
 });
 

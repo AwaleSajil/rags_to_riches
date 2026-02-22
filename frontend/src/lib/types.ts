@@ -24,6 +24,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   charts?: string[];
+  images?: string[];
   toolTraces?: ToolEvent[];
 }
 
