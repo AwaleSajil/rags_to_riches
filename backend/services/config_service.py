@@ -1,23 +1,23 @@
 import asyncio
 import logging
 
-from backend.dependencies import get_supabase
+from backend.db_client import get_db_client
 
 logger = logging.getLogger("moneyrag.services.config")
 
 
 def _get_config_sync(access_token: str, user_id: str) -> dict | None:
     logger.debug("Querying AccountConfig for user_id=%s", user_id)
-    client = get_supabase(access_token)
-    res = client.table("AccountConfig").select("*").eq("user_id", user_id).execute()
-    if res.data:
-        logger.debug(
-            "AccountConfig found for user_id=%s — provider=%s, model=%s",
-            user_id, res.data[0].get("llm_provider"), res.data[0].get("decode_model"),
-        )
-        return res.data[0]
-    logger.debug("No AccountConfig found for user_id=%s", user_id)
-    return None
+    with get_db_client(access_token) as db:
+        res = db.get_account_config(user_id)
+        if res:
+            logger.debug(
+                "AccountConfig found for user_id=%s — provider=%s, model=%s",
+                user_id, res.get("llm_provider"), res.get("decode_model"),
+            )
+            return res
+        logger.debug("No AccountConfig found for user_id=%s", user_id)
+        return None
 
 
 def _upsert_config_sync(access_token: str, user_id: str, data: dict) -> dict:
@@ -25,23 +25,10 @@ def _upsert_config_sync(access_token: str, user_id: str, data: dict) -> dict:
         "Upserting AccountConfig for user_id=%s — provider=%s, model=%s, embedding=%s",
         user_id, data["llm_provider"], data["decode_model"], data["embedding_model"],
     )
-    client = get_supabase(access_token)
-    record = {
-        "user_id": user_id,
-        "llm_provider": data["llm_provider"],
-        "api_key": data["api_key"],
-        "decode_model": data["decode_model"],
-        "embedding_model": data["embedding_model"],
-    }
-    existing = client.table("AccountConfig").select("id").eq("user_id", user_id).execute()
-    if existing.data:
-        logger.debug("Updating existing AccountConfig id=%s for user_id=%s", existing.data[0]["id"], user_id)
-        client.table("AccountConfig").update(record).eq("id", existing.data[0]["id"]).execute()
-    else:
-        logger.debug("Inserting new AccountConfig for user_id=%s", user_id)
-        client.table("AccountConfig").insert(record).execute()
-    logger.debug("AccountConfig upsert complete for user_id=%s", user_id)
-    return record
+    with get_db_client(access_token) as db:
+        record = db.upsert_account_config(user_id, data)
+        logger.debug("AccountConfig upsert complete for user_id=%s", user_id)
+        return record
 
 
 async def get_config(user: dict) -> dict | None:

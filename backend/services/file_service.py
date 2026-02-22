@@ -6,6 +6,7 @@ import sys
 import time
 from typing import List
 from backend.dependencies import get_supabase
+from backend.db_client import get_db_client
 from backend.services.rag_manager import rag_manager
 from backend.services import config_service
 
@@ -21,19 +22,18 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 
 def _list_files_sync(access_token: str, user_id: str) -> List[dict]:
     logger.debug("Querying CSVFile and BillFile tables for user_id=%s", user_id)
-    client = get_supabase(access_token)
-    res_csv = client.table("CSVFile").select("*").eq("user_id", user_id).execute()
-    res_bill = client.table("BillFile").select("*").eq("user_id", user_id).execute()
+    with get_db_client(access_token) as db:
+        res_csv, res_bill = db.list_files(user_id)
 
-    csv_count = len(res_csv.data or [])
-    bill_count = len(res_bill.data or [])
+    csv_count = len(res_csv)
+    bill_count = len(res_bill)
     logger.debug("Found %d CSV files, %d bill files for user_id=%s", csv_count, bill_count, user_id)
 
     files = []
-    for d in (res_csv.data or []):
+    for d in res_csv:
         d["type"] = "csv"
         files.append(d)
-    for d in (res_bill.data or []):
+    for d in res_bill:
         d["type"] = "bill"
         files.append(d)
     return files
@@ -55,44 +55,41 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
     uploaded_files_info = []
     file_ids = []
 
-    for file_info in saved_files:
-        local_path = file_info["local_path"]
-        filename = file_info["filename"]
-        is_image = filename.lower().endswith((".png", ".jpg", ".jpeg"))
-        folder = "bills" if is_image else "csvs"
-        s3_key = f"{user['id']}/{folder}/{filename}"
+    with get_db_client(user["access_token"]) as db:
+        for file_info in saved_files:
+            local_path = file_info["local_path"]
+            filename = file_info["filename"]
+            is_image = filename.lower().endswith((".png", ".jpg", ".jpeg"))
+            folder = "bills" if is_image else "csvs"
+            s3_key = f"{user['id']}/{folder}/{filename}"
 
-        content_type = "text/csv"
-        if filename.lower().endswith(".png"):
-            content_type = "image/png"
-        elif filename.lower().endswith((".jpg", ".jpeg")):
-            content_type = "image/jpeg"
+            content_type = "text/csv"
+            if filename.lower().endswith(".png"):
+                content_type = "image/png"
+            elif filename.lower().endswith((".jpg", ".jpeg")):
+                content_type = "image/jpeg"
 
-        logger.debug(
-            "Uploading '%s' to storage — s3_key=%s, content_type=%s",
-            filename, s3_key, content_type,
-        )
-        start = time.perf_counter()
-        client.storage.from_("money-rag-files").upload(
-            file=local_path,
-            path=s3_key,
-            file_options={"content-type": content_type, "upsert": "true"},
-        )
-        upload_ms = (time.perf_counter() - start) * 1000
-        logger.debug("Storage upload complete for '%s' in %.1fms", filename, upload_ms)
+            logger.debug(
+                "Uploading '%s' to storage — s3_key=%s, content_type=%s",
+                filename, s3_key, content_type,
+            )
+            start = time.perf_counter()
+            client.storage.from_("money-rag-files").upload(
+                file=local_path,
+                path=s3_key,
+                file_options={"content-type": content_type, "upsert": "true"},
+            )
+            upload_ms = (time.perf_counter() - start) * 1000
+            logger.debug("Storage upload complete for '%s' in %.1fms", filename, upload_ms)
 
-        table = "BillFile" if is_image else "CSVFile"
-        logger.debug("Inserting DB record into %s for '%s'", table, filename)
-        file_record = client.table(table).insert({
-            "user_id": user["id"],
-            "filename": filename,
-            "s3_key": s3_key,
-        }).execute()
+            table = "BillFile" if is_image else "CSVFile"
+            logger.debug("Inserting DB record into %s for '%s'", table, filename)
+            
+            file_id = db.insert_file_record(table, user["id"], filename, s3_key)
 
-        file_id = file_record.data[0]["id"]
-        file_ids.append(file_id)
-        uploaded_files_info.append({"path": local_path, "file_id": file_id})
-        logger.debug("DB record created — file_id=%s for '%s'", file_id, filename)
+            file_ids.append(file_id)
+            uploaded_files_info.append({"path": local_path, "file_id": file_id})
+            logger.debug("DB record created — file_id=%s for '%s'", file_id, filename)
 
     logger.debug(
         "All %d files uploaded — file_ids=%s",
@@ -212,20 +209,22 @@ def _delete_file_sync(access_token: str, file_id: str, file_type: str) -> tuple[
     client = get_supabase(access_token)
     table = "CSVFile" if file_type == "csv" else "BillFile"
     logger.debug("Looking up file in %s table", table)
-    record = client.table(table).select("*").eq("id", file_id).execute()
-    if not record.data:
-        logger.warning("File not found — file_id=%s in table %s", file_id, table)
-        raise ValueError("File not found")
+    
+    with get_db_client(access_token) as db:
+        record = db.get_file_record(table, file_id)
+        if not record:
+            logger.warning("File not found — file_id=%s in table %s", file_id, table)
+            raise ValueError("File not found")
 
-    s3_key = record.data[0]["s3_key"]
-    filename = record.data[0]["filename"]
-    logger.debug("Found file '%s' — s3_key=%s, deleting from storage", filename, s3_key)
+        s3_key = record["s3_key"]
+        filename = record["filename"]
+        logger.debug("Found file '%s' — s3_key=%s, deleting from storage", filename, s3_key)
 
-    try:
-        client.storage.from_("money-rag-files").remove([s3_key])
-        logger.debug("Storage delete succeeded for s3_key=%s", s3_key)
-    except Exception as e:
-        logger.warning("Storage delete failed for s3_key=%s: %s", s3_key, e)
+        try:
+            client.storage.from_("money-rag-files").remove([s3_key])
+            logger.debug("Storage delete succeeded for s3_key=%s", s3_key)
+        except Exception as e:
+            logger.warning("Storage delete failed for s3_key=%s: %s", s3_key, e)
 
     return filename, file_type
 
@@ -258,11 +257,8 @@ async def delete_file(user: dict, file_id: str, file_type: str):
 
 def _delete_fallback_sync(access_token: str, file_id: str, file_type: str):
     logger.debug("_delete_fallback_sync — file_id=%s, type=%s", file_id, file_type)
-    client = get_supabase(access_token)
     table = "CSVFile" if file_type == "csv" else "BillFile"
-    if file_type == "csv":
-        logger.debug("Deleting Transactions for source_csv_id=%s", file_id)
-        client.table("Transaction").delete().eq("source_csv_id", file_id).execute()
-    logger.debug("Deleting %s record for file_id=%s", table, file_id)
-    client.table(table).delete().eq("id", file_id).execute()
-    logger.debug("Fallback DB delete complete for file_id=%s", file_id)
+    with get_db_client(access_token) as db:
+        logger.debug("Deleting %s record for file_id=%s", table, file_id)
+        db.delete_file_record(table, file_id)
+        logger.debug("Fallback DB delete complete for file_id=%s", file_id)

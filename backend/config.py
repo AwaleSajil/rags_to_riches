@@ -12,10 +12,15 @@ class Settings(BaseSettings):
     QDRANT_URL: str
     QDRANT_API_KEY: str
     DATABASE_URL: str
+    POSTGRESSQL_STACK: str = "supabase"
+    DATABRICKS_SERVER_HOSTNAME: str | None = None
+    DATABRICKS_HTTP_PATH: str | None = None
+    DATABRICKS_TOKEN: str | None = None
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 @lru_cache()

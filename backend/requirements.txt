@@ -6,3 +6,4 @@ python-multipart>=0.0.18
 # The following are also needed (in ../requirements.txt):
 # langchain, langgraph, qdrant-client, supabase, pandas, plotly, etc.
 # Install both: pip install -r requirements.txt -r backend/requirements.txt
+databricks-sql-connector
