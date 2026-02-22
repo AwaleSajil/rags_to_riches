@@ -129,5 +129,19 @@ async def public_config():
 # --- Serve Expo web build as static files (for Docker / HF Spaces) ---
 _static_dir = Path(__file__).resolve().parent.parent / "static"
 if _static_dir.is_dir():
+    from starlette.responses import FileResponse
+
     logger.info("Serving static frontend from %s", _static_dir)
-    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+
+    # Mount static assets (JS/CSS/images) at /_expo so they don't conflict with API
+    app.mount("/_expo", StaticFiles(directory=str(_static_dir / "_expo")), name="expo-assets")
+
+    # Catch-all: serve index.html for any non-API route (SPA client-side routing)
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # Try to serve the exact static file first
+        file_path = _static_dir / full_path
+        if full_path and file_path.is_file():
+            return FileResponse(file_path)
+        # Otherwise serve index.html (SPA fallback)
+        return FileResponse(_static_dir / "index.html")
