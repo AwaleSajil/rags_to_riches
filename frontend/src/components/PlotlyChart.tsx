@@ -20,23 +20,36 @@ export function PlotlyChart({ chartJson }: PlotlyChartProps) {
 function PlotlyChartNative({ chartJson }: { chartJson: string }) {
   const { WebView } = require("react-native-webview");
   const { width: screenWidth } = useWindowDimensions();
-  const [webViewHeight, setWebViewHeight] = React.useState(400);
+  const [webViewHeight, setWebViewHeight] = React.useState(320);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Wide bubble (98% of screen) with reduced padding
-  const bubbleContentWidth = Math.floor(screenWidth * 0.98) - 16 - 8;
+  // Detect chart type for layout adjustments
+  const chartType = React.useMemo(() => {
+    try {
+      const parsed = JSON.parse(chartJson);
+      const firstTrace = parsed.data?.[0];
+      return firstTrace?.type || "bar";
+    } catch {
+      return "bar";
+    }
+  }, [chartJson]);
+
+  const isPie = chartType === "pie";
+
+  // Full-width chart with minimal padding for mobile
+  const bubbleContentWidth = Math.floor(screenWidth * 0.96) - 16;
   const chartWidth = Math.max(bubbleContentWidth, 200);
-  const chartHeight = Math.round(chartWidth * 0.85);
-  const fontSize = Math.max(9, Math.min(11, Math.round(chartWidth / 30)));
+  // Shorter aspect ratio for mobile: pie charts are squarer, bar/line are wider
+  const chartHeight = isPie
+    ? Math.round(chartWidth * 0.75)
+    : Math.round(chartWidth * 0.65);
+  const fontSize = Math.max(9, Math.min(12, Math.round(chartWidth / 28)));
 
   // Base64-encode the chart JSON so it survives template literal injection safely.
-  // This avoids issues with backticks, ${}, or special chars in the JSON breaking the HTML.
   const chartJsonB64 = React.useMemo(() => {
     try {
-      // Ensure it's valid JSON first; re-stringify to normalise
       const parsed = JSON.parse(chartJson);
       const clean = JSON.stringify(parsed);
-      // btoa works in RN's JSC/Hermes for ASCII; chart JSON is ASCII-safe after stringify
       return btoa(unescape(encodeURIComponent(clean)));
     } catch {
       return "";
@@ -53,12 +66,15 @@ function PlotlyChartNative({ chartJson }: { chartJson: string }) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: transparent; overflow: hidden; font-family: -apple-system, sans-serif; }
+    body { background: transparent; overflow: hidden; font-family: -apple-system, sans-serif; -webkit-tap-highlight-color: transparent; }
     #chart { width: ${chartWidth}px; }
     #status { color: #888; text-align: center; padding: 20px; font-size: 13px; }
-    .modebar { top: 0 !important; right: 4px !important; }
-    .modebar-btn { font-size: 14px !important; }
-    .modebar-group { padding: 0 2px !important; }
+    /* Hide modebar on mobile — not useful for touch */
+    .modebar { display: none !important; }
+    /* Improve touch target for pie slices and bar segments */
+    .trace { cursor: pointer; }
+    /* Prevent text selection on chart */
+    .plot-container { -webkit-user-select: none; user-select: none; }
   </style>
 </head>
 <body>
@@ -74,43 +90,100 @@ function PlotlyChartNative({ chartJson }: { chartJson: string }) {
         var el = document.getElementById('chart');
         var h = el ? el.offsetHeight : 0;
         if (h > 0) msg({ height: h });
-      }, 200);
+      }, 150);
+    }
+
+    function truncateLabel(text, maxLen) {
+      if (!text || typeof text !== 'string') return text;
+      return text.length > maxLen ? text.substring(0, maxLen - 1) + '…' : text;
     }
 
     function renderChart() {
       try {
         var raw = decodeURIComponent(escape(atob(CHART_B64)));
         var chartData = JSON.parse(raw);
+        var isPie = chartData.data && chartData.data[0] && chartData.data[0].type === 'pie';
+
+        // Truncate long x-axis labels for bar/line charts on mobile
+        if (!isPie && chartData.data) {
+          chartData.data.forEach(function(trace) {
+            if (trace.x && Array.isArray(trace.x)) {
+              trace.x = trace.x.map(function(v) { return truncateLabel(String(v), 16); });
+            }
+            // Add hover info for better mobile tap experience
+            trace.hoverinfo = trace.hoverinfo || 'x+y+text';
+          });
+        }
+
+        // Pie chart mobile optimizations
+        if (isPie && chartData.data) {
+          chartData.data.forEach(function(trace) {
+            // Move labels outside for readability, show % only
+            trace.textposition = 'outside';
+            trace.textinfo = 'label+percent';
+            trace.textfont = { size: ${fontSize} };
+            trace.outsidetextfont = { size: ${Math.max(8, fontSize - 1)} };
+            trace.insidetextorientation = 'horizontal';
+            // Truncate long pie labels
+            if (trace.labels && Array.isArray(trace.labels)) {
+              trace.labels = trace.labels.map(function(v) { return truncateLabel(String(v), 14); });
+            }
+            trace.hoverinfo = 'label+value+percent';
+            // Slight pull for visual separation
+            trace.pull = 0.02;
+            trace.hole = 0.3;
+          });
+        }
 
         var xaxis = Object.assign({}, chartData.layout && chartData.layout.xaxis || {}, {
           tickangle: -45,
           automargin: true,
-          fixedrange: true
+          fixedrange: true,
+          tickfont: { size: ${Math.max(8, fontSize - 1)} }
         });
         var yaxis = Object.assign({}, chartData.layout && chartData.layout.yaxis || {}, {
           automargin: true,
-          fixedrange: true
+          fixedrange: true,
+          tickfont: { size: ${Math.max(8, fontSize - 1)} }
         });
 
         var layout = Object.assign({}, chartData.layout || {}, {
           width: ${chartWidth},
           height: ${chartHeight},
           autosize: false,
-          margin: { l: 0, r: 0, t: 40, b: 0, pad: 0, autoexpand: true },
+          margin: isPie
+            ? { l: 10, r: 10, t: 36, b: 10, pad: 0 }
+            : { l: 4, r: 4, t: 36, b: 60, pad: 0, autoexpand: true },
           paper_bgcolor: 'transparent',
           plot_bgcolor: 'transparent',
-          font: { size: ${fontSize} },
-          xaxis: xaxis,
-          yaxis: yaxis,
+          font: { size: ${fontSize}, color: '#374151' },
+          title: chartData.layout && chartData.layout.title ? {
+            text: typeof chartData.layout.title === 'string'
+              ? chartData.layout.title
+              : (chartData.layout.title.text || ''),
+            font: { size: ${fontSize + 2}, color: '#1e1e3a' },
+            x: 0.5,
+            xanchor: 'center',
+            y: 0.98,
+            yanchor: 'top'
+          } : undefined,
+          xaxis: isPie ? undefined : xaxis,
+          yaxis: isPie ? undefined : yaxis,
           legend: {
             orientation: 'h',
             yanchor: 'top',
-            y: -0.2,
+            y: -0.15,
             xanchor: 'center',
             x: 0.5,
-            font: { size: ${Math.max(8, fontSize - 1)} }
+            font: { size: ${Math.max(8, fontSize - 1)} },
+            tracegroupgap: 4
           },
-          dragmode: false
+          dragmode: false,
+          hoverlabel: {
+            bgcolor: '#1e1e3a',
+            bordercolor: '#6366f1',
+            font: { size: ${fontSize}, color: '#fff', family: '-apple-system, sans-serif' }
+          }
         });
 
         document.getElementById('status').style.display = 'none';
@@ -124,7 +197,6 @@ function PlotlyChartNative({ chartJson }: { chartJson: string }) {
         }).then(function() {
           reportHeight();
           var gd = document.getElementById('chart');
-          gd.on('plotly_relayout', function() { setTimeout(reportHeight, 100); });
           gd.on('plotly_afterplot', function() { setTimeout(reportHeight, 100); });
         });
       } catch(e) {

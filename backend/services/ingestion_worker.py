@@ -33,26 +33,34 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
     )
     logger.debug("Files to ingest: %s", uploaded_files_info)
 
-    logger.debug("Creating MoneyRAG instance")
-    start = time.perf_counter()
-    rag = MoneyRAG(
-        llm_provider=config["llm_provider"],
-        model_name=config.get("decode_model", "gemini-3-flash-preview"),
-        embedding_model_name=config.get("embedding_model", "gemini-embedding-001"),
-        api_key=config["api_key"],
-        user_id=user_id,
-        access_token=access_token,
-    )
-    logger.debug("MoneyRAG instance created in %.1fms", (time.perf_counter() - start) * 1000)
+    try:
+        logger.debug("Creating MoneyRAG instance")
+        start = time.perf_counter()
+        rag = MoneyRAG(
+            llm_provider=config["llm_provider"],
+            model_name=config.get("decode_model", "gemini-3-flash-preview"),
+            embedding_model_name=config.get("embedding_model", "gemini-embedding-001"),
+            api_key=config["api_key"],
+            user_id=user_id,
+            access_token=access_token,
+        )
+        logger.debug("MoneyRAG instance created in %.1fms", (time.perf_counter() - start) * 1000)
+    except Exception as e:
+        logger.error("Failed to create MoneyRAG instance: %s", e, exc_info=True)
+        raise RuntimeError(f"Failed to initialize RAG engine: {e}") from e
 
-    logger.debug("Calling rag.setup_session with %d files", len(uploaded_files_info))
-    session_start = time.perf_counter()
-    duplicates = await rag.setup_session(uploaded_files_info)
-    session_ms = (time.perf_counter() - session_start) * 1000
-    logger.info(
-        "Ingestion worker complete — user_id=%s, %d files processed in %.1fms, %d duplicates",
-        user_id, len(uploaded_files_info), session_ms, len(duplicates or []),
-    )
+    try:
+        logger.debug("Calling rag.setup_session with %d files", len(uploaded_files_info))
+        session_start = time.perf_counter()
+        duplicates = await rag.setup_session(uploaded_files_info)
+        session_ms = (time.perf_counter() - session_start) * 1000
+        logger.info(
+            "Ingestion worker complete — user_id=%s, %d files processed in %.1fms, %d duplicates",
+            user_id, len(uploaded_files_info), session_ms, len(duplicates or []),
+        )
+    except Exception as e:
+        logger.error("Ingestion failed during setup_session: %s", e, exc_info=True)
+        raise RuntimeError(f"Ingestion failed: {e}") from e
 
     # Output result as JSON on stdout for the parent process to parse
     print(json.dumps({"duplicates": duplicates or []}))

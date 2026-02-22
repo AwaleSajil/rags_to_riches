@@ -53,8 +53,9 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
                     while "===CHART===" in content:
                         pre, rest = content.split("===CHART===", 1)
                         if "===ENDCHART===" in rest:
-                            chart_json, content = rest.split("===ENDCHART===", 1)
+                            chart_json, after = rest.split("===ENDCHART===", 1)
                             charts.append(chart_json.strip())
+                            content = pre + after
                             logger.debug("Extracted chart JSON (%d chars)", len(chart_json))
                         else:
                             content = pre + rest
@@ -66,7 +67,8 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
                     while "===IMAGES===" in content:
                         pre, rest = content.split("===IMAGES===", 1)
                         if "===ENDIMAGES===" in rest:
-                            images_json, content = rest.split("===ENDIMAGES===", 1)
+                            images_json, after = rest.split("===ENDIMAGES===", 1)
+                            content = pre + after
                             try:
                                 urls = json.loads(images_json.strip())
                                 images.extend(urls)

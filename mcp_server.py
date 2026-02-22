@@ -242,19 +242,60 @@ def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_co
         if df.empty:
             return '{"error": "No data found for this query."}'
         if chart_type == "bar":
-            fig = px.bar(df, x=x_col, y=y_col, title=title)
+            fig = px.bar(df, x=x_col, y=y_col, title=title, color=color_col)
         elif chart_type == "pie":
-            fig = px.pie(df, names=x_col, values=y_col, title=title)
+            fig = px.pie(df, names=x_col, values=y_col, title=title, color=color_col)
         elif chart_type == "line":
-            fig = px.line(df, x=x_col, y=y_col, title=title)
+            fig = px.line(df, x=x_col, y=y_col, title=title, color=color_col)
+        elif chart_type == "scatter":
+            fig = px.scatter(df, x=x_col, y=y_col, title=title, color=color_col)
         else:
             return f'{{"error": "Unsupported chart type: {chart_type}"}}'
+
+        # Mobile-friendly color palette (high contrast, accessible)
+        mobile_colors = [
+            "#6366f1", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4",
+            "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#64748b",
+        ]
+        fig.update_layout(colorway=mobile_colors)
+
+        # Mobile-optimized layout defaults
+        fig.update_layout(
+            font=dict(size=12),
+            margin=dict(l=4, r=4, t=40, b=4, autoexpand=True),
+        )
+
+        # Bar chart: limit visible bars and use horizontal if many categories
+        if chart_type == "bar" and len(df) > 10:
+            fig.update_layout(xaxis_tickangle=-45)
+
+        # Pie chart: compact label positioning
+        if chart_type == "pie":
+            fig.update_traces(
+                textposition="outside",
+                textinfo="label+percent",
+                hole=0.3,
+                pull=0.02,
+            )
+
         # Write the huge JSON to a temp file instead of returning it directly to LLM context
         chart_path = os.path.join(DATA_DIR, "latest_chart.json")
         with open(chart_path, "w") as f:
             f.write(fig.to_json())
             
-        return "Chart generated successfully! It has been sent to the user's UI. Continue analyzing without outputting the JSON parameters directly."
+        # Summarise the data so the LLM can write a useful text analysis
+        summary_parts = [f"Chart generated ({chart_type}): '{title}'"]
+        summary_parts.append(f"Data: {len(df)} rows, columns={list(df.columns)}")
+        if y_col in df.columns and pd.api.types.is_numeric_dtype(df[y_col]):
+            summary_parts.append(f"Total {y_col}: {df[y_col].sum():.2f}")
+            summary_parts.append(f"Top: {df.loc[df[y_col].idxmax(), x_col]} ({df[y_col].max():.2f})")
+            summary_parts.append(f"Bottom: {df.loc[df[y_col].idxmin(), x_col]} ({df[y_col].min():.2f})")
+        return (
+            " | ".join(summary_parts)
+            + "\n\nThe chart will be displayed in the UI automatically. "
+            "You MUST now write a detailed text summary of the data and key insights for the user. "
+            "Do NOT include the raw chart JSON in your response."
+        )
         
     except Exception as e:
         return f'{{"error": "Failed to generate chart: {str(e)}"}}'

@@ -1,5 +1,5 @@
 import React from "react";
-import { Image, Platform, ScrollView, StyleSheet, View } from "react-native";
+import { Image, Platform, ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
 import { Text } from "react-native-paper";
 import Markdown from "react-native-markdown-display";
 import { PlotlyChart } from "./PlotlyChart";
@@ -12,6 +12,12 @@ interface ChatMessageProps {
 
 export function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === "user";
+  const { width: screenWidth } = useWindowDimensions();
+  const hasCharts = message.charts && message.charts.length > 0;
+
+  // Scale receipt images based on screen width
+  const imageWidth = Math.min(Math.floor(screenWidth * 0.45), 200);
+  const imageHeight = Math.round(imageWidth * 1.4);
 
   return (
     <View style={[styles.container, isUser ? styles.userContainer : styles.assistantContainer]}>
@@ -21,7 +27,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
       <View style={[
         styles.bubble,
         isUser ? styles.userBubble : styles.assistantBubble,
-        !isUser && message.charts && message.charts.length > 0 && styles.wideBubble,
+        !isUser && hasCharts && styles.wideBubble,
       ]}>
         {message.content?.trim() ? (
           <Markdown
@@ -29,14 +35,14 @@ export function ChatMessage({ message }: ChatMessageProps) {
           >
             {message.content}
           </Markdown>
-        ) : message.charts && message.charts.length > 0 ? (
+        ) : hasCharts ? (
           <Text style={{ color: colors.textSecondary, fontSize: 14, marginBottom: 4 }}>
             Here's what I found:
           </Text>
         ) : null}
-        {message.charts && message.charts.length > 0 && (
+        {hasCharts && (
           <View>
-            {message.charts.map((chartJson, i) => (
+            {message.charts!.map((chartJson, i) => (
               <PlotlyChart key={i} chartJson={chartJson} />
             ))}
             {Platform.OS !== "web" && (
@@ -50,7 +56,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
               <Image
                 key={i}
                 source={{ uri: url }}
-                style={styles.receiptImage}
+                style={[styles.receiptImage, { width: imageWidth, height: imageHeight }]}
                 resizeMode="contain"
               />
             ))}
@@ -106,8 +112,6 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   receiptImage: {
-    width: 200,
-    height: 280,
     borderRadius: 8,
     marginRight: 8,
     backgroundColor: colors.surfaceBorder,

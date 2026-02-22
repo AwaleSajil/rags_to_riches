@@ -188,7 +188,9 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
             )
             await rag_manager.invalidate(user_id)
         else:
-            error_msg = stderr.decode().strip().split("\n")[-1] if stderr else "Unknown error"
+            # Extract meaningful error: last 5 lines for context
+            stderr_lines = stderr.decode().strip().split("\n") if stderr else []
+            error_msg = "\n".join(stderr_lines[-5:]) if stderr_lines else "Unknown error"
             ingestion_status[user_id] = {"status": "failed", "error": error_msg}
             logger.error(
                 "Background ingestion FAILED for user_id=%s — returncode=%d, error=%s",

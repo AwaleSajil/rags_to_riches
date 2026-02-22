@@ -86,23 +86,37 @@ class MoneyRAG:
         # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
         all_duplicates = []
         for file_info in uploaded_files:
-            ext = file_info["path"].lower().split('.')[-1]
-            if ext in ['png', 'jpg', 'jpeg']:
-                dups = await self._ingest_bill(file_info["path"], file_info.get("file_id"))
-            else:
-                dups = await self._ingest_csv(file_info["path"], file_info.get("file_id"))
-            if dups:
-                all_duplicates.extend(dups)
-        
-        self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
-        self.vector_store = self._sync_to_qdrant()
+            file_path = file_info["path"]
+            file_name = os.path.basename(file_path)
+            ext = file_path.lower().split('.')[-1]
+            try:
+                if ext in ['png', 'jpg', 'jpeg']:
+                    dups = await self._ingest_bill(file_path, file_info.get("file_id"))
+                else:
+                    dups = await self._ingest_csv(file_path, file_info.get("file_id"))
+                if dups:
+                    all_duplicates.extend(dups)
+            except Exception as e:
+                raise RuntimeError(f"Failed to ingest '{file_name}': {e}") from e
+
+        try:
+            self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
+            self.vector_store = self._sync_to_qdrant()
+        except Exception as e:
+            raise RuntimeError(f"Failed to sync to vector store: {e}") from e
         return all_duplicates
 
     async def _ingest_csv(self, file_path, csv_id=None):
         import hashlib
         import json
-        
-        df = pd.read_csv(file_path)
+
+        filename = os.path.basename(file_path)
+
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as e:
+            raise RuntimeError(f"Cannot read CSV file: {e}") from e
+
         headers = df.columns.tolist()
         sample_data = df.head(10).to_json()
 
@@ -115,11 +129,11 @@ class MoneyRAG:
         TASK:
         1. Map the CSV columns to standard fields: date, description, amount, and category.
         2. Determine the 'sign_convention' for spending.
-        
+
         RULES:
         - If the filename suggests 'Discover' credit card, spending are usually POSITIVE.
         - If the filename suggests 'Chase' credit card, spending are usually NEGATIVE.
-                                                
+
         - Analyze the 'sign_convention' for spending (outflows):
             - Look at the sample data for known merchants or spending patterns.
             - If spending (like a restaurant or store) is NEGATIVE (e.g., -25.00), the convention is 'spending_is_negative'.
@@ -134,21 +148,38 @@ class MoneyRAG:
         "sign_convention": "spending_is_negative" | "spending_is_positive"
         }}
         """)
-        
+
         chain = prompt | self.llm | JsonOutputParser()
-        mapping = await chain.ainvoke({"headers": headers, "sample": sample_data, "filename": os.path.basename(file_path)})
+        try:
+            mapping = await chain.ainvoke({"headers": headers, "sample": sample_data, "filename": filename})
+        except Exception as e:
+            raise RuntimeError(f"LLM column mapping failed (headers: {headers}): {e}") from e
+
+        # Validate that the LLM returned the required keys
+        for key in ['date_col', 'desc_col', 'amount_col']:
+            if key not in mapping:
+                raise RuntimeError(f"LLM mapping missing required key '{key}'. Got: {mapping}")
+            if mapping[key] not in df.columns:
+                raise RuntimeError(f"LLM mapped '{key}' to column '{mapping[key]}' which doesn't exist. Available columns: {headers}")
 
         standard_df = pd.DataFrame()
-        standard_df['trans_date'] = pd.to_datetime(df[mapping['date_col']]).dt.strftime('%Y-%m-%d')
+        try:
+            standard_df['trans_date'] = pd.to_datetime(df[mapping['date_col']]).dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            raise RuntimeError(f"Date parsing failed for column '{mapping['date_col']}': {e}") from e
         # Assign user_id AFTER trans_date establishes the DataFrame length, or else it defaults to NaN!
         standard_df['user_id'] = self.user_id
         standard_df['description'] = df[mapping['desc_col']]
         if csv_id:
             standard_df['source_csv_id'] = csv_id
-        
-        raw_amounts = pd.to_numeric(df[mapping['amount_col']])
+
+        raw_amounts = pd.to_numeric(df[mapping['amount_col']], errors='coerce')
+        if raw_amounts.isna().all():
+            raise RuntimeError(f"All values in amount column '{mapping['amount_col']}' are non-numeric")
         standard_df['amount'] = raw_amounts * -1 if mapping['sign_convention'] == "spending_is_negative" else raw_amounts
-        standard_df['category'] = df[mapping.get('category_col')] if mapping.get('category_col') else 'Uncategorized'
+
+        cat_col = mapping.get('category_col')
+        standard_df['category'] = df[cat_col] if cat_col and cat_col in df.columns else 'Uncategorized'
 
         # --- Async Enrichment Step ---
         print(f"   ✨ Enriching descriptions for {os.path.basename(file_path)}...")
@@ -630,10 +661,13 @@ Return ONLY valid JSON with exactly these two fields:
             system_prompt = (
                 "You are a financial analyst. Use the provided tools to query the database "
                 "and perform semantic searches. Spending is POSITIVE (>0). "
-                "Always explain your findings clearly."
                 "IMPORTANT: Whenever possible and relevant (e.g. when discussing trends, comparing categories, or showing breakdowns), "
                 "you MUST proactively use the 'generate_interactive_chart' tool to generate visual plots (bar, pie, or line charts) to accompany your analysis. "
-                "WARNING: You MUST use the actual tool call to generate the chart. DO NOT simply output a json block with chart parameters as your final text answer."
+                "CRITICAL RULE FOR RESPONSES: After calling any chart or data tool, you MUST write a detailed text analysis "
+                "that includes: (1) a summary of the key numbers, (2) the top and bottom items, (3) any notable patterns or insights. "
+                "The chart appears below your text automatically — your text analysis is the PRIMARY response the user reads. "
+                "Never respond with just a single sentence when data is available. "
+                "WARNING: You MUST use the actual tool call to generate the chart. DO NOT output raw chart JSON in your text."
             )
             
             agent = create_agent(
@@ -654,7 +688,8 @@ Return ONLY valid JSON with exactly these two fields:
                 os.remove(images_path)
 
             # Stream events so we can yield live tool-call updates
-            final_content = ""
+            # Accumulate all AI text tokens across the full agent run
+            ai_text_chunks: list[str] = []
             async for event in agent.astream_events(
                 {"messages": [{"role": "user", "content": query}]},
                 config,
@@ -678,19 +713,19 @@ Return ONLY valid JSON with exactly these two fields:
                     snippet = str(output)[:200].replace("\n", " ")
                     yield {"type": "tool_end", "name": tool_name, "snippet": snippet}
 
-                elif kind == "on_chain_end":
-                    # Capture the final AI message from the root chain
-                    output = event.get("data", {}).get("output", {})
-                    if isinstance(output, dict) and "messages" in output:
-                        last_msg = output["messages"][-1]
-                        content = last_msg.content if hasattr(last_msg, "content") else ""
-                        if isinstance(content, list):
-                            final_content = "\n".join(
-                                b.get("text", "") for b in content
-                                if isinstance(b, dict) and b.get("type") == "text"
-                            )
-                        elif content:
-                            final_content = content
+                elif kind == "on_chat_model_stream":
+                    # Collect streamed AI text tokens
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content"):
+                        raw = chunk.content
+                        if isinstance(raw, str) and raw:
+                            ai_text_chunks.append(raw)
+                        elif isinstance(raw, list):
+                            for block in raw:
+                                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                                    ai_text_chunks.append(block["text"])
+
+            final_content = "".join(ai_text_chunks).strip()
 
             # Build final response (with optional chart and images)
             if os.path.exists(chart_path):

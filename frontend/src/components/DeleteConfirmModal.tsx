@@ -31,7 +31,7 @@ export function DeleteConfirmModal({
           </Button>
           <Button
             onPress={onConfirm}
-            textColor={colors.error}
+            textColor="#ffffff"
             mode="contained"
             buttonColor={colors.error}
             style={{ borderRadius: 8 }}

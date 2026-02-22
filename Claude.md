@@ -1,0 +1,1 @@
+- Developing this application for android specifically using expo 
