@@ -26,6 +26,7 @@ export default function IngestScreen() {
     isDeleting,
     error,
     duplicates,
+    ingestionProgress,
     uploadFiles,
     deleteFile,
     clearDuplicates,
@@ -190,14 +191,30 @@ export default function IngestScreen() {
         {/* Section 3: Ingestion Progress */}
         {isIngesting && (
           <GlassCard style={styles.progressSection}>
-            <Text style={styles.progressText}>Processing your files...</Text>
+            <Text style={styles.progressText}>
+              {ingestionProgress?.stage === "parsing" && "📄 Parsing CSV..."}
+              {ingestionProgress?.stage === "enriching" && "✨ Enriching merchants..."}
+              {ingestionProgress?.stage === "saving" && "💾 Saving to database..."}
+              {ingestionProgress?.stage === "embedding" && "🧠 Building search index..."}
+              {!ingestionProgress?.stage && "Processing your files..."}
+            </Text>
             <ProgressBar
-              indeterminate
+              indeterminate={
+                !ingestionProgress?.stage ||
+                ingestionProgress.total === 0
+              }
+              progress={
+                ingestionProgress && ingestionProgress.total > 0
+                  ? ingestionProgress.done / ingestionProgress.total
+                  : 0
+              }
               color={colors.primary}
               style={styles.progressBar}
             />
             <Text style={styles.progressSubtext}>
-              This may take a minute
+              {ingestionProgress && ingestionProgress.total > 0
+                ? `${ingestionProgress.done} / ${ingestionProgress.total}${ingestionProgress.detail ? ` — ${ingestionProgress.detail}` : ""}`
+                : "Starting up..."}
             </Text>
           </GlassCard>
         )}

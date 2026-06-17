@@ -43,6 +43,7 @@ export async function uploadFiles(
   const res = await apiFetch("/files/upload", {
     method: "POST",
     body: formData,
+    timeout: 60000, // Allow 60 seconds for uploading multiple/large files
   });
 
   if (!res.ok) {
@@ -60,6 +61,10 @@ export interface IngestionStatus {
   status: "idle" | "processing" | "complete" | "failed";
   error?: string | null;
   duplicates?: { date: string; merchant: string; amount: number }[];
+  stage?: string;
+  total?: number;
+  done?: number;
+  detail?: string;
 }
 
 export async function getIngestionStatus(): Promise<IngestionStatus> {

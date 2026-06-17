@@ -11,14 +11,22 @@ export interface DuplicateInfo {
   amount: number;
 }
 
+export interface IngestionProgress {
+  stage: string;
+  total: number;
+  done: number;
+  detail?: string;
+}
+
 export function useFiles() {
   const [files, setFiles] = useState<FileItem[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
+  const [ingestionProgress, setIngestionProgress] = useState<IngestionProgress | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const stopPolling = useCallback(() => {
@@ -31,6 +39,7 @@ export function useFiles() {
   const startIngestionPolling = useCallback(() => {
     stopPolling();
     setIsIngesting(true);
+    setIngestionProgress(null);
     log.info("Starting ingestion status polling");
 
     pollRef.current = setInterval(async () => {
@@ -38,9 +47,20 @@ export function useFiles() {
         const status = await fileService.getIngestionStatus();
         log.debug("Ingestion poll result", status);
 
+        // Update progress if available
+        if (status.stage) {
+          setIngestionProgress({
+            stage: status.stage,
+            total: status.total || 0,
+            done: status.done || 0,
+            detail: status.detail,
+          });
+        }
+
         if (status.status === "complete") {
           stopPolling();
           setIsIngesting(false);
+          setIngestionProgress(null);
           if (status.duplicates && status.duplicates.length > 0) {
             log.info("Duplicates detected", { count: status.duplicates.length });
             setDuplicates(status.duplicates);
@@ -51,12 +71,13 @@ export function useFiles() {
         } else if (status.status === "failed") {
           stopPolling();
           setIsIngesting(false);
+          setIngestionProgress(null);
           setError(status.error || "Ingestion failed");
         }
       } catch (e: any) {
         log.error("Ingestion poll error", e);
       }
-    }, 3000);
+    }, 2000);  // Poll faster for progress updates
   }, [stopPolling]);
 
   useEffect(() => {
@@ -139,6 +160,7 @@ export function useFiles() {
     isDeleting,
     error,
     duplicates,
+    ingestionProgress,
     uploadFiles,
     deleteFile,
     loadFiles,

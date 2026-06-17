@@ -10,6 +10,7 @@ export interface AccountConfig {
   api_key: string;
   decode_model: string;
   embedding_model: string;
+  deep_enrichment?: boolean;
 }
 
 export interface FileItem {

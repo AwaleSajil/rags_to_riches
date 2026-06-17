@@ -7,6 +7,7 @@ class ConfigUpdate(BaseModel):
     api_key: str
     decode_model: str
     embedding_model: str
+    deep_enrichment: bool = False
 
 
 class ConfigResponse(BaseModel):
@@ -16,3 +17,4 @@ class ConfigResponse(BaseModel):
     api_key: str
     decode_model: str
     embedding_model: str
+    deep_enrichment: bool = False

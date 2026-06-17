@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { StyleSheet, View, ScrollView } from "react-native";
-import { Text, TextInput, Button, Snackbar } from "react-native-paper";
+import { Text, TextInput, Button, Snackbar, Switch, Dialog, Portal } from "react-native-paper";
 import { GlassCard } from "../../src/components/GlassCard";
 import { ProviderModelPicker } from "../../src/components/ProviderModelPicker";
 import { ApiKeyHelp } from "../../src/components/ApiKeyHelp";
@@ -19,6 +19,8 @@ export default function ConfigScreen() {
   const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-001");
   const [apiKey, setApiKey] = useState("");
   const [saved, setSaved] = useState(false);
+  const [deepEnrichment, setDeepEnrichment] = useState(false);
+  const [showWarning, setShowWarning] = useState(false);
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
 
   // Populate form when config loads
@@ -34,6 +36,7 @@ export default function ConfigScreen() {
       setDecodeModel(config.decode_model || "gemini-3-flash-preview");
       setEmbeddingModel(config.embedding_model || "gemini-embedding-001");
       setApiKey(config.api_key || "");
+      setDeepEnrichment(config.deep_enrichment || false);
     }
   }, [config]);
 
@@ -43,6 +46,18 @@ export default function ConfigScreen() {
       setSnackbar({ visible: true, message: "API Key is required.", error: true });
       return;
     }
+
+    if (config && config.embedding_model !== embeddingModel) {
+      log.info("Embedding model changed, showing warning dialog");
+      setShowWarning(true);
+      return;
+    }
+
+    executeSave();
+  };
+
+  const executeSave = async () => {
+    setShowWarning(false);
     log.info("Save config button pressed", {
       provider,
       decodeModel,
@@ -53,6 +68,7 @@ export default function ConfigScreen() {
       api_key: apiKey,
       decode_model: decodeModel,
       embedding_model: embeddingModel,
+      deep_enrichment: deepEnrichment,
     });
     if (ok) {
       log.info("Config saved successfully from UI");
@@ -115,6 +131,25 @@ export default function ConfigScreen() {
           <ApiKeyHelp />
         </GlassCard>
 
+        
+        {/* Section 3: Ingestion Settings */}
+        <GlassCard style={styles.section}>
+          <Text style={styles.sectionTitle}>Ingestion</Text>
+          <View style={styles.toggleRow}>
+            <View style={styles.toggleText}>
+              <Text style={styles.toggleLabel}>Deep Enrichment</Text>
+              <Text style={styles.toggleHint}>
+                Uses web search for richer merchant descriptions. More accurate for obscure merchants, but slower.
+              </Text>
+            </View>
+            <Switch
+              value={deepEnrichment}
+              onValueChange={setDeepEnrichment}
+              color={colors.primary}
+            />
+          </View>
+        </GlassCard>
+
         {/* Save Button */}
         <Button
           mode="contained"
@@ -131,6 +166,25 @@ export default function ConfigScreen() {
           {saved ? "Saved!" : "Save Configuration"}
         </Button>
       </ScrollView>
+
+      <Portal>
+        <Dialog visible={showWarning} onDismiss={() => setShowWarning(false)}>
+          <Dialog.Title>Model Change Warning</Dialog.Title>
+          <Dialog.Content>
+            <Text variant="bodyMedium">
+              You are changing your embedding model from <Text style={{ fontWeight: 'bold' }}>{config?.embedding_model}</Text> to <Text style={{ fontWeight: 'bold' }}>{embeddingModel}</Text>.
+              {"\n\n"}
+              This will automatically trigger a background job to re-process and re-embed all your existing transactions into a new vector database collection. This might take a while depending on how much data you have.
+              {"\n\n"}
+              Are you sure you want to proceed?
+            </Text>
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button onPress={() => setShowWarning(false)}>Cancel</Button>
+            <Button onPress={executeSave}>Proceed</Button>
+          </Dialog.Actions>
+        </Dialog>
+      </Portal>
 
       <Snackbar
         visible={snackbar.visible}
@@ -186,5 +240,24 @@ const styles = StyleSheet.create({
   saveButtonLabel: {
     fontWeight: "600",
     paddingVertical: spacing.xs,
+  },
+  toggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  toggleText: {
+    flex: 1,
+    marginRight: spacing.md,
+  },
+  toggleLabel: {
+    ...typography.body1,
+    color: colors.text,
+    fontWeight: "600",
+  },
+  toggleHint: {
+    ...typography.caption,
+    color: colors.textSecondary,
+    marginTop: 2,
   },
 });

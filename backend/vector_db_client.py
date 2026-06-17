@@ -10,39 +10,29 @@ class VectorDBClient:
     
     def __init__(self):
         self.settings = get_settings()
-        self.stack = self.settings.VECTOR_DB_STACK.lower()
         self.collection_name = "transactions"
         
-        if self.stack == "actian":
-            try:
-                from cortex import CortexClient
-                self.actian_client = CortexClient(
-                    address=self.settings.ACTIAN_ADDRESS,
-                    api_key=self.settings.ACTIAN_API_KEY
-                )
-            except ImportError:
-                raise RuntimeError("Actian Cortex SDK ('actiancortex') is not installed.")
-        else:
-            # Setup Qdrant
-            from qdrant_client import QdrantClient
-            self.qdrant_client = QdrantClient(
-                url=self.settings.QDRANT_URL,
-                api_key=self.settings.QDRANT_API_KEY
-            )
+        # Setup Qdrant
+        from qdrant_client import QdrantClient
+        self.qdrant_client = QdrantClient(
+            url=self.settings.QDRANT_URL,
+            api_key=self.settings.QDRANT_API_KEY
+        )
 
-    def is_actian(self) -> bool:
-        return self.stack == "actian"
-
-    def sync_transactions(self, df: pd.DataFrame, details_df: pd.DataFrame, user_id: str, embeddings_model: Embeddings) -> None:
+    def sync_transactions(self, df: pd.DataFrame, details_df: pd.DataFrame, user_id: str, embeddings_model: Embeddings, progress_callback=None) -> None:
         """
         Embed and ingest transactions and line items into the vector database.
         Returns the initialized Langchain VectorStore (for Qdrant) or None (for Actian, which is managed directly).
+        progress_callback(stage_detail, total, done) — optional callable for progress updates.
         """
         if df.empty:
-            raise ValueError("No transactions found in database for this user. Please upload files first.")
-            
+            print("No transactions found in database for this user. Skipping vector sync.")
+            return None
         sample_embedding = embeddings_model.embed_query("test")
         embedding_dim = len(sample_embedding)
+        
+        total_items = len(df) + (len(details_df) if not details_df.empty else 0)
+        built = 0
         
         texts = []
         metadatas = []
@@ -72,6 +62,9 @@ class VectorDBClient:
             
             metadatas.append(meta)
             vector_ids.append(str(row['id']))
+            built += 1
+            if progress_callback and built % 50 == 0:
+                progress_callback("Building payloads", total_items, built)
 
         # 2. Build line item payloads
         if not details_df.empty:
@@ -98,40 +91,30 @@ class VectorDBClient:
                 meta['page_content'] = texts[-1]
                 metadatas.append(meta)
                 vector_ids.append(str(d_row['id']))
+                built += 1
+                if progress_callback and built % 50 == 0:
+                    progress_callback("Building payloads", total_items, built)
 
-        # Generate actual embeddings
-        print(f"   🧠 Embedding {len(texts)} documents into {self.stack}...")
-        vectors = embeddings_model.embed_documents(texts)
+        if progress_callback:
+            progress_callback("Building payloads", total_items, total_items)
 
-        if self.is_actian():
-            self._sync_actian(vectors, metadatas, vector_ids, embedding_dim)
-            return None
-        else:
-            return self._sync_qdrant(texts, metadatas, vector_ids, embedding_dim, embeddings_model)
+        # Generate embeddings in batches for progress tracking
+        total_texts = len(texts)
+        print(f"   🧠 Embedding {total_texts} documents into Qdrant...")
+        EMBED_BATCH = 50
+        vectors = []
+        for i in range(0, total_texts, EMBED_BATCH):
+            batch = texts[i:i + EMBED_BATCH]
+            batch_vectors = embeddings_model.embed_documents(batch)
+            vectors.extend(batch_vectors)
+            if progress_callback:
+                progress_callback("Embedding", total_texts, min(i + EMBED_BATCH, total_texts))
 
-    def _sync_actian(self, vectors: List[List[float]], metadatas: List[Dict], vector_ids: List[str], dim: int):
-        from cortex import DistanceMetric
-        import uuid
-        
-        with self.actian_client as client:
-            client.get_or_create_collection(
-                name=self.collection_name,
-                dimension=dim,
-                distance_metric=DistanceMetric.COSINE
-            )
-            
-            # Actian expects integer IDs, but our DB uses UUID strings.
-            # We map strings to integer IDs deterministically via hashing for Actian.
-            int_ids = [int(uuid.UUID(vid).int >> 64) for vid in vector_ids]
-            
-            client.batch_upsert(
-                collection_name=self.collection_name,
-                ids=int_ids,
-                vectors=vectors,
-                payloads=metadatas
-            )
+        return self._sync_qdrant(texts, metadatas, vector_ids, embedding_dim, embeddings_model, progress_callback)
 
-    def _sync_qdrant(self, texts, metadatas, vector_ids, dim, embeddings_model):
+
+
+    def _sync_qdrant(self, texts, metadatas, vector_ids, dim, embeddings_model, progress_callback=None):
         from qdrant_client.http import models as qdrant_models
         from langchain_qdrant import QdrantVectorStore
         
@@ -146,70 +129,47 @@ class VectorDBClient:
         self.qdrant_client.create_payload_index(self.collection_name, "metadata.bill_file_id", qdrant_models.PayloadSchemaType.KEYWORD)
         
         vs = QdrantVectorStore(client=self.qdrant_client, collection_name=self.collection_name, embedding=embeddings_model)
-        vs.add_texts(texts=texts, metadatas=metadatas, ids=vector_ids)
+        
+        # Batch add_texts for progress tracking
+        total = len(texts)
+        UPSERT_BATCH = 50
+        if progress_callback:
+            progress_callback("Uploading to vector DB", total, 0)
+        for i in range(0, total, UPSERT_BATCH):
+            end = min(i + UPSERT_BATCH, total)
+            vs.add_texts(
+                texts=texts[i:end],
+                metadatas=metadatas[i:end],
+                ids=vector_ids[i:end],
+            )
+            if progress_callback:
+                progress_callback("Uploading to vector DB", total, end)
+        
         return vs
 
     def semantic_search(self, query: str, user_id: str, top_k: int = 5, embeddings_model: Optional[Embeddings] = None) -> List[Dict]:
         """Search the vector database, returning a list of dicts with 'page_content' and 'metadata'."""
-        if self.is_actian():
-            if not embeddings_model:
-                raise ValueError("Actian search requires passing the embeddings_model to generated query vectors.")
-            
-            query_vector = embeddings_model.embed_query(query)
-            from cortex import Filter, Field
-            
-            f = Filter().must(Field("user_id").eq(user_id))
-            
-            with self.actian_client as client:
-                if not client.has_collection(self.collection_name):
-                    return []
-                results = client.search(
-                    collection_name=self.collection_name,
-                    query=query_vector,
-                    top_k=top_k,
-                    filter=f,
-                    with_payload=True
-                )
-            
-            return [{"page_content": r.payload.get("page_content", ""), "metadata": r.payload} for r in results]
-            
-        else:
-            from qdrant_client.http import models
-            from langchain_qdrant import QdrantVectorStore
-            
-            q_filter = models.Filter(
-                must=[models.FieldCondition(key="metadata.user_id", match=models.MatchValue(value=user_id))]
-            )
-            
-            vs = QdrantVectorStore(client=self.qdrant_client, collection_name=self.collection_name, embedding=embeddings_model)
-            results = vs.similarity_search(query, k=top_k, filter=q_filter)
-            return [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in results]
+        from qdrant_client.http import models
+        from langchain_qdrant import QdrantVectorStore
+        
+        q_filter = models.Filter(
+            must=[models.FieldCondition(key="metadata.user_id", match=models.MatchValue(value=user_id))]
+        )
+        
+        vs = QdrantVectorStore(client=self.qdrant_client, collection_name=self.collection_name, embedding=embeddings_model)
+        results = vs.similarity_search(query, k=top_k, filter=q_filter)
+        return [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in results]
 
     def delete_file_vectors(self, file_id: str, file_type: str) -> None:
         """Deletes all vectors originating from a specific file."""
-        if self.is_actian():
-            from cortex import Filter, Field
-            filter_key = "source_csv_id" if file_type == 'csv' else "bill_file_id"
-            f = Filter().must(Field(filter_key).eq(file_id))
-            
-            with self.actian_client as client:
-                if not client.has_collection(self.collection_name): return
-                
-                # Actian batch_delete requires IDs, so we query to find matching IDs first
-                records = client.query(self.collection_name, filter=f, limit=10000)
-                ids_to_delete = [r.id for r in records]
-                
-                if ids_to_delete:
-                    client.batch_delete(self.collection_name, ids=ids_to_delete)
-        else:
-            filter_key = "metadata.source_csv_id" if file_type == 'csv' else "metadata.bill_file_id"
-            from qdrant_client.http import models
-            self.qdrant_client.delete(
-                collection_name=self.collection_name,
-                points_selector=models.Filter(
-                    must=[models.FieldCondition(key=filter_key, match=models.MatchValue(value=file_id))]
-                )
+        filter_key = "metadata.source_csv_id" if file_type == 'csv' else "metadata.bill_file_id"
+        from qdrant_client.http import models
+        self.qdrant_client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.Filter(
+                must=[models.FieldCondition(key=filter_key, match=models.MatchValue(value=file_id))]
             )
+        )
 
 def get_vector_client() -> VectorDBClient:
     return VectorDBClient()

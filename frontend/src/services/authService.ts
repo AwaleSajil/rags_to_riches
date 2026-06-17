@@ -42,7 +42,6 @@ export async function login(
     log.debug("Syncing user to backend User table...");
     await apiJson("/auth/login", {
       method: "POST",
-      body: JSON.stringify({ email, password }),
     });
     log.debug("Backend user sync successful");
   } catch (e) {
@@ -83,7 +82,6 @@ export async function register(
     log.debug("Syncing new user to backend...");
     await apiJson("/auth/register", {
       method: "POST",
-      body: JSON.stringify({ email, password }),
     });
     log.debug("Backend registration sync successful");
   } catch (e) {

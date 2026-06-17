@@ -78,11 +78,27 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
                 filename, s3_key, content_type,
             )
             start = time.perf_counter()
-            client.storage.from_("money-rag-files").upload(
-                file=local_path,
-                path=s3_key,
-                file_options={"content-type": content_type, "upsert": "true"},
-            )
+            # Retry upload up to 3 times — transient SSL drops happen with multiple large files
+            for attempt in range(3):
+                try:
+                    client.storage.from_("money-rag-files").upload(
+                        file=local_path,
+                        path=s3_key,
+                        file_options={"content-type": content_type, "upsert": "true"},
+                    )
+                    break
+                except Exception as upload_err:
+                    if attempt < 2:
+                        wait = (attempt + 1) * 1.0
+                        logger.warning(
+                            "Storage upload attempt %d failed for '%s': %s — retrying in %.1fs",
+                            attempt + 1, filename, upload_err, wait,
+                        )
+                        time.sleep(wait)
+                        # Re-create client to get a fresh connection
+                        client = get_supabase(user["access_token"])
+                    else:
+                        raise RuntimeError(f"Storage upload failed for '{filename}' after 3 attempts: {upload_err}") from upload_err
             upload_ms = (time.perf_counter() - start) * 1000
             logger.debug("Storage upload complete for '%s' in %.1fms", filename, upload_ms)
 
@@ -163,14 +179,51 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
             stderr=asyncio.subprocess.PIPE,
             cwd=PROJECT_ROOT,
         )
-        logger.debug("Subprocess launched — PID=%d, waiting for completion", proc.pid)
-        stdout, stderr = await proc.communicate()
+        logger.debug("Subprocess launched — PID=%d, streaming stderr for progress", proc.pid)
+
+        # Stream stderr line-by-line for real-time progress updates
+        stderr_lines = []
+        async def _read_stderr():
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                decoded = line.decode().strip()
+                stderr_lines.append(decoded)
+                # Try to parse progress JSON
+                try:
+                    data = json.loads(decoded)
+                    if "progress" in data:
+                        p = data["progress"]
+                        ingestion_status[user_id] = {
+                            "status": "processing",
+                            "error": None,
+                            "stage": p.get("stage", "processing"),
+                            "total": p.get("total", 0),
+                            "done": p.get("done", 0),
+                            "detail": p.get("detail", ""),
+                        }
+                        logger.debug(
+                            "Ingestion progress user_id=%s: stage=%s %d/%d",
+                            user_id, p.get("stage"), p.get("done", 0), p.get("total", 0),
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Regular log line, not progress JSON
+
+        stderr_task = asyncio.create_task(_read_stderr())
+        # Read stdout manually — do NOT use communicate() as it conflicts with _read_stderr
+        stdout = await proc.stdout.read()
+        await proc.wait()
+        await stderr_task
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         if stdout:
             logger.debug("Subprocess stdout:\n%s", stdout.decode())
-        if stderr:
-            logger.debug("Subprocess stderr:\n%s", stderr.decode())
+        if stderr_lines:
+            # Log last few non-progress stderr lines
+            non_progress = [l for l in stderr_lines[-10:] if not l.startswith('{"progress"')]
+            if non_progress:
+                logger.debug("Subprocess stderr (last lines):\n%s", "\n".join(non_progress))
 
         if proc.returncode == 0:
             duplicates = []
@@ -190,7 +243,6 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
             await rag_manager.invalidate(user_id)
         else:
             # Extract meaningful error: last 5 lines for context
-            stderr_lines = stderr.decode().strip().split("\n") if stderr else []
             error_msg = "\n".join(stderr_lines[-5:]) if stderr_lines else "Unknown error"
             ingestion_status[user_id] = {"status": "failed", "error": error_msg}
             logger.error(

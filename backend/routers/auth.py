@@ -11,72 +11,85 @@ logger = logging.getLogger("moneyrag.routers.auth")
 router = APIRouter()
 
 
-@router.post("/login", response_model=AuthResponse)
-async def login(body: LoginRequest, settings: Settings = Depends(get_settings)):
-    logger.debug("Login attempt for email=%s", body.email)
+@router.post("/login")
+async def login(
+    body: LoginRequest | None = None,
+    user: dict | None = Depends(get_current_user), 
+    settings: Settings = Depends(get_settings)
+):
     try:
-        logger.debug("Creating Supabase client for login")
-        client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-        logger.debug("Calling sign_in_with_password for email=%s", body.email)
-        res = client.auth.sign_in_with_password({
-            "email": body.email,
-            "password": body.password,
-        })
-        logger.info("Login successful — user_id=%s, email=%s", res.user.id, body.email)
-
-        # Upsert User table (mirrors app.py lines 219-226)
-        try:
-            logger.debug("Upserting User table for user_id=%s", res.user.id)
-            client.table("User").upsert({
-                "id": res.user.id,
+        # If accessed via Swagger/Postman with raw credentials, generate the token first
+        if body and body.email and body.password and (not user or getattr(user, "email", None) is None):
+            logger.debug("Generating token dynamically for Swagger UI login email=%s", body.email)
+            client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+            res = client.auth.sign_in_with_password({
                 "email": body.email,
-                "hashed_password": "managed_by_supabase_auth",
-            }).execute()
-            logger.debug("User table upsert succeeded")
-        except Exception as sync_e:
-            logger.warning("Could not sync user to User table: %s", sync_e)
+                "password": body.password,
+            })
+            user = {"id": res.user.id, "email": body.email, "access_token": res.session.access_token}
 
-        return AuthResponse(
-            user=UserInfo(id=res.user.id, email=body.email),
-            access_token=res.session.access_token,
-        )
+        if not user or "access_token" not in user:
+            raise HTTPException(status_code=401, detail="Must provide either Bearer token or email/password credentials")
+
+        # Initialize an authenticated client to bypass RLS policies
+        from backend.dependencies import get_supabase
+        client = get_supabase(user["access_token"])
+        
+        logger.debug("Login sync for email=%s", user["email"])
+        client.table("User").upsert({
+            "id": user["id"],
+            "email": user["email"],
+            "hashed_password": "managed_by_supabase_auth",
+        }).execute()
+        
+        return {
+            "user": {"id": user["id"], "email": user["email"]},
+            "access_token": user.get("access_token"),
+        }
     except Exception as e:
-        logger.error("Login failed for email=%s: %s", body.email, e, exc_info=True)
-        raise HTTPException(status_code=401, detail=f"Login failed: {e}")
+        logger.error("Login sync failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=401, detail=f"Login sync failed: {e}")
 
 
 @router.post("/register")
-async def register(body: RegisterRequest, settings: Settings = Depends(get_settings)):
-    logger.debug("Registration attempt for email=%s", body.email)
+async def register(
+    body: RegisterRequest | None = None,
+    user: dict | None = Depends(get_current_user), 
+    settings: Settings = Depends(get_settings)
+):
     try:
-        logger.debug("Creating Supabase client for registration")
-        client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-        logger.debug("Calling sign_up for email=%s", body.email)
-        res = client.auth.sign_up({
-            "email": body.email,
-            "password": body.password,
-        })
-        logger.info("Registration successful — user_id=%s, email=%s", res.user.id, body.email)
+        if body and body.email and body.password and (not user or getattr(user, "email", None) is None):
+            logger.debug("Generating token dynamically for Swagger UI register email=%s", body.email)
+            client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+            res = client.auth.sign_up({
+                "email": body.email,
+                "password": body.password,
+            })
+            if not res.session:
+                 raise HTTPException(status_code=400, detail="Signup succeeded but no session was returned (email confirmation may be required). Cannot sync User table without JWT.")
+            user = {"id": res.user.id, "email": body.email, "access_token": res.session.access_token}
 
-        if res.user:
-            try:
-                logger.debug("Upserting User table for new user_id=%s", res.user.id)
-                client.table("User").upsert({
-                    "id": res.user.id,
-                    "email": body.email,
-                    "hashed_password": "managed_by_supabase_auth",
-                }).execute()
-                logger.debug("User table upsert succeeded for new user")
-            except Exception as upsert_e:
-                logger.warning("Could not sync new user to User table: %s", upsert_e)
+        if not user or "access_token" not in user:
+            raise HTTPException(status_code=400, detail="Must provide either Bearer token or email/password credentials")
+
+        # Initialize an authenticated client to bypass RLS policies
+        from backend.dependencies import get_supabase
+        client = get_supabase(user["access_token"])
+        
+        logger.debug("Register sync for email=%s", user["email"])
+        client.table("User").upsert({
+            "id": user["id"],
+            "email": user["email"],
+            "hashed_password": "managed_by_supabase_auth",
+        }).execute()
 
         return {
-            "user": {"id": res.user.id, "email": body.email},
+            "user": {"id": user["id"], "email": user["email"]},
             "message": "Account created successfully",
         }
     except Exception as e:
-        logger.error("Registration failed for email=%s: %s", body.email, e, exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Signup failed: {e}")
+        logger.error("Registration sync failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Signup sync failed: {e}")
 
 
 @router.post("/logout")

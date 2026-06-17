@@ -17,7 +17,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("moneyrag.ingestion_worker")
@@ -43,6 +43,7 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
             api_key=config["api_key"],
             user_id=user_id,
             access_token=access_token,
+            deep_enrichment=config.get("deep_enrichment", False),
         )
         logger.debug("MoneyRAG instance created in %.1fms", (time.perf_counter() - start) * 1000)
     except Exception as e:

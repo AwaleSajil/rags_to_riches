@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useCallback } from "react";
 import { StyleSheet, View, FlatList, KeyboardAvoidingView, Platform, useWindowDimensions } from "react-native";
-import { Banner } from "react-native-paper";
+import { Banner, Text } from "react-native-paper";
 import { useRouter } from "expo-router";
 import { ChatMessage } from "../../src/components/ChatMessage";
 import { ChatInput } from "../../src/components/ChatInput";
@@ -21,7 +21,7 @@ const MAX_CHAT_WIDTH = 720;
 
 export default function ChatScreen() {
   log.debug("ChatScreen rendered");
-  const { messages, isStreaming, sendMessage } = useChat();
+  const { messages, isStreaming, currentToolTraces, sendMessage } = useChat();
   const { files } = useFiles();
   const flatListRef = useRef<FlatList>(null);
   const router = useRouter();
@@ -97,10 +97,28 @@ export default function ChatScreen() {
         }
       />
 
-      {/* Streaming indicator */}
+      {/* Streaming indicator with live tool status */}
       {isStreaming && (
         <View style={[styles.streamingIndicator, responsiveStyle]}>
-          <TypingIndicator />
+          {currentToolTraces.length > 0 ? (
+            <View style={styles.toolStatus}>
+              <Text style={styles.toolStatusText}>
+                {(() => {
+                  const lastStart = [...currentToolTraces].reverse().find(t => t.type === "tool_start");
+                  const lastEnd = [...currentToolTraces].reverse().find(t => t.type === "tool_end");
+                  const lastStartIdx = lastStart ? currentToolTraces.lastIndexOf(lastStart) : -1;
+                  const lastEndIdx = lastEnd ? currentToolTraces.lastIndexOf(lastEnd) : -1;
+                  if (lastStartIdx > lastEndIdx && lastStart) {
+                    const name = lastStart.name.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+                    return `🔍 ${name}...`;
+                  }
+                  return "💭 Thinking...";
+                })()}
+              </Text>
+            </View>
+          ) : (
+            <TypingIndicator />
+          )}
         </View>
       )}
 
@@ -132,5 +150,15 @@ const styles = StyleSheet.create({
   },
   inputWrapper: {
     alignItems: "center" as const,
+  },
+  toolStatus: {
+    flexDirection: "row" as const,
+    alignItems: "center" as const,
+    paddingVertical: 4,
+  },
+  toolStatusText: {
+    fontSize: 13,
+    color: colors.primary,
+    fontWeight: "500" as const,
   },
 });

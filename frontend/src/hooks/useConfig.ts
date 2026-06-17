@@ -7,7 +7,7 @@ const log = createLogger("useConfig");
 
 export function useConfig() {
   const [config, setConfig] = useState<AccountConfig | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -40,6 +40,7 @@ export function useConfig() {
     api_key: string;
     decode_model: string;
     embedding_model: string;
+    deep_enrichment?: boolean;
   }) => {
     log.info("saveConfig called", {
       provider: data.llm_provider,

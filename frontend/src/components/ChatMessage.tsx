@@ -4,6 +4,7 @@ import { IconButton, Text } from "react-native-paper";
 import Markdown from "react-native-markdown-display";
 import { PlotlyChart } from "./PlotlyChart";
 import { TransactionConfirmCard } from "./TransactionConfirmCard";
+import { ToolTrace } from "./ToolTrace";
 import { colors, typography, spacing } from "../styles/theme";
 import type { ChatMessage as ChatMessageType } from "../lib/types";
 
@@ -85,6 +86,9 @@ export function ChatMessage({ message }: ChatMessageProps) {
               <TransactionConfirmCard key={i} transaction={tx} />
             ))}
           </View>
+        )}
+        {!isUser && message.toolTraces && message.toolTraces.length > 0 && (
+          <ToolTrace traces={message.toolTraces} />
         )}
       </View>
     </View>

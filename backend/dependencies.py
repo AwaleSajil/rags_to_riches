@@ -8,7 +8,7 @@ from backend.config import get_settings, Settings
 
 logger = logging.getLogger("moneyrag.dependencies")
 
-bearer_scheme = HTTPBearer()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def get_supabase(access_token: str | None = None):
@@ -34,9 +34,12 @@ def _validate_token_sync(token: str, supabase_url: str, supabase_key: str) -> di
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     settings: Settings = Depends(get_settings),
-) -> dict:
+) -> dict | None:
+    if not credentials:
+        return None
+        
     token = credentials.credentials
     logger.debug("get_current_user called — token=%s...", token[:20])
     try:

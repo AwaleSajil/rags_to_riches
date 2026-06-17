@@ -18,7 +18,7 @@ AI-powered financial transaction analysis using RAG (Retrieval-Augmented Generat
 - **Smart CSV Ingestion**: Automatically maps any CSV format to standardized transaction schema using LLM
 - **Multi-Provider Support**: Works with Google Gemini and OpenAI models
 - **Merchant Enrichment**: Automatically enriches transactions with web-searched merchant information
-- **Semantic + Structured Search**: Actian Vector DB for semantic search + Databricks SQL for structured queries
+- **Semantic + Structured Search**: Qdrant Cloud for semantic search + Supabase PostgreSQL for structured queries
 - **MCP Integration**: Leverages Model Context Protocol for tool-based agent interactions
 - **Mobile-First UI**: Expo (React Native) frontend with Android support
 - **Auth**: Supabase authentication with JWT validation
@@ -32,8 +32,8 @@ AI-powered financial transaction analysis using RAG (Retrieval-Augmented Generat
 - **Backend**: FastAPI wrapping the RAG engine
 - **RAG Engine**: LangChain + LangGraph with MCP tool server
 - **Auth**: Supabase (client-side JS + server-side JWT validation)
-- **Vector DB**: Actian Vector DB for semantic search (multi-tenant via user_id). Qdrant Cloud available as an alternative.
-- **Database**: Databricks SQL Warehouse for structured transaction queries. Supabase PostgreSQL available as an alternative.
+- **Vector DB**: Qdrant Cloud for semantic search (multi-tenant via user_id).
+- **Database**: Supabase PostgreSQL for structured transaction queries.
 
 
 
@@ -48,32 +48,18 @@ Set these as **Repository secrets** in HF Space settings:
 | `SUPABASE_URL` | Supabase project URL (auth) |
 | `SUPABASE_KEY` | Supabase anon/service key (auth) |
 
-### Databricks (Primary SQL Database)
+### Database
 
 | Variable | Description |
 |---|---|
-| `POSTGRESSQL_STACK` | Set to `databricks` |
-| `DATABRICKS_SERVER_HOSTNAME` | Databricks workspace hostname |
-| `DATABRICKS_HTTP_PATH` | SQL Warehouse HTTP path |
-| `DATABRICKS_TOKEN` | Databricks personal access token |
+| `DATABASE_URL` | PostgreSQL connection string (Supabase) |
 
-### Actian Vector DB (Primary Vector Store)
+### Vector DB
 
 | Variable | Description |
 |---|---|
-| `VECTOR_DB_STACK` | Set to `actian` |
-| `ACTIAN_ADDRESS` | Actian Vector DB endpoint |
-| `ACTIAN_API_KEY` | Actian API key |
-
-### Alternative Backends
-
-| Variable | Description |
-|---|---|
-| `POSTGRESSQL_STACK` | Set to `supabase` to use Supabase PostgreSQL instead of Databricks |
-| `DATABASE_URL` | PostgreSQL connection string (when using Supabase) |
-| `VECTOR_DB_STACK` | Set to `qdrant` to use Qdrant Cloud instead of Actian |
-| `QDRANT_URL` | Qdrant Cloud cluster URL (when using Qdrant) |
-| `QDRANT_API_KEY` | Qdrant API key (when using Qdrant) |
+| `QDRANT_URL` | Qdrant Cloud cluster URL |
+| `QDRANT_API_KEY` | Qdrant API key |
 
 ## Deployment
 
@@ -149,10 +135,8 @@ MoneyRAG automatically handles different CSV formats:
 
 - **LangChain & LangGraph**: Agent orchestration
 - **Google Gemini / OpenAI GPT**: LLM providers
-- **Actian Vector DB**: Vector database for semantic search
-- **Databricks SQL**: Structured transaction queries
-- **Supabase**: Auth + alternative PostgreSQL database
-- **Qdrant Cloud**: Alternative vector database
+- **Supabase**: Auth + PostgreSQL database for structured queries
+- **Qdrant Cloud**: Vector database for semantic search
 - **FastMCP**: Model Context Protocol server
 - **Expo (React Native)**: Cross-platform frontend
 - **FastAPI**: Backend API framework

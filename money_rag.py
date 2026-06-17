@@ -31,14 +31,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class MoneyRAG:
-    def __init__(self, llm_provider: str, model_name: str, embedding_model_name: str, api_key: str, user_id: str, access_token: str = None):
+    def __init__(self, llm_provider: str, model_name: str, embedding_model_name: str, api_key: str, user_id: str, access_token: str = None, deep_enrichment: bool = False):
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
         self.embedding_model_name = embedding_model_name
         self.user_id = user_id
-        self._db_stack = os.environ.get("POSTGRESSQL_STACK", "supabase").lower()
-
-        # Initialize Supabase Client (always needed for auth, storage; also for data if stack=supabase)
+        self.deep_enrichment = deep_enrichment
+        # Initialize Supabase Client (always needed for auth, storage, and data)
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
 
@@ -48,16 +47,6 @@ class MoneyRAG:
             self.supabase = create_client(url, key, options=opts)
         else:
             self.supabase = create_client(url, key)
-
-        # Initialize Databricks connection if needed
-        self._databricks_conn = None
-        if self._db_stack == "databricks":
-            from databricks import sql
-            self._databricks_conn = sql.connect(
-                server_hostname=os.environ.get("DATABRICKS_SERVER_HOSTNAME"),
-                http_path=os.environ.get("DATABRICKS_HTTP_PATH"),
-                access_token=os.environ.get("DATABRICKS_TOKEN"),
-            )
         
         # Set API Keys
         if self.llm_provider == "google":
@@ -79,7 +68,6 @@ class MoneyRAG:
         self.temp_dir = tempfile.mkdtemp()
         os.environ["DATA_DIR"] = self.temp_dir # Harmonize with mcp_server.py 
         self.db_path = os.path.join(self.temp_dir, "money_rag.db")
-        self.db_path = os.path.join(self.temp_dir, "money_rag.db")
         
         self.db: Optional[SQLDatabase] = None
         self.vector_store_client = None
@@ -93,119 +81,44 @@ class MoneyRAG:
 
     def _db_select(self, table: str, columns: str = "*", filters: dict = None) -> List[dict]:
         """SELECT rows from a table. Returns list of dicts."""
-        if self._db_stack == "databricks":
-            where_parts = []
-            values = []
-            if filters:
-                for k, v in filters.items():
-                    where_parts.append(f"{k} = ?")
-                    values.append(v)
-            where = " AND ".join(where_parts) if where_parts else "1=1"
-            with self._databricks_conn.cursor() as cur:
-                cur.execute(f"SELECT {columns} FROM {table} WHERE {where}", values)
-                rows = cur.fetchall()
-                if not rows:
-                    return []
-                col_names = [desc[0] for desc in cur.description]
-                return [dict(zip(col_names, r)) for r in rows]
-        else:
-            q = self.supabase.table(table).select(columns)
-            if filters:
-                for k, v in filters.items():
-                    q = q.eq(k, v)
-            res = q.execute()
-            return res.data or []
+        q = self.supabase.table(table).select(columns)
+        if filters:
+            for k, v in filters.items():
+                q = q.eq(k, v)
+        res = q.execute()
+        return res.data or []
 
     def _db_select_in(self, table: str, columns: str, field: str, values_list: list) -> List[dict]:
         """SELECT rows WHERE field IN (...)."""
         if not values_list:
             return []
-        if self._db_stack == "databricks":
-            placeholders = ",".join(["?"] * len(values_list))
-            with self._databricks_conn.cursor() as cur:
-                cur.execute(f"SELECT {columns} FROM {table} WHERE {field} IN ({placeholders})", values_list)
-                rows = cur.fetchall()
-                if not rows:
-                    return []
-                col_names = [desc[0] for desc in cur.description]
-                return [dict(zip(col_names, r)) for r in rows]
-        else:
-            res = self.supabase.table(table).select(columns).in_(field, values_list).execute()
-            return res.data or []
+        res = self.supabase.table(table).select(columns).in_(field, values_list).execute()
+        return res.data or []
 
     def _db_upsert(self, table: str, records: List[dict], conflict_key: str = None):
         """Upsert records into a table."""
-        if self._db_stack == "databricks":
-            for rec in records:
-                cols = list(rec.keys())
-                placeholders = ",".join(["?"] * len(cols))
-                col_str = ",".join(cols)
-                # Check if exists by conflict_key
-                if conflict_key and conflict_key in rec:
-                    with self._databricks_conn.cursor() as cur:
-                        cur.execute(f"SELECT id FROM {table} WHERE {conflict_key} = ?", [rec[conflict_key]])
-                        existing = cur.fetchone()
-                        if existing:
-                            set_parts = ",".join(f"{c} = ?" for c in cols if c != conflict_key)
-                            vals = [rec[c] for c in cols if c != conflict_key] + [rec[conflict_key]]
-                            cur.execute(f"UPDATE {table} SET {set_parts} WHERE {conflict_key} = ?", vals)
-                        else:
-                            cur.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", [rec[c] for c in cols])
-                else:
-                    with self._databricks_conn.cursor() as cur:
-                        cur.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", [rec[c] for c in cols])
-            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
-        else:
-            if conflict_key:
-                self.supabase.table(table).upsert(records, on_conflict=conflict_key).execute()
-            else:
-                self.supabase.table(table).insert(records).execute()
-
-    def _db_insert(self, table: str, records: List[dict]):
-        """Insert records into a table."""
-        if self._db_stack == "databricks":
-            for rec in records:
-                cols = list(rec.keys())
-                placeholders = ",".join(["?"] * len(cols))
-                col_str = ",".join(cols)
-                with self._databricks_conn.cursor() as cur:
-                    cur.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", [rec[c] for c in cols])
-            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
+        if conflict_key:
+            self.supabase.table(table).upsert(records, on_conflict=conflict_key).execute()
         else:
             self.supabase.table(table).insert(records).execute()
 
+    def _db_insert(self, table: str, records: List[dict]):
+        """Insert records into a table."""
+        self.supabase.table(table).insert(records).execute()
+
     def _db_delete(self, table: str, filters: dict):
         """Delete rows matching filters."""
-        if self._db_stack == "databricks":
-            where_parts = []
-            values = []
-            for k, v in filters.items():
-                where_parts.append(f"{k} = ?")
-                values.append(v)
-            where = " AND ".join(where_parts)
-            with self._databricks_conn.cursor() as cur:
-                cur.execute(f"DELETE FROM {table} WHERE {where}", values)
-            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
-        else:
-            q = self.supabase.table(table).delete()
-            for k, v in filters.items():
-                q = q.eq(k, v)
-            q.execute()
+        q = self.supabase.table(table).delete()
+        for k, v in filters.items():
+            q = q.eq(k, v)
+        q.execute()
 
     def _db_update(self, table: str, data: dict, filters: dict):
         """Update rows matching filters."""
-        if self._db_stack == "databricks":
-            set_parts = ",".join(f"{k} = ?" for k in data.keys())
-            where_parts = [f"{k} = ?" for k in filters.keys()]
-            vals = list(data.values()) + list(filters.values())
-            with self._databricks_conn.cursor() as cur:
-                cur.execute(f"UPDATE {table} SET {set_parts} WHERE {' AND '.join(where_parts)}", vals)
-            self._databricks_conn.commit() if hasattr(self._databricks_conn, 'commit') else None
-        else:
-            q = self.supabase.table(table).update(data)
-            for k, v in filters.items():
-                q = q.eq(k, v)
-            q.execute()
+        q = self.supabase.table(table).update(data)
+        for k, v in filters.items():
+            q = q.eq(k, v)
+        q.execute()
 
     async def setup_session(self, uploaded_files: List[dict]):
         """Ingests CSVs and Bills, then sets up DBs."""
@@ -226,11 +139,23 @@ class MoneyRAG:
                 raise RuntimeError(f"Failed to ingest '{file_name}': {e}") from e
 
         try:
+            self._emit_progress("embedding", 0, 0, "Syncing to vector database...")
             self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
             self.vector_store_client = self._sync_to_vectordb()
+            self._emit_progress("embedding", 1, 1, "Vector sync complete")
         except Exception as e:
             raise RuntimeError(f"Failed to sync to vector store: {e}") from e
         return all_duplicates
+
+    def _emit_progress(self, stage: str, total: int, done: int, detail: str = ""):
+        """Emit a progress update as a JSON line to stderr for the parent process to parse."""
+        import json as _json
+        import sys as _sys
+        progress = {"progress": {"stage": stage, "total": total, "done": done}}
+        if detail:
+            progress["progress"]["detail"] = detail
+        _sys.stderr.write(_json.dumps(progress) + "\n")
+        _sys.stderr.flush()
 
     async def _ingest_csv(self, file_path, csv_id=None):
         import hashlib
@@ -242,6 +167,9 @@ class MoneyRAG:
             df = pd.read_csv(file_path)
         except Exception as e:
             raise RuntimeError(f"Cannot read CSV file: {e}") from e
+
+        total_rows = len(df)
+        self._emit_progress("parsing", total_rows, 0, f"Read {total_rows} rows from {filename}")
 
         headers = df.columns.tolist()
         sample_data = df.head(10).to_json()
@@ -281,6 +209,8 @@ class MoneyRAG:
         except Exception as e:
             raise RuntimeError(f"LLM column mapping failed (headers: {headers}): {e}") from e
 
+        self._emit_progress("parsing", total_rows, total_rows, "Column mapping complete")
+
         # Validate that the LLM returned the required keys
         for key in ['date_col', 'desc_col', 'amount_col']:
             if key not in mapping:
@@ -307,54 +237,103 @@ class MoneyRAG:
         cat_col = mapping.get('category_col')
         standard_df['category'] = df[cat_col] if cat_col and cat_col in df.columns else 'Uncategorized'
 
-        # --- Async Enrichment Step ---
-        print(f"   ✨ Enriching descriptions for {os.path.basename(file_path)}...")
+        # --- Async Enrichment Step (batched for speed) ---
         unique_descriptions = standard_df['description'].unique().tolist()
-        sem = asyncio.Semaphore(5)
+        total_unique = len(unique_descriptions)
+        self._emit_progress("enriching", total_unique, 0, f"{total_unique} unique merchants to enrich")
+        print(f"   ✨ Enriching {total_unique} unique descriptions for {filename}...")
 
-        extract_prompt = ChatPromptTemplate.from_template("""
-You are a financial data assistant. Given a raw bank transaction description and a web search snippet about the merchant, extract structured information.
+        sem = asyncio.Semaphore(15)  # Higher concurrency for faster enrichment
+        enriched_count = 0
 
-Transaction description: {description}
-Web search result: {search_result}
+        # Batch enrichment prompt — process up to 10 descriptions at once
+        batch_extract_prompt = ChatPromptTemplate.from_template("""
+You are a financial data assistant. For each transaction description below, extract the clean merchant name and a one-sentence description of the business.
 
-Return ONLY valid JSON with exactly these two fields:
-{{
-  "merchant_name": "<clean 1-4 word business name, e.g. 'Chipotle', 'Amazon', 'Spotify'>",
-  "enriched_info": "<one sentence describing what type of business this is>"
-}}
+Transaction descriptions:
+{descriptions_json}
+
+Return ONLY a valid JSON array with one object per description, in the same order:
+[
+  {{"description": "<original description>", "merchant_name": "<clean 1-4 word name>", "enriched_info": "<one sentence about the business>"}},
+  ...
+]
 """)
-        extract_chain = extract_prompt | self.llm | JsonOutputParser()
+        batch_extract_chain = batch_extract_prompt | self.llm | JsonOutputParser()
 
-        async def get_merchant_info(description):
-            if description in self.merchant_cache:
-                return self.merchant_cache[description]
-            async with sem:
-                try:
-                    await asyncio.sleep(0.05)
-                    print(f"      🔍 Web searching: {description}...")
-                    search_result = await self.search_tool.ainvoke(
-                        f"What type of business / store is '{description}'?"
-                    )
-                    # Extract structured merchant name + description in one LLM call
-                    structured = await extract_chain.ainvoke({
-                        "description": description,
-                        "search_result": search_result[:500],
-                    })
-                    result = {
-                        "merchant_name": structured.get("merchant_name", description),
-                        "enriched_info": structured.get("enriched_info", search_result[:200]),
-                    }
-                    self.merchant_cache[description] = result
-                    return result
-                except Exception as e:
-                    print(f"      ⚠️ Enrichment failed for {description}: {e}")
-                    return {"merchant_name": description, "enriched_info": ""}
+        async def enrich_batch(descriptions_batch):
+            nonlocal enriched_count
+            # Check cache first, only process uncached
+            results = {}
+            uncached = []
+            for desc in descriptions_batch:
+                if desc in self.merchant_cache:
+                    results[desc] = self.merchant_cache[desc]
+                else:
+                    uncached.append(desc)
 
-        tasks = [get_merchant_info(desc) for desc in unique_descriptions]
-        enrichment_results = await asyncio.gather(*tasks)
+            if uncached:
+                async with sem:
+                    try:
+                        # Deep enrichment: do web searches first for extra context
+                        search_context = ""
+                        if self.deep_enrichment:
+                            search_results = {}
+                            for desc in uncached:
+                                try:
+                                    sr = await self.search_tool.ainvoke(f"What type of business is '{desc}'?")
+                                    search_results[desc] = sr[:200]
+                                except Exception:
+                                    search_results[desc] = ""
+                            if any(search_results.values()):
+                                search_context = "\n\nWeb search context:\n" + "\n".join(
+                                    f"- {d}: {s}" for d, s in search_results.items() if s
+                                )
 
-        desc_map = dict(zip(unique_descriptions, enrichment_results))
+                        descriptions_json = json.dumps(uncached)
+                        prompt_input = {"descriptions_json": descriptions_json + search_context}
+                        structured_list = await batch_extract_chain.ainvoke(prompt_input)
+                        if isinstance(structured_list, list):
+                            for item in structured_list:
+                                desc = item.get("description", "")
+                                result = {
+                                    "merchant_name": item.get("merchant_name", desc),
+                                    "enriched_info": item.get("enriched_info", ""),
+                                }
+                                # Match to uncached by best effort
+                                matched_desc = desc
+                                for uc in uncached:
+                                    if uc.lower().strip() == desc.lower().strip() or uc in desc or desc in uc:
+                                        matched_desc = uc
+                                        break
+                                results[matched_desc] = result
+                                self.merchant_cache[matched_desc] = result
+                        # Fill any that weren't matched
+                        for desc in uncached:
+                            if desc not in results:
+                                results[desc] = {"merchant_name": desc, "enriched_info": ""}
+                                self.merchant_cache[desc] = results[desc]
+                    except Exception as e:
+                        print(f"      ⚠️ Batch enrichment failed: {e}")
+                        for desc in uncached:
+                            results[desc] = {"merchant_name": desc, "enriched_info": ""}
+
+            enriched_count += len(descriptions_batch)
+            self._emit_progress("enriching", total_unique, enriched_count)
+            return results
+
+        # Process in batches of 10
+        BATCH_SIZE = 10
+        desc_map = {}
+        batch_tasks = []
+        for i in range(0, total_unique, BATCH_SIZE):
+            batch = unique_descriptions[i:i + BATCH_SIZE]
+            batch_tasks.append(enrich_batch(batch))
+
+        batch_results = await asyncio.gather(*batch_tasks)
+        for batch_result in batch_results:
+            desc_map.update(batch_result)
+
         standard_df['enriched_info'] = standard_df['description'].map(
             lambda d: desc_map.get(d, {}).get("enriched_info", "")
         )
@@ -362,10 +341,10 @@ Return ONLY valid JSON with exactly these two fields:
             lambda d: desc_map.get(d, {}).get("merchant_name", d)
         )
 
-        print(f"   ✅ Enriched {len(unique_descriptions)} unique merchants.")
-
+        print(f"   ✅ Enriched {total_unique} unique merchants.")
 
         # Save to Supabase transactions table
+        self._emit_progress("saving", total_rows, 0, "Saving transactions to database")
         records = json.loads(standard_df.to_json(orient='records'))
 
         # Calculate content_hash and source for deduplication
@@ -395,6 +374,7 @@ Return ONLY valid JSON with exactly these two fields:
         ]
 
         batch_size = 100
+        saved_rows = 0
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             try:
@@ -409,6 +389,8 @@ Return ONLY valid JSON with exactly these two fields:
                     self._db_insert("Transaction", batch)
                 except Exception as ex:
                     print(f"Failed fallback insert: {ex}")
+            saved_rows += len(batch)
+            self._emit_progress("saving", total_rows, saved_rows)
 
         return duplicates
 
@@ -418,7 +400,9 @@ Return ONLY valid JSON with exactly these two fields:
         import json
         from langchain_core.messages import HumanMessage
         
-        print(f"   📸 Processing bill image: {os.path.basename(file_path)}...")
+        filename = os.path.basename(file_path)
+        self._emit_progress("parsing", 1, 0, f"Reading image: {filename}")
+        
         with open(file_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
         
@@ -433,6 +417,8 @@ Return ONLY valid JSON with exactly these two fields:
             "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "tax_amount": 0.0, "item_total_price": 10.0}]
         }
         
+        # Vision extraction — single LLM call to extract all structured data
+        self._emit_progress("parsing", 1, 0, "Extracting data from receipt...")
         prompt = f"Extract structured data from this receipt/bill. Return strictly valid JSON exactly matching this schema: {json.dumps(schema)}"
         message = HumanMessage(
             content=[
@@ -448,51 +434,80 @@ Return ONLY valid JSON with exactly these two fields:
             print(f"   ❌ Vision extraction failed: {e}")
             return
             
-        print(f"   ✅ Extracted {extracted.get('merchant_name')} for {extracted.get('total_amount')}")
+        self._emit_progress("parsing", 1, 1, f"Extracted: {extracted.get('merchant_name')}")
         
         # Save the raw OCR JSON back to the BillFile record
         if file_id:
             try:
                 self._db_update("BillFile", {"raw_ocr_string": json.dumps(extracted)}, {"id": file_id})
-                print("   ✅ Saved raw OCR to BillFile seamlessly.")
             except Exception as e:
                 print(f"   ⚠️ Failed to save raw_ocr_string to BillFile: {e}")
         
+        # Enrich merchant + all line items in a single LLM call
+        raw_merchant = extracted.get('merchant_name', 'Unknown')
+        line_items = extracted.get('line_items', [])
+        all_names = [raw_merchant] + [item.get('item_description', '') for item in line_items]
+        total_to_enrich = len(all_names)
+        self._emit_progress("enriching", total_to_enrich, 0, f"Enriching {total_to_enrich} items...")
+
+        # Deep enrichment: web search for richer context
+        search_context = ""
+        if self.deep_enrichment:
+            search_results = {}
+            for name in all_names:
+                try:
+                    sr = await self.search_tool.ainvoke(f"What type of product or business is '{name}'?")
+                    search_results[name] = sr[:200]
+                except Exception:
+                    search_results[name] = ""
+            if any(search_results.values()):
+                search_context = "\n\nWeb search context:\n" + "\n".join(
+                    f"- {n}: {s}" for n, s in search_results.items() if s
+                )
+
+        enrich_prompt = ChatPromptTemplate.from_template("""
+You are a financial data assistant. For each item description below, provide a clean name and a one-sentence description.
+The first item is the merchant/store. The rest are line items from a receipt.
+
+Item descriptions:
+{descriptions_json}
+
+Return ONLY a valid JSON array with one object per item, in the same order:
+[
+  {{"description": "<original>", "clean_name": "<clean 1-4 word name>", "enriched_info": "<one sentence>"}},
+  ...
+]
+""")
+        enrich_chain = enrich_prompt | self.llm | JsonOutputParser()
+        
+        try:
+            enriched_list = await enrich_chain.ainvoke({"descriptions_json": json.dumps(all_names) + search_context})
+            # First result is the merchant
+            if isinstance(enriched_list, list) and len(enriched_list) > 0:
+                merchant_info = enriched_list[0]
+                clean_merchant = merchant_info.get("clean_name", raw_merchant)
+                enriched_info = merchant_info.get("enriched_info", "")
+                # Remaining results are line items
+                for idx, item in enumerate(line_items):
+                    if idx + 1 < len(enriched_list):
+                        item['enriched_info'] = enriched_list[idx + 1].get("enriched_info", "")
+                    else:
+                        item['enriched_info'] = ""
+            else:
+                clean_merchant = raw_merchant
+                enriched_info = ""
+        except Exception as e:
+            print(f"   ⚠️ Batch enrichment failed: {e}")
+            clean_merchant = raw_merchant
+            enriched_info = ""
+            for item in line_items:
+                item['enriched_info'] = ""
+
+        self._emit_progress("enriching", total_to_enrich, total_to_enrich, "Enrichment complete")
+
         # Calculate content_hash
         date_str = str(extracted.get('date', '')).strip()
         amount_str = str(round(float(extracted.get('total_amount', 0)), 2))
-        
-        # Enrich parent merchant via Web Search
-        raw_merchant = extracted.get('merchant_name', 'Unknown')
-        print(f"      🔍 Web searching to enrich merchant: {raw_merchant}...")
-        try:
-            search_result = await self.search_tool.ainvoke(f"What type of business / store is '{raw_merchant}'?")
-            
-            # Reusing the CSV enrichment prompt format
-            extract_prompt = ChatPromptTemplate.from_template("""
-You are a financial data assistant. Given a raw bank transaction description and a web search snippet about the merchant, extract structured information.
-
-Transaction description: {description}
-Web search result: {search_result}
-
-Return ONLY valid JSON with exactly these two fields:
-{{
-  "merchant_name": "<clean 1-4 word business name, e.g. 'Chipotle', 'Amazon', 'Spotify'>",
-  "enriched_info": "<one sentence describing what type of business this is>"
-}}
-""")
-            extract_chain_enrich = extract_prompt | self.llm | JsonOutputParser()
-            enriched_data = await extract_chain_enrich.ainvoke({
-                "description": raw_merchant,
-                "search_result": search_result[:500]
-            })
-            enriched_info = enriched_data.get("enriched_info", search_result[:200])
-            clean_merchant = enriched_data.get("merchant_name", raw_merchant)
-        except Exception as e:
-            print(f"      ⚠️ Parent enrichment failed: {e}")
-            enriched_info = ""
-            clean_merchant = raw_merchant
-
         merch_hash = str(clean_merchant).lower().strip().split()[0] if clean_merchant else ""
         merch_hash = ''.join(c for c in merch_hash if c.isalnum())
         hash_input = f"{date_str}{amount_str}{merch_hash}"
@@ -502,7 +517,6 @@ Return ONLY valid JSON with exactly these two fields:
         tx_record = {
             "user_id": self.user_id,
             "trans_date": date_str,
-            # In this app, spending is traditionally positive, so let's keep it strictly positive for bills
             "amount": abs(float(extracted.get('total_amount', 0))), 
             "description": raw_merchant,
             "merchant_name": clean_merchant,
@@ -518,50 +532,25 @@ Return ONLY valid JSON with exactly these two fields:
         existing_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
         is_duplicate = len(existing_rows) > 0
         duplicates = [{"date": tx_record['trans_date'], "merchant": tx_record['merchant_name'], "amount": tx_record['amount']}] if is_duplicate else []
-            
-        # Optional: Enrich line items
-        sem = asyncio.Semaphore(5)
-        async def enrich_item(item):
-            name = item.get('item_description', '')
-            async with sem:
-                try:
-                    await asyncio.sleep(0.05)
-                    res = await self.search_tool.ainvoke(f"What type of product is '{name}'?")
-                    item['enriched_info'] = res[:200]
-                except Exception:
-                    item['enriched_info'] = ""
-            return item
-            
-        line_items = extracted.get('line_items', [])
-        print(f"   ✨ Enriching {len(line_items)} line items...")
-        tasks = [enrich_item(i) for i in line_items]
-        line_items = await asyncio.gather(*tasks)
 
-        # Upsert Transaction
+        # Save transaction
+        self._emit_progress("saving", 1, 0, "Saving transaction...")
         try:
-            print(f"   [DEBUG] Preparing to Upsert Transaction with source_bill_file_id: {file_id}")
-            if file_id:
-                bill_check = self._db_select("BillFile", "id", {"id": file_id})
-                print(f"   [DEBUG] BillFile presence check: {len(bill_check)} rows found.")
-
             self._db_upsert("Transaction", [tx_record], conflict_key="content_hash")
-            print("   [DEBUG] Upsert successful!")
         except Exception as e:
-            print(f"   ⚠️ Upsert failed (migration not run?), falling back to insert: {e}")
             tx_record.pop('merchant_name', None)
             tx_record.pop('content_hash', None)
             tx_record.pop('source', None)
             try:
                 self._db_insert("Transaction", [tx_record])
             except Exception as e2:
-                print(f"   ❌ Fallback insert completely failed: {e2}")
+                print(f"   ❌ Fallback insert failed: {e2}")
 
         # Get the transaction ID to link details
         try:
             fetch_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
             tx_id = fetch_rows[0]['id'] if fetch_rows else None
-        except Exception as e:
-            print(f"   ⚠️ Failed to fetch transaction ID: {e}")
+        except Exception:
             tx_id = None
 
         if tx_id and line_items:
@@ -580,10 +569,10 @@ Return ONLY valid JSON with exactly these two fields:
                 })
             try:
                 self._db_insert("TransactionDetail", details)
-                print(f"   ✅ Saved {len(details)} line items.")
             except Exception as e:
                 print(f"   ⚠️ Failed to insert details (table might not exist): {e}")
 
+        self._emit_progress("saving", 1, 1, "Complete")
         return duplicates
 
     def _sync_to_vectordb(self):
@@ -600,8 +589,11 @@ Return ONLY valid JSON with exactly these two fields:
         except Exception:
             details_df = pd.DataFrame()
 
+        def _progress(detail, total, done):
+            self._emit_progress("embedding", total, done, detail)
+
         vdb = get_vector_client()
-        return vdb.sync_transactions(df, details_df, self.user_id, self.embeddings)
+        return vdb.sync_transactions(df, details_df, self.user_id, self.embeddings, progress_callback=_progress)
 
     async def delete_file(self, file_id: str, file_type: str = 'csv'):
         """Force delete a file and all its transactions from the database and vector store."""

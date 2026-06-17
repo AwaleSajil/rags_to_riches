@@ -70,9 +70,13 @@ async function getAccessToken(forceRefresh = false): Promise<string | null> {
   }
 }
 
+interface CustomRequestInit extends RequestInit {
+  timeout?: number;
+}
+
 export async function apiFetch(
   path: string,
-  options: RequestInit = {}
+  options: CustomRequestInit = {}
 ): Promise<Response> {
   const token = await getAccessToken();
   const method = options.method || "GET";
@@ -99,10 +103,15 @@ export async function apiFetch(
   const url = `${API_URL}${path}`;
   log.debug("Full request URL", { url });
 
+  const controller = new AbortController();
+  const timeoutMs = options.timeout || 5000;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const res = await fetch(url, {
       ...options,
       headers,
+      signal: controller.signal,
     });
 
     log.info(`${method} ${path} -> ${res.status}`, {
@@ -111,6 +120,8 @@ export async function apiFetch(
       ok: res.ok,
     });
 
+    clearTimeout(timeoutId);
+
     // On 401, try once with a refreshed token before giving up
     if (res.status === 401 && token) {
       log.warn("401 Unauthorized - attempting session refresh and retry");
@@ -118,7 +129,7 @@ export async function apiFetch(
       if (freshToken && freshToken !== token) {
         log.info("Got fresh token - retrying request");
         const retryHeaders = { ...headers, Authorization: `Bearer ${freshToken}` };
-        const retryRes = await fetch(url, { ...options, headers: retryHeaders });
+        const retryRes = await fetch(url, { ...options, headers: retryHeaders, signal: controller.signal });
         log.info(`${method} ${path} retry -> ${retryRes.status}`);
         return retryRes;
       }
@@ -126,7 +137,12 @@ export async function apiFetch(
     }
 
     return res;
-  } catch (error) {
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === "AbortError") {
+      log.error(`${method} ${path} TIMEOUT (${timeoutMs}ms)`);
+      throw new Error("Request timed out — is the backend server running?");
+    }
     log.error(`${method} ${path} NETWORK ERROR`, error);
     throw error;
   }
@@ -134,7 +150,7 @@ export async function apiFetch(
 
 export async function apiJson<T>(
   path: string,
-  options: RequestInit = {}
+  options: CustomRequestInit = {}
 ): Promise<T> {
   const res = await apiFetch(path, options);
   if (!res.ok) {

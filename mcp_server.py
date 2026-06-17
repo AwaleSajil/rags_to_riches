@@ -19,24 +19,13 @@ mcp = FastMCP("Money RAG Financial Analyst")
 
 from supabase import create_client, Client
 
-# Database stack detection
-DB_STACK = os.environ.get("POSTGRESSQL_STACK", "supabase").lower()
-
 def get_db_connection():
-    """Returns a database connection (psycopg2 for Supabase, databricks.sql for Databricks)."""
-    if DB_STACK == "databricks":
-        from databricks import sql
-        return sql.connect(
-            server_hostname=os.environ.get("DATABRICKS_SERVER_HOSTNAME"),
-            http_path=os.environ.get("DATABRICKS_HTTP_PATH"),
-            access_token=os.environ.get("DATABRICKS_TOKEN"),
-        )
-    else:
-        import psycopg2
-        db_url = os.environ.get("DATABASE_URL")
-        if not db_url:
-            raise ValueError("DATABASE_URL must be defined to construct raw SQL connections.")
-        return psycopg2.connect(db_url)
+    """Returns a database connection (psycopg2 for Postgres)."""
+    import psycopg2
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL must be defined to construct raw SQL connections.")
+    return psycopg2.connect(db_url)
 
 def get_current_user_id() -> str:
     user_id = os.environ.get("CURRENT_USER_ID")
@@ -45,13 +34,11 @@ def get_current_user_id() -> str:
     return user_id
 
 def _quote_table(name: str) -> str:
-    """Quote a table name appropriately for the current DB stack."""
-    if DB_STACK == "databricks":
-        return name  # Databricks uses unquoted or backtick-quoted names
+    """Quote a table name appropriately for Postgres."""
     return f'"{name}"'  # Postgres uses double-quoted identifiers
 
 def _execute_query(conn, query: str):
-    """Execute a query and return (rows, column_names). Works with both psycopg2 and Databricks."""
+    """Execute a query and return (rows, column_names). Works with psycopg2."""
     cursor = conn.cursor()
     cursor.execute(query)
     results = cursor.fetchall()
