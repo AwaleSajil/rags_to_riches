@@ -36,6 +36,7 @@ class MoneyRAG:
         self.model_name = model_name
         self.embedding_model_name = embedding_model_name
         self.user_id = user_id
+        self.access_token = access_token
         self.deep_enrichment = deep_enrichment
         # Initialize Supabase Client (always needed for auth, storage, and data)
         url = os.environ.get("SUPABASE_URL")
@@ -621,7 +622,14 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                     "transport": "stdio",
                     "command": sys.executable,
                     "args": [server_path],
-                    "env": {**os.environ.copy(), "CURRENT_USER_ID": self.user_id},
+                    "env": {
+                        **os.environ.copy(),
+                        "CURRENT_USER_ID": self.user_id,
+                        "CURRENT_EMBEDDING_PROVIDER": self.llm_provider,
+                        "CURRENT_EMBEDDING_MODEL": self.embedding_model_name,
+                        # So MCP tools can sign private-bucket storage URLs as this user.
+                        "CURRENT_ACCESS_TOKEN": self.access_token or "",
+                    },
                 }
             }
         )

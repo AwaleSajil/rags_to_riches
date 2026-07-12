@@ -173,8 +173,17 @@ def semantic_search(query: str, top_k: int = 5) -> str:
         
         from backend.vector_db_client import get_vector_client
         vdb = get_vector_client()
-        embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
-        
+
+        # Use the SAME embedding model the transactions were synced with, injected
+        # by money_rag when it launches this MCP server. Falls back to Gemini.
+        provider = os.environ.get("CURRENT_EMBEDDING_PROVIDER", "google")
+        model = os.environ.get("CURRENT_EMBEDDING_MODEL", "gemini-embedding-001")
+        if provider == "google":
+            embeddings = GoogleGenerativeAIEmbeddings(model=model)
+        else:
+            from langchain_openai import OpenAIEmbeddings
+            embeddings = OpenAIEmbeddings(model=model)
+
         results = vdb.semantic_search(query, user_id=user_id, top_k=top_k, embeddings_model=embeddings)
         
         if not results:
@@ -314,14 +323,31 @@ def get_bill_images(sql_query: str) -> str:
 
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
-        supabase = create_client(url, key)
-        
+        access_token = os.environ.get("CURRENT_ACCESS_TOKEN")
+
+        # The bucket is private, so a public URL won't load. Sign a temporary URL
+        # instead — authenticated as the user so it passes storage RLS.
+        if access_token:
+            from supabase import ClientOptions
+            opts = ClientOptions(headers={"Authorization": f"Bearer {access_token}"})
+            supabase = create_client(url, key, options=opts)
+        else:
+            supabase = create_client(url, key)
+
         urls = []
         for row in results:
             if row[0]:
-                public_url = supabase.storage.from_("money-rag-files").get_public_url(row[0])
-                urls.append(public_url)
-                
+                signed = supabase.storage.from_("money-rag-files").create_signed_url(row[0], 3600)
+                signed_url = (
+                    signed.get("signedURL")
+                    or signed.get("signedUrl")
+                    or signed.get("signed_url")
+                )
+                if signed_url and signed_url.startswith("/"):
+                    signed_url = url.rstrip("/") + signed_url
+                if signed_url:
+                    urls.append(signed_url)
+
         if not urls:
             return '{"error": "No image keys found in result set."}'
             
