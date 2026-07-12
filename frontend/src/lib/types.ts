@@ -89,11 +89,12 @@ export interface TransactionDetailItem {
   id: string;
   item_description: string | null;
   item_quantity: number | null;
-  item_unit_price: number | null;
-  tax_amount: number | null;
+  item_unit_subtotal_price: number | null; // pre-tax unit price
+  item_subtotal_price: number | null; // pre-tax line total (qty x unit)
+  tax_amount: number | null; // tax for this item
   taxable: boolean | null;
   tax_rate: number | null;
-  item_total_price: number | null;
+  item_total_price: number | null; // post-tax line total (subtotal + tax)
   enriched_info: string | null;
 }
 

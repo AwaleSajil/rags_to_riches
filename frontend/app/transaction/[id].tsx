@@ -71,7 +71,7 @@ function toForm(tx: TransactionWithDetails): FormState {
 
 function LineItem({ item }: { item: TransactionDetailItem }) {
   const qty = item.item_quantity;
-  const unit = item.item_unit_price;
+  const unit = item.item_unit_subtotal_price;
   const showQtyLine = qty != null && unit != null;
   const isTaxable = item.taxable === true || (item.tax_rate ?? 0) > 0;
 
@@ -84,6 +84,11 @@ function LineItem({ item }: { item: TransactionDetailItem }) {
         {showQtyLine && (
           <Text style={styles.lineItemSub}>
             {qty} × {money(unit)}
+          </Text>
+        )}
+        {isTaxable && (item.tax_amount ?? 0) > 0 && (
+          <Text style={styles.lineItemSub}>
+            {money(item.item_subtotal_price)} + {money(item.tax_amount)} tax
           </Text>
         )}
       </View>

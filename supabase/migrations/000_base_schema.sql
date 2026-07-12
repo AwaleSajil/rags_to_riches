@@ -90,14 +90,15 @@ CREATE TABLE IF NOT EXISTS public."TransactionDetail" (
     transaction_id   uuid REFERENCES public."Transaction"(id) ON DELETE CASCADE,
     user_id          uuid NOT NULL REFERENCES public."User"(id) ON DELETE CASCADE,
     bill_file_id     uuid REFERENCES public."BillFile"(id) ON DELETE CASCADE,
-    item_description text,
-    item_quantity    numeric,
-    item_unit_price  numeric,
-    tax_amount       numeric,
-    taxable          boolean,
-    tax_rate         numeric,        -- tax rate applied to this item (0 = exempt)
-    item_total_price numeric,
-    enriched_info    text,
+    item_description         text,
+    item_quantity            numeric,
+    item_unit_subtotal_price numeric,       -- pre-tax unit price
+    item_subtotal_price      numeric,       -- pre-tax line total (qty x unit)
+    tax_amount               numeric,       -- tax for this item (= subtotal x rate)
+    taxable                  boolean,
+    tax_rate                 numeric,       -- tax rate applied to this item (0 = exempt)
+    item_total_price         numeric,       -- post-tax line total (= subtotal + tax_amount)
+    enriched_info            text,
     created_at       timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_txdetail_user ON public."TransactionDetail"(user_id);

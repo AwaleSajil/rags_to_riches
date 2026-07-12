@@ -634,17 +634,29 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                     item_rate = float(item['tax_rate']) if item.get('tax_rate') is not None else None
                 except (TypeError, ValueError):
                     item_rate = None
+                taxable = (item_rate is not None and item_rate > 0)
+                # The LLM reports printed (pre-tax) unit/line prices; those are the
+                # *subtotal* columns. Derive per-item tax from the rate, then the
+                # post-tax line total.
+                try:
+                    line_subtotal = float(item.get('item_total_price', 0) or 0)
+                except (TypeError, ValueError):
+                    line_subtotal = 0.0
+                unit_subtotal = item.get('item_unit_price', item.get('item_total_price', 0))
+                tax_amount = round(line_subtotal * item_rate / 100.0, 2) if taxable else 0.0
+                item_total = round(line_subtotal + tax_amount, 2)
                 details.append({
                     "transaction_id": tx_id,
                     "user_id": self.user_id,
                     "bill_file_id": file_id,
                     "item_description": item.get('item_description', ''),
                     "item_quantity": item.get('item_quantity', 1),
-                    "item_unit_price": item.get('item_unit_price', item.get('item_total_price', 0)),
-                    "tax_amount": item.get('tax_amount', 0),
+                    "item_unit_subtotal_price": unit_subtotal,
+                    "item_subtotal_price": line_subtotal,
+                    "tax_amount": tax_amount,
                     "tax_rate": item_rate,
-                    "taxable": (item_rate is not None and item_rate > 0),
-                    "item_total_price": item.get('item_total_price', 0),
+                    "taxable": taxable,
+                    "item_total_price": item_total,
                     "enriched_info": item.get('enriched_info', '')
                 })
             try:

@@ -53,12 +53,17 @@ class TransactionListItem(BaseModel):
 
 
 class TransactionDetailItem(BaseModel):
-    """A single line item belonging to a transaction (from a parsed receipt)."""
+    """A single line item belonging to a transaction (from a parsed receipt).
+
+    Prices are split: *_subtotal_price are pre-tax, item_total_price is post-tax
+    (= item_subtotal_price + tax_amount).
+    """
 
     id: str
     item_description: Optional[str] = None
     item_quantity: Optional[float] = None
-    item_unit_price: Optional[float] = None
+    item_unit_subtotal_price: Optional[float] = None
+    item_subtotal_price: Optional[float] = None
     tax_amount: Optional[float] = None
     taxable: Optional[bool] = None
     tax_rate: Optional[float] = None
