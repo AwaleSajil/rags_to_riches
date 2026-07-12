@@ -1,5 +1,8 @@
 demo_data/*
 .env*.png
 .env
+.mcp.json
+.venv/
 **/node_modules
 **/__pycache__
+*.pyc
