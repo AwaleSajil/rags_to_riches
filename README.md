@@ -18,7 +18,7 @@ AI-powered financial transaction analysis using RAG (Retrieval-Augmented Generat
 - **Smart CSV Ingestion**: Automatically maps any CSV format to standardized transaction schema using LLM
 - **Multi-Provider Support**: Works with Google Gemini and OpenAI models
 - **Merchant Enrichment**: Automatically enriches transactions with web-searched merchant information
-- **Semantic + Structured Search**: Qdrant Cloud for semantic search + Supabase PostgreSQL for structured queries
+- **Semantic + Structured Search**: Supabase Postgres with pgvector for semantic search + structured queries (one database)
 - **MCP Integration**: Leverages Model Context Protocol for tool-based agent interactions
 - **Mobile-First UI**: Expo (React Native) frontend with Android support
 - **Auth**: Supabase authentication with JWT validation
@@ -32,7 +32,7 @@ AI-powered financial transaction analysis using RAG (Retrieval-Augmented Generat
 - **Backend**: FastAPI wrapping the RAG engine
 - **RAG Engine**: LangChain + LangGraph with MCP tool server
 - **Auth**: Supabase (client-side JS + server-side JWT validation)
-- **Vector DB**: Qdrant Cloud for semantic search (multi-tenant via user_id).
+- **Vector DB**: Supabase Postgres + pgvector for semantic search (multi-tenant via user_id).
 - **Database**: Supabase PostgreSQL for structured transaction queries.
 
 
@@ -56,10 +56,9 @@ Set these as **Repository secrets** in HF Space settings:
 
 ### Vector DB
 
-| Variable | Description |
-|---|---|
-| `QDRANT_URL` | Qdrant Cloud cluster URL |
-| `QDRANT_API_KEY` | Qdrant API key |
+Semantic search runs on **pgvector inside your Supabase Postgres** — no separate
+service or keys. It reuses `DATABASE_URL` above. Enable the extension by running
+`supabase/migrations/000_base_schema.sql` (it's pre-installed on Supabase).
 
 ## Deployment
 
@@ -136,7 +135,7 @@ MoneyRAG automatically handles different CSV formats:
 - **LangChain & LangGraph**: Agent orchestration
 - **Google Gemini / OpenAI GPT**: LLM providers
 - **Supabase**: Auth + PostgreSQL database for structured queries
-- **Qdrant Cloud**: Vector database for semantic search
+- **pgvector (Supabase Postgres)**: Vector search for semantic retrieval
 - **FastMCP**: Model Context Protocol server
 - **Expo (React Native)**: Cross-platform frontend
 - **FastAPI**: Backend API framework

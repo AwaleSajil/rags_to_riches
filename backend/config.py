@@ -9,8 +9,6 @@ logger = logging.getLogger("moneyrag.config")
 class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_KEY: str
-    QDRANT_URL: str
-    QDRANT_API_KEY: str
     DATABASE_URL: str
 
     class Config:
@@ -24,9 +22,8 @@ def get_settings() -> Settings:
     logger.debug("Loading settings from .env")
     settings = Settings()
     logger.debug(
-        "Settings loaded — SUPABASE_URL=%s, QDRANT_URL=%s, DATABASE_URL=%s",
+        "Settings loaded — SUPABASE_URL=%s, DATABASE_URL=%s",
         settings.SUPABASE_URL,
-        settings.QDRANT_URL,
         settings.DATABASE_URL[:30] + "..." if len(settings.DATABASE_URL) > 30 else settings.DATABASE_URL,
     )
     return settings

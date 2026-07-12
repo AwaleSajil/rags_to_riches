@@ -46,7 +46,7 @@ async def update_config(body: ConfigUpdate, user: dict = Depends(get_current_use
             from backend.services.file_service import _run_ingestion_subprocess, ingestion_status
             import asyncio
             ingestion_status[user["id"]] = {"status": "processing", "error": None}
-            # Pass empty file list; worker will just sync existing DB transactions to new Qdrant collection
+            # Pass empty file list; worker will re-embed existing DB transactions into pgvector
             asyncio.create_task(_run_ingestion_subprocess(user, record, []))
             
         logger.info("Config updated and RAG invalidated for user_id=%s", user["id"])
