@@ -63,3 +63,44 @@ export interface StoredMessage {
   pending_transactions?: PendingTransaction[] | null;
   created_at: string;
 }
+
+export interface TaxBreakdownEntry {
+  label?: string;
+  rate?: number;
+  amount?: number;
+}
+
+export interface TransactionListItem {
+  id: string;
+  trans_date: string | null;
+  description: string | null;
+  amount: number | null;
+  category: string | null;
+  merchant_name: string | null;
+  location: string | null;
+  subtotal: number | null;
+  tax_total: number | null;
+  tax_breakdown: TaxBreakdownEntry[] | null;
+  source: string | null;
+  created_at: string | null;
+}
+
+export interface TransactionDetailItem {
+  id: string;
+  item_description: string | null;
+  item_quantity: number | null;
+  item_unit_price: number | null;
+  tax_amount: number | null;
+  taxable: boolean | null;
+  tax_rate: number | null;
+  item_total_price: number | null;
+  enriched_info: string | null;
+}
+
+export interface TransactionWithDetails extends TransactionListItem {
+  enriched_info: string | null;
+  content_hash?: string | null;
+  source_csv_id?: string | null;
+  source_bill_file_id?: string | null;
+  details: TransactionDetailItem[];
+}

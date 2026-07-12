@@ -1,11 +1,11 @@
 import React, { useEffect } from "react";
-import { Slot, useRouter, useSegments } from "expo-router";
+import { Stack, useRouter, useSegments } from "expo-router";
 import { Platform } from "react-native";
 import { PaperProvider } from "react-native-paper";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AuthProvider, useAuth } from "../src/providers/AuthProvider";
 import { ChatSessionProvider } from "../src/providers/ChatSessionProvider";
-import { theme } from "../src/styles/theme";
+import { theme, colors } from "../src/styles/theme";
 import { LoadingSpinner } from "../src/components/LoadingSpinner";
 import { createLogger } from "../src/lib/logger";
 
@@ -44,7 +44,22 @@ function RootLayoutNav() {
     return <LoadingSpinner message="Loading..." />;
   }
 
-  return <Slot />;
+  // Root stack. The (tabs) group renders its own headers, so only the
+  // pushed transaction detail screen shows the native stack header + Back.
+  return (
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen
+        name="transaction/[id]"
+        options={{
+          headerShown: true,
+          title: "Transaction",
+          headerStyle: { backgroundColor: colors.surface },
+          headerTintColor: colors.text,
+          headerTitleStyle: { fontWeight: "700" },
+        }}
+      />
+    </Stack>
+  );
 }
 
 log.info("App starting", { platform: Platform.OS });
