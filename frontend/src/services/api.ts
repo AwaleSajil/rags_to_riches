@@ -87,12 +87,14 @@ export async function apiFetch(
     isFormData: options.body instanceof FormData,
   });
 
+  const isFormData = options.body instanceof FormData;
+
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string>),
   };
 
-  // Don't set Content-Type for FormData (browser sets boundary automatically)
-  if (!(options.body instanceof FormData)) {
+  // Don't set Content-Type for FormData (the runtime sets the multipart boundary)
+  if (!isFormData) {
     headers["Content-Type"] = "application/json";
   }
 
@@ -103,15 +105,21 @@ export async function apiFetch(
   const url = `${API_URL}${path}`;
   log.debug("Full request URL", { url });
 
-  const controller = new AbortController();
+  // React Native's fetch aborts multipart file uploads when an AbortSignal is
+  // attached — it fails immediately with "Network request failed". So we only
+  // wire up the timeout/abort for non-FormData requests; uploads run untimed.
   const timeoutMs = options.timeout || 5000;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const controller = isFormData ? null : new AbortController();
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  const signal = controller?.signal;
 
   try {
     const res = await fetch(url, {
       ...options,
       headers,
-      signal: controller.signal,
+      signal,
     });
 
     log.info(`${method} ${path} -> ${res.status}`, {
@@ -120,7 +128,7 @@ export async function apiFetch(
       ok: res.ok,
     });
 
-    clearTimeout(timeoutId);
+    if (timeoutId) clearTimeout(timeoutId);
 
     // On 401, try once with a refreshed token before giving up
     if (res.status === 401 && token) {
@@ -129,7 +137,7 @@ export async function apiFetch(
       if (freshToken && freshToken !== token) {
         log.info("Got fresh token - retrying request");
         const retryHeaders = { ...headers, Authorization: `Bearer ${freshToken}` };
-        const retryRes = await fetch(url, { ...options, headers: retryHeaders, signal: controller.signal });
+        const retryRes = await fetch(url, { ...options, headers: retryHeaders, signal });
         log.info(`${method} ${path} retry -> ${retryRes.status}`);
         return retryRes;
       }
@@ -138,7 +146,7 @@ export async function apiFetch(
 
     return res;
   } catch (error: any) {
-    clearTimeout(timeoutId);
+    if (timeoutId) clearTimeout(timeoutId);
     if (error.name === "AbortError") {
       log.error(`${method} ${path} TIMEOUT (${timeoutMs}ms)`);
       throw new Error("Request timed out — is the backend server running?");
