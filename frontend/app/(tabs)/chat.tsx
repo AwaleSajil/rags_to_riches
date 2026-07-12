@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useCallback } from "react";
 import { StyleSheet, View, FlatList, KeyboardAvoidingView, Platform, useWindowDimensions } from "react-native";
 import { Banner, Text } from "react-native-paper";
-import { useRouter } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
 import { ChatMessage } from "../../src/components/ChatMessage";
 import { ChatInput } from "../../src/components/ChatInput";
 import { SuggestedPrompts } from "../../src/components/SuggestedPrompts";
@@ -22,8 +22,16 @@ const MAX_CHAT_WIDTH = 720;
 export default function ChatScreen() {
   log.debug("ChatScreen rendered");
   const { messages, isStreaming, currentToolTraces, sendMessage } = useChat();
-  const { files } = useFiles();
+  const { files, loadFiles } = useFiles();
   const flatListRef = useRef<FlatList>(null);
+
+  // Files are loaded per-screen, so re-check whenever this tab regains focus —
+  // otherwise the "no data" banner stays stale after uploading on the Ingest tab.
+  useFocusEffect(
+    useCallback(() => {
+      loadFiles();
+    }, [loadFiles])
+  );
   const router = useRouter();
   const { width: screenWidth } = useWindowDimensions();
 

@@ -70,14 +70,19 @@ function PlotlyChartNative({ chartJson }: { chartJson: string }) {
 
   const isPie = chartMeta.type === "pie";
 
-  // Full-width chart with minimal padding for mobile
-  const bubbleContentWidth = Math.floor(screenWidth * 0.96) - 16;
-  const chartWidth = Math.max(bubbleContentWidth, 200);
-  // Shorter aspect ratio for mobile; pie charts are squarer, bar/line are wider
+  // Measure the ACTUAL available width (the chat bubble) via onLayout, so the
+  // chart fills its container instead of overflowing a screenWidth-based guess.
+  const [boxWidth, setBoxWidth] = React.useState(0);
+  const measured = boxWidth > 0;
+  // chartContainer has 4px padding each side
+  const chartWidth = measured
+    ? Math.max(Math.floor(boxWidth) - 8, 220)
+    : Math.floor(screenWidth * 0.9) - 8;
+  // Taller, more readable aspect ratios on mobile
   const chartHeight = isPie
-    ? Math.round(chartWidth * 0.75)
-    : Math.round(chartWidth * 0.65);
-  const fontSize = Math.max(9, Math.min(12, Math.round(chartWidth / 28)));
+    ? Math.round(chartWidth * 0.85)
+    : Math.round(chartWidth * 0.68);
+  const fontSize = Math.max(11, Math.min(15, Math.round(chartWidth / 24)));
 
   // Base64-encode the chart JSON so it survives template literal injection safely.
   const chartJsonB64 = React.useMemo(() => {
@@ -314,8 +319,15 @@ function PlotlyChartNative({ chartJson }: { chartJson: string }) {
   const displayHeight = isLoading ? chartHeight + 40 : webViewHeight;
 
   return (
-    <View style={[styles.chartContainer, { height: displayHeight + 16 }]}>
-      {isLoading && <ChartSkeleton width={chartWidth} height={chartHeight} />}
+    <View
+      style={[styles.chartContainer, { height: displayHeight + 16 }]}
+      onLayout={(e) => {
+        const w = e.nativeEvent.layout.width;
+        if (w > 0 && Math.abs(w - boxWidth) > 1) setBoxWidth(w);
+      }}
+    >
+      {(isLoading || !measured) && <ChartSkeleton width={chartWidth} height={chartHeight} />}
+      {measured && (
       <WebView
         originWhitelist={["*"]}
         source={{ html }}
@@ -350,6 +362,7 @@ function PlotlyChartNative({ chartJson }: { chartJson: string }) {
           setError("WebView failed to load");
         }}
       />
+      )}
       {error && (
         <Text style={{ color: colors.textTertiary, fontSize: 11, textAlign: "center", marginTop: 4 }}>
           {error}

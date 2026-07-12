@@ -6,7 +6,7 @@ import {
   TouchableOpacity,
   Platform,
 } from "react-native";
-import { Text, IconButton } from "react-native-paper";
+import { IconButton } from "react-native-paper";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { colors } from "../styles/theme";
 
@@ -94,14 +94,8 @@ export function CameraCapture({
             />
           </View>
 
-          {/* Guide overlay */}
-          <View style={styles.guideContainer}>
-            <View style={styles.guideBox}>
-              <Text style={styles.guideText}>
-                Position receipt within frame
-              </Text>
-            </View>
-          </View>
+          {/* Spacer between top and bottom controls */}
+          <View style={styles.spacer} />
 
           {/* Bottom controls */}
           <View style={styles.bottomBar}>
@@ -157,25 +151,8 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.4)",
     borderRadius: 20,
   },
-  guideContainer: {
+  spacer: {
     flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  guideBox: {
-    width: "85%",
-    aspectRatio: 1.5,
-    borderWidth: 2,
-    borderColor: "rgba(255,255,255,0.5)",
-    borderRadius: 12,
-    borderStyle: "dashed",
-    justifyContent: "flex-end",
-    alignItems: "center",
-    paddingBottom: 12,
-  },
-  guideText: {
-    color: "rgba(255,255,255,0.7)",
-    fontSize: 14,
   },
   bottomBar: {
     flexDirection: "row",
