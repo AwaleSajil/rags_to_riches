@@ -65,6 +65,7 @@ def get_schema_info() -> str:
       - amount (DECIMAL/DOUBLE)
       - category (VARCHAR/STRING)
       - merchant_name (TEXT)
+      - location (TEXT, nullable — store city/state/address when known)
 
     TABLE: {dtbl}
     Columns:
@@ -98,6 +99,7 @@ def query_database(query: str) -> str:
     - merchant_name (TEXT)
     - amount (NUMERIC/DOUBLE)
     - category (TEXT)
+    - location (TEXT, nullable)
 
     Table: TransactionDetail
     - id (UUID/STRING)

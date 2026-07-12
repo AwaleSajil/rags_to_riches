@@ -101,6 +101,7 @@ class VectorDBClient:
 
             meta_cols = ['id', 'amount', 'category', 'trans_date']
             if 'merchant_name' in row: meta_cols.append('merchant_name')
+            if 'location' in row: meta_cols.append('location')
             if 'source_csv_id' in row: meta_cols.append('source_csv_id')
 
             meta = {k: row[k] for k in meta_cols if k in row and pd.notna(row[k])}

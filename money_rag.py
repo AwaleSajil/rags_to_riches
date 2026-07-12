@@ -182,7 +182,8 @@ class MoneyRAG:
         Sample Data: {sample}
 
         TASK:
-        1. Map the CSV columns to standard fields: date, description, amount, and category.
+        1. Map the CSV columns to standard fields: date, description, amount, category, and location.
+           - 'location' is optional: map it only if a column clearly holds a place (city, state, or address). Otherwise return null.
         2. Determine the 'sign_convention' for spending.
 
         RULES:
@@ -200,6 +201,7 @@ class MoneyRAG:
         "desc_col": "column_name",
         "amount_col": "column_name",
         "category_col": "column_name or null",
+        "location_col": "column_name or null",
         "sign_convention": "spending_is_negative" | "spending_is_positive"
         }}
         """)
@@ -237,6 +239,9 @@ class MoneyRAG:
 
         cat_col = mapping.get('category_col')
         standard_df['category'] = df[cat_col] if cat_col and cat_col in df.columns else 'Uncategorized'
+
+        loc_col = mapping.get('location_col')
+        standard_df['location'] = df[loc_col] if loc_col and loc_col in df.columns else None
 
         # --- Async Enrichment Step (batched for speed) ---
         unique_descriptions = standard_df['description'].unique().tolist()
@@ -415,6 +420,7 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             "total_amount": 123.45,
             "merchant_name": "Merchant",
             "category": "Dining",
+            "location": "Store address or city/state if visible on the receipt, else null",
             "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "tax_amount": 0.0, "item_total_price": 10.0}]
         }
         
@@ -524,7 +530,8 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             "category": extracted.get('category', 'Uncategorized'),
             "content_hash": content_hash,
             "source": 'bill',
-            "enriched_info": enriched_info
+            "enriched_info": enriched_info,
+            "location": extracted.get('location') or None
         }
         if file_id:
             tx_record["source_bill_file_id"] = file_id

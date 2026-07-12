@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS public."Transaction" (
     amount               numeric,
     category             text DEFAULT 'Uncategorized',
     merchant_name        text,
+    location             text,          -- optional: store address/city (receipt) or CSV location col
     enriched_info        text,
     content_hash         text,
     source               text,               -- 'csv' | 'bill'
