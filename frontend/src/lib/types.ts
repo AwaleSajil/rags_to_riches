@@ -36,6 +36,7 @@ export interface ChatMessage {
   images?: string[];
   toolTraces?: ToolEvent[];
   pendingTransactions?: PendingTransaction[];
+  isError?: boolean;
 }
 
 export interface ToolEvent {

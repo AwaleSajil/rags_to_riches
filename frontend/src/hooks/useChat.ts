@@ -95,7 +95,8 @@ export function useChat() {
             log.error("Stream error (hook)", { error });
             const errorMsg: ChatMessage = {
               role: "assistant",
-              content: `Error: ${error}`,
+              content: error || "Something went wrong. Please try again.",
+              isError: true,
             };
             setMessages((prev) => [...prev, errorMsg]);
             setIsStreaming(false);
@@ -105,7 +106,8 @@ export function useChat() {
         log.error("sendMessage exception", e);
         const errorMsg: ChatMessage = {
           role: "assistant",
-          content: `Error: ${e.message}`,
+          content: e?.message || "Network error. Please try again.",
+          isError: true,
         };
         setMessages((prev) => [...prev, errorMsg]);
         setIsStreaming(false);

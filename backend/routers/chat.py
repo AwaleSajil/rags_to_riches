@@ -14,6 +14,27 @@ logger = logging.getLogger("moneyrag.routers.chat")
 router = APIRouter()
 
 
+def _friendly_error(exc: Exception) -> str:
+    """Turn a raw provider exception into a short, human message for the chat UI."""
+    low = str(exc).lower()
+    if any(k in low for k in ("resource_exhausted", "429", "quota", "too many requests", "rate limit")):
+        return (
+            "You've hit your AI provider's rate limit (the Gemini free tier allows "
+            "~20 requests/day). Please wait a moment and try again, or enable billing "
+            "on your Google Cloud project."
+        )
+    if "no longer available" in low or "not_found" in low or ("404" in low and "model" in low):
+        return (
+            "The selected AI model isn't available for your API key. Open Settings and "
+            "switch the model to “gemini-3-flash-preview”."
+        )
+    if any(k in low for k in ("api key not valid", "api_key_invalid", "permission_denied", "unauthenticated", "401", "403")):
+        return "Your AI provider API key looks invalid or unauthorized — please re-check it in Settings."
+    if any(k in low for k in ("deadline", "timeout", "timed out")):
+        return "The AI provider took too long to respond. Please try again."
+    return "Something went wrong while generating a response. Please try again in a moment."
+
+
 @router.post("")
 async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
     logger.debug("Chat request from user_id=%s | message=%s", user["id"], body.message[:100])
@@ -125,7 +146,7 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
             yield "event: done\ndata: {}\n\n"
         except Exception as e:
             logger.error("SSE stream error for user_id=%s: %s", user["id"], e, exc_info=True)
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': _friendly_error(e)})}\n\n"
 
     return StreamingResponse(
         event_generator(),

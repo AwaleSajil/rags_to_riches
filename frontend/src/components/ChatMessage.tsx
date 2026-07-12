@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Image, Modal, Platform, Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
 import { IconButton, Text } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import Markdown from "react-native-markdown-display";
 import { PlotlyChart } from "./PlotlyChart";
 import { TransactionConfirmCard } from "./TransactionConfirmCard";
@@ -31,8 +32,14 @@ export function ChatMessage({ message }: ChatMessageProps) {
         styles.bubble,
         isUser ? styles.userBubble : styles.assistantBubble,
         !isUser && hasCharts && styles.wideBubble,
+        message.isError && styles.errorBubble,
       ]}>
-        {message.content?.trim() ? (
+        {message.isError ? (
+          <View style={styles.errorRow}>
+            <MaterialCommunityIcons name="alert-circle-outline" size={18} color="#b45309" />
+            <Text style={styles.errorText}>{message.content}</Text>
+          </View>
+        ) : message.content?.trim() ? (
           <Markdown
             style={isUser ? markdownStylesUser : markdownStylesAssistant}
           >
@@ -135,6 +142,22 @@ const styles = StyleSheet.create({
   wideBubble: {
     maxWidth: "98%",
     paddingHorizontal: 8,
+  },
+  errorBubble: {
+    backgroundColor: "#FEF3C7",
+    borderColor: "#FCD34D",
+    borderWidth: 1,
+  },
+  errorRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+  },
+  errorText: {
+    flex: 1,
+    color: "#92400e",
+    fontSize: 14,
+    lineHeight: 20,
   },
   imageRow: {
     marginTop: spacing.sm,
