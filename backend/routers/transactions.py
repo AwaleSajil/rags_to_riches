@@ -1,13 +1,62 @@
 import hashlib
 import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from backend.dependencies import get_current_user, get_supabase
-from backend.schemas.transactions import TransactionCreate, TransactionResponse
+from backend.schemas.transactions import (
+    TransactionCreate,
+    TransactionListItem,
+    TransactionResponse,
+    TransactionWithDetails,
+)
+from backend.services import transaction_service
 
 logger = logging.getLogger("moneyrag.routers.transactions")
 
 router = APIRouter()
+
+
+def _require_user(user: dict | None) -> dict:
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+@router.get("", response_model=List[TransactionListItem])
+async def list_transactions(
+    category: Optional[str] = Query(None, description="Exact category match"),
+    start_date: Optional[str] = Query(None, description="Inclusive lower bound (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Inclusive upper bound (YYYY-MM-DD)"),
+    q: Optional[str] = Query(None, description="Text search on merchant/description"),
+    user: dict = Depends(get_current_user),
+):
+    """List the current user's transactions, newest first, with optional filters."""
+    user = _require_user(user)
+    try:
+        return await transaction_service.list_transactions(
+            user, category=category, start_date=start_date, end_date=end_date, q=q
+        )
+    except Exception as e:
+        logger.error("Failed to list transactions: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list transactions: {e}")
+
+
+@router.get("/{transaction_id}", response_model=TransactionWithDetails)
+async def get_transaction(
+    transaction_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Fetch one transaction plus its line items (ordered), including tax breakdown."""
+    user = _require_user(user)
+    try:
+        tx = await transaction_service.get_transaction(user, transaction_id)
+    except Exception as e:
+        logger.error("Failed to get transaction %s: %s", transaction_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get transaction: {e}")
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
 
 
 @router.post("", response_model=TransactionResponse)
