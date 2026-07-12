@@ -70,12 +70,11 @@ CREATE TABLE IF NOT EXISTS public."Transaction" (
     source_csv_id        uuid REFERENCES public."CSVFile"(id) ON DELETE CASCADE,
     source_bill_file_id  uuid REFERENCES public."BillFile"(id) ON DELETE CASCADE,
     created_at           timestamptz NOT NULL DEFAULT now(),
-    -- Required for the code's upsert(on_conflict="content_hash").
-    -- NOTE: hash = date+amount+first-merchant-word (NOT user-scoped), so this
-    -- unique constraint is global. If you want two users to be able to hold the
-    -- same transaction, change to UNIQUE (user_id, content_hash) AND update the
-    -- on_conflict key in money_rag.py accordingly.
-    UNIQUE (content_hash)
+    -- Per-user de-duplication: hash = date+amount+first-merchant-word.
+    -- Scoped to user_id so two users can hold the same transaction and
+    -- cross-user upserts don't collide. Paired with money_rag.py's
+    -- on_conflict="user_id,content_hash".
+    UNIQUE (user_id, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_transaction_user      ON public."Transaction"(user_id);
 CREATE INDEX IF NOT EXISTS idx_transaction_csv       ON public."Transaction"(source_csv_id);

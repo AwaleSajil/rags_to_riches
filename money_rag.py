@@ -379,7 +379,7 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
             try:
-                self._db_upsert("Transaction", batch, conflict_key="content_hash")
+                self._db_upsert("Transaction", batch, conflict_key="user_id,content_hash")
             except Exception as e:
                 # Fallback if DB migration hasn't been run yet (no content_hash / merchant_name)
                 for r in batch:
@@ -537,7 +537,7 @@ Return ONLY a valid JSON array with one object per item, in the same order:
         # Save transaction
         self._emit_progress("saving", 1, 0, "Saving transaction...")
         try:
-            self._db_upsert("Transaction", [tx_record], conflict_key="content_hash")
+            self._db_upsert("Transaction", [tx_record], conflict_key="user_id,content_hash")
         except Exception as e:
             tx_record.pop('merchant_name', None)
             tx_record.pop('content_hash', None)
