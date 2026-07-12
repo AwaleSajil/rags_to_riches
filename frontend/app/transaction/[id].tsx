@@ -233,6 +233,9 @@ export default function TransactionDetailScreen() {
     if (!transaction || !form || !id) return;
     const orig = toForm(transaction);
     const changes: TransactionUpdatePayload = {};
+    // When line items exist, the header subtotal/tax/amount are derived from
+    // them on the server, so we don't edit those fields directly here.
+    const hasLineItems = detailForms.length > 0;
 
     // Text fields
     if (form.merchant_name !== orig.merchant_name) changes.merchant_name = form.merchant_name.trim();
@@ -250,25 +253,27 @@ export default function TransactionDetailScreen() {
       changes.trans_date = dt;
     }
 
-    // Amount (required, > 0)
-    if (form.amount !== orig.amount) {
-      const n = parseFloat(form.amount);
-      if (isNaN(n) || n <= 0) {
-        setSnackbar({ visible: true, message: "Amount must be a positive number", error: true });
-        return;
-      }
-      changes.amount = n;
-    }
-
-    // Optional numerics — only send when non-empty
-    for (const key of ["subtotal", "tax_total"] as const) {
-      if (form[key] !== orig[key] && form[key].trim() !== "") {
-        const n = parseFloat(form[key]);
-        if (isNaN(n) || n < 0) {
-          setSnackbar({ visible: true, message: `${key} must be a number`, error: true });
+    if (!hasLineItems) {
+      // Amount (required, > 0)
+      if (form.amount !== orig.amount) {
+        const n = parseFloat(form.amount);
+        if (isNaN(n) || n <= 0) {
+          setSnackbar({ visible: true, message: "Amount must be a positive number", error: true });
           return;
         }
-        changes[key] = n;
+        changes.amount = n;
+      }
+
+      // Optional numerics — only send when non-empty
+      for (const key of ["subtotal", "tax_total"] as const) {
+        if (form[key] !== orig[key] && form[key].trim() !== "") {
+          const n = parseFloat(form[key]);
+          if (isNaN(n) || n < 0) {
+            setSnackbar({ visible: true, message: `${key} must be a number`, error: true });
+            return;
+          }
+          changes[key] = n;
+        }
       }
     }
 
@@ -375,6 +380,18 @@ export default function TransactionDetailScreen() {
 
   // -------- Edit mode --------
   if (isEditing && form) {
+    const hasLineItems = detailForms.length > 0;
+    // Header totals are derived from the line items when they exist.
+    const liveTotals = detailForms.reduce(
+      (acc, r) => {
+        const t = computeRowTotals(r);
+        acc.subtotal += t.subtotal;
+        acc.tax += t.tax;
+        acc.total += t.total;
+        return acc;
+      },
+      { subtotal: 0, tax: 0, total: 0 }
+    );
     return (
       <KeyboardAvoidingView
         style={styles.container}
@@ -405,15 +422,17 @@ export default function TransactionDetailScreen() {
               autoCapitalize="none"
               style={styles.input}
             />
-            <TextInput
-              mode="outlined"
-              label="Amount"
-              value={form.amount}
-              onChangeText={(v) => setField("amount", v)}
-              keyboardType="decimal-pad"
-              left={<TextInput.Affix text="$" />}
-              style={styles.input}
-            />
+            {!hasLineItems && (
+              <TextInput
+                mode="outlined"
+                label="Amount"
+                value={form.amount}
+                onChangeText={(v) => setField("amount", v)}
+                keyboardType="decimal-pad"
+                left={<TextInput.Affix text="$" />}
+                style={styles.input}
+              />
+            )}
             <TextInput
               mode="outlined"
               label="Category"
@@ -428,24 +447,26 @@ export default function TransactionDetailScreen() {
               onChangeText={(v) => setField("location", v)}
               style={styles.input}
             />
-            <View style={styles.inputRow}>
-              <TextInput
-                mode="outlined"
-                label="Subtotal"
-                value={form.subtotal}
-                onChangeText={(v) => setField("subtotal", v)}
-                keyboardType="decimal-pad"
-                style={[styles.input, styles.inputHalf]}
-              />
-              <TextInput
-                mode="outlined"
-                label="Tax total"
-                value={form.tax_total}
-                onChangeText={(v) => setField("tax_total", v)}
-                keyboardType="decimal-pad"
-                style={[styles.input, styles.inputHalf]}
-              />
-            </View>
+            {!hasLineItems && (
+              <View style={styles.inputRow}>
+                <TextInput
+                  mode="outlined"
+                  label="Subtotal"
+                  value={form.subtotal}
+                  onChangeText={(v) => setField("subtotal", v)}
+                  keyboardType="decimal-pad"
+                  style={[styles.input, styles.inputHalf]}
+                />
+                <TextInput
+                  mode="outlined"
+                  label="Tax total"
+                  value={form.tax_total}
+                  onChangeText={(v) => setField("tax_total", v)}
+                  keyboardType="decimal-pad"
+                  style={[styles.input, styles.inputHalf]}
+                />
+              </View>
+            )}
           </GlassCard>
 
           {/* Line-item editor */}
@@ -530,6 +551,27 @@ export default function TransactionDetailScreen() {
                   </View>
                 );
               })
+            )}
+
+            {hasLineItems && (
+              <>
+                <Divider style={styles.divider} />
+                <View style={styles.totalsRow}>
+                  <Text style={styles.totalsLabel}>Subtotal</Text>
+                  <Text style={styles.totalsValue}>{money(liveTotals.subtotal)}</Text>
+                </View>
+                <View style={styles.totalsRow}>
+                  <Text style={styles.totalsLabel}>Tax</Text>
+                  <Text style={styles.totalsValue}>{money(liveTotals.tax)}</Text>
+                </View>
+                <View style={styles.totalsRow}>
+                  <Text style={styles.totalsLabelBold}>Total</Text>
+                  <Text style={styles.totalsValueBold}>{money(liveTotals.total)}</Text>
+                </View>
+                <Text style={styles.derivedNote}>
+                  Header subtotal, tax, and total are computed from these line items.
+                </Text>
+              </>
             )}
           </GlassCard>
 
@@ -955,5 +997,11 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     marginTop: spacing.xs,
     textAlign: "right",
+  },
+  derivedNote: {
+    ...typography.caption,
+    color: colors.textTertiary,
+    marginTop: spacing.sm,
+    fontStyle: "italic",
   },
 });

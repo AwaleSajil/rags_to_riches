@@ -304,11 +304,48 @@ def _prepare_detail_rows(
     return rows
 
 
+def _header_totals_from_details(
+    details: List[Dict[str, Any]], existing_breakdown
+):
+    """Roll line items up into header subtotal / tax_total / amount / breakdown,
+    so the transaction stays consistent with its items."""
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    subtotal = round(sum(_f(d.get("item_subtotal_price")) for d in details), 2)
+    tax_total = round(sum(_f(d.get("tax_amount")) for d in details), 2)
+    amount = round(sum(_f(d.get("item_total_price")) for d in details), 2)
+
+    # Group tax by rate; preserve the receipt's rate labels where we can.
+    label_by_rate: Dict[float, Any] = {}
+    for e in (existing_breakdown or []):
+        try:
+            label_by_rate[float(e.get("rate"))] = e.get("label")
+        except (TypeError, ValueError):
+            pass
+    by_rate: Dict[float, float] = {}
+    for d in details:
+        rate = d.get("tax_rate")
+        tax = _f(d.get("tax_amount"))
+        if rate and float(rate) > 0 and tax:
+            r = float(rate)
+            by_rate[r] = round(by_rate.get(r, 0.0) + tax, 2)
+    breakdown = [
+        {"label": label_by_rate.get(r, f"{r}% tax"), "rate": r, "amount": amt}
+        for r, amt in sorted(by_rate.items())
+    ] or None
+
+    return subtotal, tax_total, amount, breakdown
+
+
 def _replace_details_rows(
     user: dict, transaction_id: str, details_input: List[Dict[str, Any]]
 ):
-    """Blocking: verify ownership, swap line items, return (tx_row, new_details)
-    or None if the transaction is not found / not the user's."""
+    """Blocking: verify ownership, swap line items, keep the header totals in
+    sync, return (tx_row, new_details) or None if not found / not the user's."""
     client = _client(user)
     tx_res = (
         client.table("Transaction")
@@ -335,6 +372,26 @@ def _replace_details_rows(
     if new_rows:
         # insert() returns rows in insert order, preserving the user's ordering.
         details = client.table("TransactionDetail").insert(new_rows).execute().data or []
+
+    # Keep header subtotal / tax_total / amount solid with the line items.
+    if details:
+        subtotal, tax_total, amount, breakdown = _header_totals_from_details(
+            details, tx_row.get("tax_breakdown")
+        )
+        header_update = {
+            "subtotal": subtotal,
+            "tax_total": tax_total,
+            "amount": amount,
+            "tax_breakdown": breakdown,
+        }
+        upd = (
+            client.table("Transaction")
+            .update(header_update)
+            .eq("id", transaction_id)
+            .eq("user_id", user["id"])
+            .execute()
+        )
+        tx_row = upd.data[0] if upd.data else {**tx_row, **header_update}
 
     return tx_row, details
 
