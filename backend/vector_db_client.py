@@ -206,6 +206,55 @@ class VectorDBClient:
                 {"cname": self.collection_name, "meta_key": meta_key, "file_id": str(file_id)},
             )
 
+    def delete_transaction_vectors(
+        self, transaction_id: str, detail_ids: Optional[List[str]] = None
+    ) -> None:
+        """Delete a single transaction's vectors (parent + its line items).
+
+        Both the parent vector and every line-item vector carry
+        cmetadata->>'id' = <transaction_id>, so that filter alone removes the
+        whole family. We also match line-item vectors by cmetadata->>'detail_id'
+        as a belt-and-suspenders guard when detail ids are known.
+        """
+        txid = str(transaction_id)
+        detail_ids = [str(d) for d in (detail_ids or [])]
+        # Only add the detail_id branch when we have ids — an empty array would
+        # otherwise trip Postgres type inference on `= ANY(:detail_ids)`.
+        detail_clause = (
+            " OR e.cmetadata ->> 'detail_id' = ANY(:detail_ids)" if detail_ids else ""
+        )
+        params: Dict[str, Any] = {"cname": self.collection_name, "txid": txid}
+        if detail_ids:
+            params["detail_ids"] = detail_ids
+        engine = _get_engine()
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    DELETE FROM {_EMBEDDING_TABLE} e
+                    USING {_COLLECTION_TABLE} c
+                    WHERE e.collection_id = c.uuid
+                      AND c.name = :cname
+                      AND ( e.cmetadata ->> 'id' = :txid{detail_clause} )
+                """),
+                params,
+            )
+
+    def sync_single_transaction(
+        self,
+        transaction: Dict[str, Any],
+        details: List[Dict[str, Any]],
+        user_id: str,
+        embeddings_model: Embeddings,
+    ) -> Optional[PGVector]:
+        """Re-embed one transaction (and its line items), upserting by id.
+
+        Reuses sync_transactions so the document text / metadata stay identical
+        to the bulk ingestion path. Passing the same ids upserts in place.
+        """
+        df = pd.DataFrame([transaction])
+        details_df = pd.DataFrame(details) if details else pd.DataFrame()
+        return self.sync_transactions(df, details_df, user_id, embeddings_model)
+
 
 def get_vector_client() -> VectorDBClient:
     return VectorDBClient()

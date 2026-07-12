@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -10,6 +10,20 @@ class TransactionCreate(BaseModel):
     trans_date: date
     category: str = "Uncategorized"
     merchant_name: Optional[str] = None
+
+
+class TransactionUpdate(BaseModel):
+    """Editable fields for a transaction. Only supplied fields are updated."""
+
+    trans_date: Optional[date] = None
+    description: Optional[str] = None
+    merchant_name: Optional[str] = None
+    amount: Optional[float] = Field(default=None, gt=0)
+    category: Optional[str] = None
+    location: Optional[str] = None
+    subtotal: Optional[float] = Field(default=None, ge=0)
+    tax_total: Optional[float] = Field(default=None, ge=0)
+    tax_breakdown: Optional[List[Dict[str, Any]]] = None
 
 
 class TransactionResponse(BaseModel):

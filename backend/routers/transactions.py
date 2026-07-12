@@ -8,6 +8,7 @@ from backend.schemas.transactions import (
     TransactionCreate,
     TransactionListItem,
     TransactionResponse,
+    TransactionUpdate,
     TransactionWithDetails,
 )
 from backend.services import transaction_service
@@ -57,6 +58,46 @@ async def get_transaction(
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return tx
+
+
+@router.patch("/{transaction_id}", response_model=TransactionWithDetails)
+async def update_transaction(
+    transaction_id: str,
+    body: TransactionUpdate,
+    user: dict = Depends(get_current_user),
+):
+    """Update editable fields. Re-embeds the vector if merchant/category changed."""
+    user = _require_user(user)
+    changes = body.model_dump(exclude_unset=True)
+    if "trans_date" in changes and changes["trans_date"] is not None:
+        changes["trans_date"] = changes["trans_date"].isoformat()
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    try:
+        tx = await transaction_service.update_transaction(user, transaction_id, changes)
+    except Exception as e:
+        logger.error("Failed to update transaction %s: %s", transaction_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update transaction: {e}")
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
+
+
+@router.delete("/{transaction_id}")
+async def delete_transaction(
+    transaction_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Delete a transaction (line items cascade) and remove its vector(s)."""
+    user = _require_user(user)
+    try:
+        deleted = await transaction_service.delete_transaction(user, transaction_id)
+    except Exception as e:
+        logger.error("Failed to delete transaction %s: %s", transaction_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to delete transaction: {e}")
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return {"message": "Transaction deleted"}
 
 
 @router.post("", response_model=TransactionResponse)

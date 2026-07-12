@@ -1,10 +1,16 @@
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from backend.dependencies import get_supabase
+from backend.services import config_service
 
 logger = logging.getLogger("moneyrag.services.transaction")
+
+# Fields whose value feeds the pgvector document text (merchant + category) —
+# a change to any of them requires re-embedding the transaction's vector.
+_VECTOR_TEXT_FIELDS = ("merchant_name", "category")
 
 # Columns returned for the browser list (kept lean — no enriched_info blob).
 _LIST_COLUMNS = (
@@ -93,3 +99,160 @@ async def get_transaction(user: dict, transaction_id: str) -> Optional[Dict[str,
         return tx
 
     return await asyncio.to_thread(_run)
+
+
+def _build_embeddings(config: dict):
+    """Construct the user's embedding model from their AccountConfig."""
+    provider = (config.get("llm_provider") or "").lower()
+    api_key = config.get("api_key")
+    model = config.get("embedding_model")
+    if provider == "google":
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        os.environ["GOOGLE_API_KEY"] = api_key
+        return GoogleGenerativeAIEmbeddings(model=model or "gemini-embedding-001")
+    from langchain_openai import OpenAIEmbeddings
+
+    os.environ["OPENAI_API_KEY"] = api_key
+    return OpenAIEmbeddings(model=model or "text-embedding-3-small")
+
+
+def _reembed_transaction(tx: Dict[str, Any], details: List[Dict[str, Any]], user_id: str, config: dict) -> None:
+    """Re-embed one transaction's vector(s) so semantic search reflects the edit."""
+    from backend.vector_db_client import get_vector_client
+
+    embeddings = _build_embeddings(config)
+    get_vector_client().sync_single_transaction(tx, details, user_id, embeddings)
+
+
+def _apply_update(user: dict, transaction_id: str, changes: Dict[str, Any]):
+    """Blocking: verify ownership, update, and re-read row + details.
+
+    Returns (updated_tx, details, needs_reembed) or None if the row does not
+    exist / is not the user's.
+    """
+    client = _client(user)
+    existing = (
+        client.table("Transaction")
+        .select("*")
+        .eq("id", transaction_id)
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        return None
+    old = existing.data[0]
+
+    if changes:
+        upd = (
+            client.table("Transaction")
+            .update(changes)
+            .eq("id", transaction_id)
+            .eq("user_id", user["id"])
+            .execute()
+        )
+        updated = upd.data[0] if upd.data else {**old, **changes}
+    else:
+        updated = old
+
+    details = (
+        client.table("TransactionDetail")
+        .select("*")
+        .eq("transaction_id", transaction_id)
+        .eq("user_id", user["id"])
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+    needs_reembed = any(
+        f in changes and changes[f] != old.get(f) for f in _VECTOR_TEXT_FIELDS
+    )
+    return updated, details, needs_reembed
+
+
+async def update_transaction(
+    user: dict, transaction_id: str, changes: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Update editable fields; re-embed the vector if merchant/category changed.
+
+    A re-embed failure (e.g. LLM quota) is logged but does not fail the edit —
+    the DB is the source of truth and a later full sync repairs the vector.
+    """
+    result = await asyncio.to_thread(_apply_update, user, transaction_id, changes)
+    if result is None:
+        return None
+    updated, details, needs_reembed = result
+
+    if needs_reembed:
+        config = await config_service.get_config(user)
+        if config:
+            try:
+                await asyncio.to_thread(
+                    _reembed_transaction, updated, details, user["id"], config
+                )
+                logger.info("Re-embedded vector for transaction %s", transaction_id)
+            except Exception as e:
+                logger.warning(
+                    "Vector re-embed failed for transaction %s (edit still saved): %s",
+                    transaction_id,
+                    e,
+                )
+        else:
+            logger.warning(
+                "No AccountConfig for user %s — skipping re-embed of %s",
+                user["id"],
+                transaction_id,
+            )
+
+    updated["details"] = details
+    return updated
+
+
+def _delete_row(user: dict, transaction_id: str) -> Optional[List[str]]:
+    """Blocking: delete the transaction (details cascade). Returns the deleted
+    line-item ids for vector cleanup, or None if nothing was deleted (404)."""
+    client = _client(user)
+    detail_ids = [
+        d["id"]
+        for d in (
+            client.table("TransactionDetail")
+            .select("id")
+            .eq("transaction_id", transaction_id)
+            .eq("user_id", user["id"])
+            .execute()
+            .data
+            or []
+        )
+    ]
+    deleted = (
+        client.table("Transaction")
+        .delete()
+        .eq("id", transaction_id)
+        .eq("user_id", user["id"])
+        .execute()
+    )
+    if not deleted.data:
+        return None
+    return detail_ids
+
+
+async def delete_transaction(user: dict, transaction_id: str) -> bool:
+    """Delete a transaction and remove its vector(s). Returns False if not found."""
+    detail_ids = await asyncio.to_thread(_delete_row, user, transaction_id)
+    if detail_ids is None:
+        return False
+
+    # Vector cleanup is pure SQL (no LLM). Log but don't fail if it errors —
+    # the row is already gone; an orphaned vector is filtered by the deleted id.
+    try:
+        from backend.vector_db_client import get_vector_client
+
+        await asyncio.to_thread(
+            get_vector_client().delete_transaction_vectors, transaction_id, detail_ids
+        )
+        logger.info("Deleted vectors for transaction %s", transaction_id)
+    except Exception as e:
+        logger.warning("Vector delete failed for transaction %s: %s", transaction_id, e)
+    return True
