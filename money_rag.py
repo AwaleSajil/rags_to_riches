@@ -353,17 +353,23 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         self._emit_progress("saving", total_rows, 0, "Saving transactions to database")
         records = json.loads(standard_df.to_json(orient='records'))
 
-        # Calculate content_hash and source for deduplication
-        def generate_hash(row):
+        # Calculate content_hash and source for deduplication.
+        def base_sig(row):
             date_str = str(row['trans_date']).strip()
             amount_str = str(round(float(row['amount']), 2))
-            merch = str(row.get('merchant_name', row['description'])).lower().strip().split()[0]
-            merch = ''.join(c for c in merch if c.isalnum())
-            hash_input = f"{date_str}{amount_str}{merch}"
-            return hashlib.sha256(hash_input.encode()).hexdigest()
+            words = str(row.get('merchant_name', row['description'])).lower().strip().split()
+            merch = ''.join(c for c in (words[0] if words else "") if c.isalnum())
+            return f"{date_str}{amount_str}{merch}"
 
+        # An occurrence counter (in file order) distinguishes genuinely-distinct rows
+        # that share date+amount+merchant (e.g. two $5 coffees the same day), while
+        # staying stable when the SAME file is re-uploaded so real re-uploads still dedup.
+        occ = {}
         for r in records:
-            r['content_hash'] = generate_hash(r)
+            sig = base_sig(r)
+            n = occ.get(sig, 0)
+            occ[sig] = n + 1
+            r['content_hash'] = hashlib.sha256(f"{sig}#{n}".encode()).hexdigest()
             r['source'] = 'csv'
 
         # Detect duplicates before upserting
@@ -517,7 +523,13 @@ Return ONLY a valid JSON array with one object per item, in the same order:
         amount_str = str(round(float(extracted.get('total_amount', 0)), 2))
         merch_hash = str(clean_merchant).lower().strip().split()[0] if clean_merchant else ""
         merch_hash = ''.join(c for c in merch_hash if c.isalnum())
-        hash_input = f"{date_str}{amount_str}{merch_hash}"
+        # Fold in a signature of the line items so two DIFFERENT receipts that happen
+        # to share date+amount+merchant don't collide; re-uploading the same photo
+        # yields the same items, so it still dedups correctly.
+        items_sig = "|".join(sorted(
+            str(it.get('item_description', '')).strip().lower() for it in line_items
+        ))
+        hash_input = f"{date_str}{amount_str}{merch_hash}{items_sig}"
         content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
         
         # Rename the stored bill to a friendly {merchant}_{yyyymmdd} display label.
