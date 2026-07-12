@@ -44,3 +44,21 @@ export interface ToolEvent {
   input?: string;
   snippet?: string;
 }
+
+export interface Conversation {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredMessage {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant";
+  content: string;
+  charts?: string[] | null;
+  images?: string[] | null;
+  pending_transactions?: PendingTransaction[] | null;
+  created_at: string;
+}

@@ -1,14 +1,26 @@
 import { useState, useCallback } from "react";
 import { streamChat } from "../services/chatService";
+import * as conversationService from "../services/conversationService";
 import { createLogger } from "../lib/logger";
-import type { ChatMessage, ToolEvent } from "../lib/types";
+import type { ChatMessage, StoredMessage, ToolEvent } from "../lib/types";
 
 const log = createLogger("useChat");
+
+function toChatMessage(m: StoredMessage): ChatMessage {
+  return {
+    role: m.role,
+    content: m.content,
+    charts: m.charts ?? undefined,
+    images: m.images ?? undefined,
+    pendingTransactions: m.pending_transactions ?? undefined,
+  };
+}
 
 export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [currentToolTraces, setCurrentToolTraces] = useState<ToolEvent[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(null);
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -33,6 +45,10 @@ export function useChat() {
 
       try {
         await streamChat(text, {
+          onConversation: (id) => {
+            log.info("Conversation id (hook)", { id });
+            setConversationId(id);
+          },
           onToolStart: (data) => {
             log.info("Tool started (hook)", { name: data.name });
             const event: ToolEvent = {
@@ -84,7 +100,7 @@ export function useChat() {
             setMessages((prev) => [...prev, errorMsg]);
             setIsStreaming(false);
           },
-        });
+        }, conversationId);
       } catch (e: any) {
         log.error("sendMessage exception", e);
         const errorMsg: ChatMessage = {
@@ -95,8 +111,28 @@ export function useChat() {
         setIsStreaming(false);
       }
     },
-    [isStreaming]
+    [isStreaming, conversationId]
   );
+
+  const loadConversation = useCallback(async (id: string) => {
+    log.info("Loading conversation", { id });
+    setConversationId(id);
+    setCurrentToolTraces([]);
+    try {
+      const stored = await conversationService.getConversationMessages(id);
+      setMessages(stored.map(toChatMessage));
+    } catch (e) {
+      log.error("Failed to load conversation", e);
+      setMessages([]);
+    }
+  }, []);
+
+  const newConversation = useCallback(() => {
+    log.info("Starting new conversation");
+    setConversationId(null);
+    setMessages([]);
+    setCurrentToolTraces([]);
+  }, []);
 
   const clearMessages = useCallback(() => {
     log.info("Clearing all messages");
@@ -104,5 +140,14 @@ export function useChat() {
     setCurrentToolTraces([]);
   }, []);
 
-  return { messages, isStreaming, currentToolTraces, sendMessage, clearMessages };
+  return {
+    messages,
+    isStreaming,
+    currentToolTraces,
+    conversationId,
+    sendMessage,
+    loadConversation,
+    newConversation,
+    clearMessages,
+  };
 }
