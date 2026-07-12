@@ -423,16 +423,27 @@ Return ONLY a valid JSON array with one object per description, in the same orde
 
         schema = {
             "date": "YYYY-MM-DD",
-            "total_amount": 123.45,
             "merchant_name": "Merchant",
             "category": "Dining",
             "location": "Store address or city/state if visible on the receipt, else null",
-            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "tax_amount": 0.0, "item_total_price": 10.0}]
+            "subtotal": 100.00,
+            "tax_lines": [{"label": "Sales Tax", "rate": 8.25, "amount": 8.25}],
+            "total_amount": 108.25,
+            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "item_total_price": 10.0, "tax_rate": 8.25}]
         }
-        
+
         # Vision extraction — single LLM call to extract all structured data
         self._emit_progress("parsing", 1, 0, "Extracting data from receipt...")
-        prompt = f"Extract structured data from this receipt/bill. Return strictly valid JSON exactly matching this schema: {json.dumps(schema)}"
+        prompt = (
+            "Extract structured data from this receipt/bill. Return strictly valid JSON matching this schema: "
+            f"{json.dumps(schema)}.\n"
+            "- 'subtotal' is the pre-tax sum; 'total_amount' is the final amount charged.\n"
+            "- 'tax_lines': one entry per DISTINCT tax rate shown. Receipts may have several "
+            "(e.g. 0% for groceries and 8.25% for general goods). Use [] if no tax is shown.\n"
+            "- Different item TYPES can carry different tax rates (e.g. groceries are often "
+            "exempt at 0% while general goods are taxed, and this varies by locale). Set each "
+            "line item's 'tax_rate' to the percentage applied to THAT item (0 if not taxed)."
+        )
         message = HumanMessage(
             content=[
                  {"type": "text", "text": prompt},
@@ -544,18 +555,49 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             except Exception as e:
                 print(f"   ⚠️ Failed to rename BillFile: {e}")
 
+        # --- Tax (bill-level, supports multiple rates) ---
+        total = abs(float(extracted.get('total_amount', 0) or 0))
+        try:
+            subtotal = float(extracted['subtotal']) if extracted.get('subtotal') is not None else None
+        except (TypeError, ValueError):
+            subtotal = None
+
+        tax_breakdown = []
+        for t in (extracted.get('tax_lines') or []):
+            try:
+                tax_breakdown.append({
+                    "label": str(t.get('label', 'Tax')),
+                    "rate": float(t['rate']) if t.get('rate') is not None else None,
+                    "amount": round(float(t.get('amount', 0) or 0), 2),
+                })
+            except (TypeError, ValueError):
+                continue
+        tax_total = round(sum(t['amount'] for t in tax_breakdown), 2) if tax_breakdown else None
+        # If no explicit tax lines but we have a subtotal, derive tax from the gap.
+        if tax_total is None and subtotal is not None:
+            derived = round(total - subtotal, 2)
+            tax_total = derived if derived > 0.001 else None
+
+        # Reconcile subtotal + tax against the total; log (don't fail) on mismatch.
+        if subtotal is not None and tax_total is not None:
+            if abs(round(subtotal + tax_total, 2) - total) > 0.02:
+                print(f"   ⚠️ Tax mismatch: subtotal {subtotal} + tax {tax_total} != total {total}")
+
         # Build transaction record
         tx_record = {
             "user_id": self.user_id,
             "trans_date": date_str,
-            "amount": abs(float(extracted.get('total_amount', 0))), 
+            "amount": total,
             "description": raw_merchant,
             "merchant_name": clean_merchant,
             "category": extracted.get('category', 'Uncategorized'),
             "content_hash": content_hash,
             "source": 'bill',
             "enriched_info": enriched_info,
-            "location": extracted.get('location') or None
+            "location": extracted.get('location') or None,
+            "subtotal": subtotal,
+            "tax_total": tax_total,
+            "tax_breakdown": tax_breakdown or None
         }
         if file_id:
             tx_record["source_bill_file_id"] = file_id
@@ -588,6 +630,10 @@ Return ONLY a valid JSON array with one object per item, in the same order:
         if tx_id and line_items:
             details = []
             for item in line_items:
+                try:
+                    item_rate = float(item['tax_rate']) if item.get('tax_rate') is not None else None
+                except (TypeError, ValueError):
+                    item_rate = None
                 details.append({
                     "transaction_id": tx_id,
                     "user_id": self.user_id,
@@ -596,6 +642,8 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                     "item_quantity": item.get('item_quantity', 1),
                     "item_unit_price": item.get('item_unit_price', item.get('item_total_price', 0)),
                     "tax_amount": item.get('tax_amount', 0),
+                    "tax_rate": item_rate,
+                    "taxable": (item_rate is not None and item_rate > 0),
                     "item_total_price": item.get('item_total_price', 0),
                     "enriched_info": item.get('enriched_info', '')
                 })

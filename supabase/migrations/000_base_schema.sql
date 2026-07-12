@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS public."Transaction" (
     category             text DEFAULT 'Uncategorized',
     merchant_name        text,
     location             text,          -- optional: store address/city (receipt) or CSV location col
+    subtotal             numeric,       -- receipt pre-tax subtotal (bills)
+    tax_total            numeric,       -- total tax across all rates
+    tax_breakdown        jsonb,         -- [{label, rate, amount}] — supports multiple rates
     enriched_info        text,
     content_hash         text,
     source               text,               -- 'csv' | 'bill'
@@ -91,6 +94,8 @@ CREATE TABLE IF NOT EXISTS public."TransactionDetail" (
     item_quantity    numeric,
     item_unit_price  numeric,
     tax_amount       numeric,
+    taxable          boolean,
+    tax_rate         numeric,        -- tax rate applied to this item (0 = exempt)
     item_total_price numeric,
     enriched_info    text,
     created_at       timestamptz NOT NULL DEFAULT now()

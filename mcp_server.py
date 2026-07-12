@@ -66,6 +66,9 @@ def get_schema_info() -> str:
       - category (VARCHAR/STRING)
       - merchant_name (TEXT)
       - location (TEXT, nullable — store city/state/address when known)
+      - subtotal (DECIMAL, nullable — pre-tax total, receipts)
+      - tax_total (DECIMAL, nullable — total tax)
+      - tax_breakdown (JSONB, nullable — [{{label, rate, amount}}] per tax rate)
 
     TABLE: {dtbl}
     Columns:
@@ -77,6 +80,8 @@ def get_schema_info() -> str:
       - item_unit_price (DECIMAL/DOUBLE)
       - item_total_price (DECIMAL/DOUBLE)
       - tax_amount (DECIMAL/DOUBLE)
+      - taxable (BOOLEAN, nullable — was this item taxed)
+      - tax_rate (DECIMAL, nullable — % rate applied to this item, 0 = exempt)
       - enriched_info (TEXT)
     """)
 
@@ -100,6 +105,9 @@ def query_database(query: str) -> str:
     - amount (NUMERIC/DOUBLE)
     - category (TEXT)
     - location (TEXT, nullable)
+    - subtotal (NUMERIC, nullable — pre-tax)
+    - tax_total (NUMERIC, nullable)
+    - tax_breakdown (JSONB, nullable — [{label, rate, amount}])
 
     Table: TransactionDetail
     - id (UUID/STRING)
@@ -108,6 +116,8 @@ def query_database(query: str) -> str:
     - item_description (TEXT)
     - item_quantity (NUMERIC/DOUBLE)
     - item_total_price (NUMERIC/DOUBLE)
+    - taxable (BOOLEAN, nullable)
+    - tax_rate (NUMERIC, nullable — % rate for this item, 0 = exempt)
     - enriched_info (TEXT)
 
     Args:
