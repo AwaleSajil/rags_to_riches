@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from backend.dependencies import get_current_user, get_supabase
 from backend.schemas.transactions import (
     TransactionCreate,
+    TransactionDetailsReplace,
     TransactionListItem,
     TransactionResponse,
     TransactionUpdate,
@@ -78,6 +79,25 @@ async def update_transaction(
     except Exception as e:
         logger.error("Failed to update transaction %s: %s", transaction_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to update transaction: {e}")
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
+
+
+@router.put("/{transaction_id}/details", response_model=TransactionWithDetails)
+async def replace_details(
+    transaction_id: str,
+    body: TransactionDetailsReplace,
+    user: dict = Depends(get_current_user),
+):
+    """Replace all line items for a transaction (edit/add/delete in one shot)."""
+    user = _require_user(user)
+    details = [d.model_dump() for d in body.details]
+    try:
+        tx = await transaction_service.replace_details(user, transaction_id, details)
+    except Exception as e:
+        logger.error("Failed to replace details for %s: %s", transaction_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to replace line items: {e}")
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return tx

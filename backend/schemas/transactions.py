@@ -71,6 +71,28 @@ class TransactionDetailItem(BaseModel):
     enriched_info: Optional[str] = None
 
 
+class TransactionDetailInput(BaseModel):
+    """One line item in a bulk 'replace details' request. Derived fields
+    (item_subtotal_price, tax_amount, item_total_price, taxable) are computed
+    server-side from quantity/unit/tax_rate when omitted."""
+
+    item_description: Optional[str] = None
+    item_quantity: Optional[float] = None
+    item_unit_subtotal_price: Optional[float] = None
+    item_subtotal_price: Optional[float] = None
+    tax_amount: Optional[float] = None
+    taxable: Optional[bool] = None
+    tax_rate: Optional[float] = None
+    item_total_price: Optional[float] = None
+    enriched_info: Optional[str] = None
+
+
+class TransactionDetailsReplace(BaseModel):
+    """Replace the full set of line items for a transaction."""
+
+    details: List[TransactionDetailInput] = Field(default_factory=list)
+
+
 class TransactionWithDetails(TransactionListItem):
     """Full transaction for the detail screen: header fields + ordered line items."""
 

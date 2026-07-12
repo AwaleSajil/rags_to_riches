@@ -65,6 +65,26 @@ export async function deleteTransaction(id: string): Promise<void> {
   await apiJson(`/transactions/${id}`, { method: "DELETE", timeout: 15000 });
 }
 
+export interface TransactionDetailInput {
+  item_description?: string | null;
+  item_quantity?: number | null;
+  item_unit_subtotal_price?: number | null;
+  tax_rate?: number | null;
+}
+
+export async function replaceTransactionDetails(
+  id: string,
+  details: TransactionDetailInput[]
+): Promise<TransactionWithDetails> {
+  log.info("Replacing line items", { id, count: details.length });
+  // Replacing line items re-embeds the vector server-side — allow extra time.
+  return apiJson<TransactionWithDetails>(`/transactions/${id}/details`, {
+    method: "PUT",
+    body: JSON.stringify({ details }),
+    timeout: 30000,
+  });
+}
+
 export interface TransactionConfirmResult {
   id: string;
   description: string;

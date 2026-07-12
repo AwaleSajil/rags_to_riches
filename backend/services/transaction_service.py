@@ -256,3 +256,128 @@ async def delete_transaction(user: dict, transaction_id: str) -> bool:
     except Exception as e:
         logger.warning("Vector delete failed for transaction %s: %s", transaction_id, e)
     return True
+
+
+def _prepare_detail_rows(
+    user_id: str, transaction_id: str, bill_file_id, details_input: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Fill in derived fields (subtotal, tax, post-tax total, taxable) for each
+    incoming line item, matching the ingestion parser's math."""
+    rows: List[Dict[str, Any]] = []
+    for d in details_input:
+        qty = d.get("item_quantity")
+        unit = d.get("item_unit_subtotal_price")
+        rate = d.get("tax_rate")
+
+        subtotal = d.get("item_subtotal_price")
+        if subtotal is None:
+            qty_val = qty if qty is not None else 1
+            unit_val = unit if unit is not None else 0
+            subtotal = round(float(qty_val) * float(unit_val), 2)
+
+        taxable = d.get("taxable")
+        if taxable is None:
+            taxable = rate is not None and rate > 0
+
+        tax_amount = d.get("tax_amount")
+        if tax_amount is None:
+            tax_amount = round(subtotal * rate / 100.0, 2) if (taxable and rate) else 0.0
+
+        total = d.get("item_total_price")
+        if total is None:
+            total = round(subtotal + tax_amount, 2)
+
+        rows.append({
+            "transaction_id": transaction_id,
+            "user_id": user_id,
+            "bill_file_id": bill_file_id,
+            "item_description": d.get("item_description"),
+            "item_quantity": qty,
+            "item_unit_subtotal_price": unit,
+            "item_subtotal_price": subtotal,
+            "tax_amount": tax_amount,
+            "tax_rate": rate,
+            "taxable": taxable,
+            "item_total_price": total,
+            "enriched_info": d.get("enriched_info"),
+        })
+    return rows
+
+
+def _replace_details_rows(
+    user: dict, transaction_id: str, details_input: List[Dict[str, Any]]
+):
+    """Blocking: verify ownership, swap line items, return (tx_row, new_details)
+    or None if the transaction is not found / not the user's."""
+    client = _client(user)
+    tx_res = (
+        client.table("Transaction")
+        .select("*")
+        .eq("id", transaction_id)
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not tx_res.data:
+        return None
+    tx_row = tx_res.data[0]
+
+    new_rows = _prepare_detail_rows(
+        user["id"], transaction_id, tx_row.get("source_bill_file_id"), details_input
+    )
+
+    # Replace: clear existing line items, then insert the new set.
+    client.table("TransactionDetail").delete().eq(
+        "transaction_id", transaction_id
+    ).eq("user_id", user["id"]).execute()
+
+    details: List[Dict[str, Any]] = []
+    if new_rows:
+        # insert() returns rows in insert order, preserving the user's ordering.
+        details = client.table("TransactionDetail").insert(new_rows).execute().data or []
+
+    return tx_row, details
+
+
+async def replace_details(
+    user: dict, transaction_id: str, details_input: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Replace a transaction's line items and resync its vectors.
+
+    Vector resync removes the old parent + line-item vectors and re-embeds the
+    new set. Failures are logged, not fatal — the DB stays the source of truth.
+    """
+    prepared = await asyncio.to_thread(
+        _replace_details_rows, user, transaction_id, details_input
+    )
+    if prepared is None:
+        return None
+    tx_row, details = prepared
+
+    config = await config_service.get_config(user)
+    if config:
+        try:
+            from backend.vector_db_client import get_vector_client
+
+            vc = get_vector_client()
+            # Drop old vectors (parent + all prior line items), then re-embed.
+            await asyncio.to_thread(vc.delete_transaction_vectors, transaction_id, None)
+            await asyncio.to_thread(
+                _reembed_transaction, tx_row, details, user["id"], config
+            )
+            logger.info("Resynced vectors after detail replace for %s", transaction_id)
+        except Exception as e:
+            logger.warning(
+                "Vector resync failed after detail replace for %s: %s",
+                transaction_id,
+                e,
+            )
+    else:
+        logger.warning(
+            "No AccountConfig for user %s — skipping vector resync of %s",
+            user["id"],
+            transaction_id,
+        )
+
+    tx_row["details"] = details
+    return tx_row

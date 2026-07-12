@@ -12,6 +12,7 @@ import {
   Divider,
   Button,
   TextInput,
+  IconButton,
   Dialog,
   Portal,
   Snackbar,
@@ -21,7 +22,10 @@ import { useLocalSearchParams, useFocusEffect, useRouter } from "expo-router";
 import { GlassCard } from "../../src/components/GlassCard";
 import { LoadingSpinner } from "../../src/components/LoadingSpinner";
 import * as transactionService from "../../src/services/transactionService";
-import type { TransactionUpdatePayload } from "../../src/services/transactionService";
+import type {
+  TransactionUpdatePayload,
+  TransactionDetailInput,
+} from "../../src/services/transactionService";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
 import type { TransactionWithDetails, TransactionDetailItem } from "../../src/lib/types";
@@ -67,6 +71,49 @@ function toForm(tx: TransactionWithDetails): FormState {
     subtotal: numStr(tx.subtotal),
     tax_total: numStr(tx.tax_total),
   };
+}
+
+interface DetailFormState {
+  key: string;
+  item_description: string;
+  item_quantity: string;
+  item_unit_subtotal_price: string;
+  tax_rate: string;
+}
+
+const numStr = (n: number | null | undefined) => (n == null ? "" : String(n));
+let detailKeySeq = 0;
+const newDetailKey = () => `new-${Date.now()}-${detailKeySeq++}`;
+
+function toDetailForm(d: TransactionDetailItem): DetailFormState {
+  return {
+    key: d.id,
+    item_description: d.item_description ?? "",
+    item_quantity: numStr(d.item_quantity),
+    item_unit_subtotal_price: numStr(d.item_unit_subtotal_price),
+    tax_rate: numStr(d.tax_rate),
+  };
+}
+
+// Canonical string of the editable detail fields, for change detection.
+function detailSnapshot(rows: DetailFormState[]): string {
+  return rows
+    .map(
+      (r) =>
+        `${r.item_description.trim()}|${r.item_quantity.trim()}|${r.item_unit_subtotal_price.trim()}|${r.tax_rate.trim()}`
+    )
+    .join("~");
+}
+
+// Live per-row totals so the editor shows what will be saved.
+function computeRowTotals(r: DetailFormState) {
+  const qty = parseFloat(r.item_quantity);
+  const unit = parseFloat(r.item_unit_subtotal_price);
+  const rate = parseFloat(r.tax_rate);
+  const subtotal =
+    (isNaN(qty) ? 1 : qty) * (isNaN(unit) ? 0 : unit);
+  const tax = !isNaN(rate) && rate > 0 ? (subtotal * rate) / 100 : 0;
+  return { subtotal, tax, total: subtotal + tax };
 }
 
 function LineItem({ item }: { item: TransactionDetailItem }) {
@@ -115,6 +162,8 @@ export default function TransactionDetailScreen() {
 
   const [isEditing, setIsEditing] = useState(false);
   const [form, setForm] = useState<FormState | null>(null);
+  const [detailForms, setDetailForms] = useState<DetailFormState[]>([]);
+  const [origDetailSnapshot, setOrigDetailSnapshot] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -145,16 +194,40 @@ export default function TransactionDetailScreen() {
   const startEdit = () => {
     if (!transaction) return;
     setForm(toForm(transaction));
+    const rows = transaction.details.map(toDetailForm);
+    setDetailForms(rows);
+    setOrigDetailSnapshot(detailSnapshot(rows));
     setIsEditing(true);
   };
 
   const cancelEdit = () => {
     setIsEditing(false);
     setForm(null);
+    setDetailForms([]);
   };
 
   const setField = (key: keyof FormState, value: string) =>
     setForm((prev) => (prev ? { ...prev, [key]: value } : prev));
+
+  const setDetailField = (key: string, field: keyof DetailFormState, value: string) =>
+    setDetailForms((prev) =>
+      prev.map((r) => (r.key === key ? { ...r, [field]: value } : r))
+    );
+
+  const addDetailRow = () =>
+    setDetailForms((prev) => [
+      ...prev,
+      {
+        key: newDetailKey(),
+        item_description: "",
+        item_quantity: "1",
+        item_unit_subtotal_price: "",
+        tax_rate: "",
+      },
+    ]);
+
+  const removeDetailRow = (key: string) =>
+    setDetailForms((prev) => prev.filter((r) => r.key !== key));
 
   const handleSave = async () => {
     if (!transaction || !form || !id) return;
@@ -199,17 +272,61 @@ export default function TransactionDetailScreen() {
       }
     }
 
-    if (Object.keys(changes).length === 0) {
+    // --- Line items ---
+    const detailsChanged = detailSnapshot(detailForms) !== origDetailSnapshot;
+    let detailsPayload: TransactionDetailInput[] = [];
+    if (detailsChanged) {
+      // Drop fully-empty rows; validate the rest.
+      const rows = detailForms.filter(
+        (r) =>
+          r.item_description.trim() !== "" ||
+          r.item_quantity.trim() !== "" ||
+          r.item_unit_subtotal_price.trim() !== ""
+      );
+      for (const r of rows) {
+        for (const [field, label] of [
+          ["item_quantity", "Quantity"],
+          ["item_unit_subtotal_price", "Unit price"],
+          ["tax_rate", "Tax rate"],
+        ] as const) {
+          const raw = r[field].trim();
+          if (raw !== "" && isNaN(parseFloat(raw))) {
+            setSnackbar({
+              visible: true,
+              message: `${label} must be a number (line "${r.item_description || "?"}")`,
+              error: true,
+            });
+            return;
+          }
+        }
+      }
+      const numOrNull = (s: string) => (s.trim() === "" ? null : parseFloat(s));
+      detailsPayload = rows.map((r) => ({
+        item_description: r.item_description.trim(),
+        item_quantity: numOrNull(r.item_quantity),
+        item_unit_subtotal_price: numOrNull(r.item_unit_subtotal_price),
+        tax_rate: numOrNull(r.tax_rate) ?? 0,
+      }));
+    }
+
+    if (Object.keys(changes).length === 0 && !detailsChanged) {
       cancelEdit();
       return;
     }
 
     setIsSaving(true);
     try {
-      const updated = await transactionService.updateTransaction(id, changes);
+      let updated = transaction;
+      if (Object.keys(changes).length > 0) {
+        updated = await transactionService.updateTransaction(id, changes);
+      }
+      if (detailsChanged) {
+        updated = await transactionService.replaceTransactionDetails(id, detailsPayload);
+      }
       setTransaction(updated);
       setIsEditing(false);
       setForm(null);
+      setDetailForms([]);
       setSnackbar({ visible: true, message: "Transaction updated", error: false });
     } catch (e: any) {
       log.error("Failed to update transaction", e);
@@ -329,7 +446,94 @@ export default function TransactionDetailScreen() {
                 style={[styles.input, styles.inputHalf]}
               />
             </View>
+          </GlassCard>
 
+          {/* Line-item editor */}
+          <GlassCard style={styles.card}>
+            <View style={styles.lineItemsHeader}>
+              <Text style={styles.sectionTitle}>Line items</Text>
+              <Button
+                mode="text"
+                icon="plus"
+                compact
+                onPress={addDetailRow}
+                disabled={isSaving}
+              >
+                Add
+              </Button>
+            </View>
+
+            {detailForms.length === 0 ? (
+              <Text style={styles.emptyDetailText}>
+                No line items. Tap “Add” to create one.
+              </Text>
+            ) : (
+              detailForms.map((row, i) => {
+                const totals = computeRowTotals(row);
+                return (
+                  <View key={row.key} style={styles.detailEditRow}>
+                    {i > 0 && <Divider style={styles.itemDivider} />}
+                    <View style={styles.detailEditTop}>
+                      <TextInput
+                        mode="outlined"
+                        label="Description"
+                        value={row.item_description}
+                        onChangeText={(v) => setDetailField(row.key, "item_description", v)}
+                        style={styles.detailDescInput}
+                        dense
+                      />
+                      <IconButton
+                        icon="trash-can-outline"
+                        iconColor={colors.error}
+                        size={20}
+                        onPress={() => removeDetailRow(row.key)}
+                        disabled={isSaving}
+                        style={styles.detailDeleteBtn}
+                      />
+                    </View>
+                    <View style={styles.detailEditNums}>
+                      <TextInput
+                        mode="outlined"
+                        label="Qty"
+                        value={row.item_quantity}
+                        onChangeText={(v) => setDetailField(row.key, "item_quantity", v)}
+                        keyboardType="decimal-pad"
+                        style={styles.detailNumInput}
+                        dense
+                      />
+                      <TextInput
+                        mode="outlined"
+                        label="Unit $"
+                        value={row.item_unit_subtotal_price}
+                        onChangeText={(v) =>
+                          setDetailField(row.key, "item_unit_subtotal_price", v)
+                        }
+                        keyboardType="decimal-pad"
+                        style={styles.detailNumInput}
+                        dense
+                      />
+                      <TextInput
+                        mode="outlined"
+                        label="Tax %"
+                        value={row.tax_rate}
+                        onChangeText={(v) => setDetailField(row.key, "tax_rate", v)}
+                        keyboardType="decimal-pad"
+                        style={styles.detailNumInput}
+                        dense
+                      />
+                    </View>
+                    <Text style={styles.detailComputed}>
+                      {money(totals.subtotal)}
+                      {totals.tax > 0 ? ` + ${money(totals.tax)} tax` : ""} ={" "}
+                      {money(totals.total)}
+                    </Text>
+                  </View>
+                );
+              })
+            )}
+          </GlassCard>
+
+          <GlassCard style={styles.editActionsCard}>
             <View style={styles.editActions}>
               <Button
                 mode="outlined"
@@ -706,5 +910,50 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: spacing.md,
     marginTop: spacing.sm,
+  },
+  editActionsCard: {
+    marginBottom: spacing.lg,
+    paddingVertical: spacing.md,
+  },
+  lineItemsHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: spacing.sm,
+  },
+  emptyDetailText: {
+    ...typography.body2,
+    color: colors.textSecondary,
+    paddingVertical: spacing.sm,
+  },
+  detailEditRow: {
+    paddingTop: spacing.sm,
+  },
+  detailEditTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+  },
+  detailDescInput: {
+    flex: 1,
+    backgroundColor: colors.surface,
+  },
+  detailDeleteBtn: {
+    margin: 0,
+  },
+  detailEditNums: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginTop: spacing.xs,
+  },
+  detailNumInput: {
+    flex: 1,
+    backgroundColor: colors.surface,
+  },
+  detailComputed: {
+    ...typography.caption,
+    color: colors.textSecondary,
+    marginTop: spacing.xs,
+    textAlign: "right",
   },
 });
