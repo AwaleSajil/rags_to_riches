@@ -520,6 +520,18 @@ Return ONLY a valid JSON array with one object per item, in the same order:
         hash_input = f"{date_str}{amount_str}{merch_hash}"
         content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
         
+        # Rename the stored bill to a friendly {merchant}_{yyyymmdd} display label.
+        # (Only the BillFile.filename shown in the UI — the storage key is left stable.)
+        if file_id:
+            import re
+            ext = os.path.splitext(filename)[1] or ".jpg"
+            slug = re.sub(r"[^A-Za-z0-9]+", "_", str(clean_merchant or "receipt")).strip("_") or "receipt"
+            ymd = date_str.replace("-", "") if date_str else "nodate"
+            try:
+                self._db_update("BillFile", {"filename": f"{slug}_{ymd}{ext}"}, {"id": file_id})
+            except Exception as e:
+                print(f"   ⚠️ Failed to rename BillFile: {e}")
+
         # Build transaction record
         tx_record = {
             "user_id": self.user_id,
