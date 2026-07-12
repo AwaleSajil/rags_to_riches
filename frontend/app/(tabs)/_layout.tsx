@@ -5,7 +5,31 @@ import { View } from "react-native";
 import { Text, IconButton } from "react-native-paper";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAuth } from "../../src/providers/AuthProvider";
+import { useChatSession } from "../../src/providers/ChatSessionProvider";
 import { colors } from "../../src/styles/theme";
+
+// Sessions drawer (☰) + new chat (＋), shown in the Chat tab's native header.
+function ChatHeaderLeft() {
+  const { handlers } = useChatSession();
+  return (
+    <View style={{ flexDirection: "row", marginLeft: 4 }}>
+      <IconButton
+        icon="menu"
+        size={22}
+        iconColor={colors.text}
+        onPress={() => handlers.onMenu?.()}
+        style={{ margin: 0 }}
+      />
+      <IconButton
+        icon="plus"
+        size={22}
+        iconColor={colors.text}
+        onPress={() => handlers.onNewChat?.()}
+        style={{ margin: 0 }}
+      />
+    </View>
+  );
+}
 
 export default function TabLayout() {
   const { user, logout } = useAuth();
@@ -60,6 +84,7 @@ export default function TabLayout() {
         options={{
           title: "Chat",
           headerTitle: "R2R",
+          headerLeft: () => <ChatHeaderLeft />,
           tabBarIcon: ({ color, size, focused }) => (
             <MaterialCommunityIcons
               name={focused ? "message-text" : "message-text-outline"}

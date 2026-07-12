@@ -4,6 +4,7 @@ import { Platform } from "react-native";
 import { PaperProvider } from "react-native-paper";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AuthProvider, useAuth } from "../src/providers/AuthProvider";
+import { ChatSessionProvider } from "../src/providers/ChatSessionProvider";
 import { theme } from "../src/styles/theme";
 import { LoadingSpinner } from "../src/components/LoadingSpinner";
 import { createLogger } from "../src/lib/logger";
@@ -53,7 +54,9 @@ export default function RootLayout() {
     <SafeAreaProvider>
       <AuthProvider>
         <PaperProvider theme={theme}>
-          <RootLayoutNav />
+          <ChatSessionProvider>
+            <RootLayoutNav />
+          </ChatSessionProvider>
         </PaperProvider>
       </AuthProvider>
     </SafeAreaProvider>

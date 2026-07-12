@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from "react";
 import { StyleSheet, View, FlatList, KeyboardAvoidingView, Platform, useWindowDimensions } from "react-native";
-import { Banner, Text, IconButton } from "react-native-paper";
+import { Banner, Text } from "react-native-paper";
 import { useRouter, useFocusEffect } from "expo-router";
 import { ChatMessage } from "../../src/components/ChatMessage";
 import { ChatInput } from "../../src/components/ChatInput";
@@ -10,7 +10,8 @@ import { ConversationDrawer } from "../../src/components/ConversationDrawer";
 import { useChat } from "../../src/hooks/useChat";
 import { useConversations } from "../../src/hooks/useConversations";
 import { useFiles } from "../../src/hooks/useFiles";
-import { colors, spacing, typography } from "../../src/styles/theme";
+import { useChatSession } from "../../src/providers/ChatSessionProvider";
+import { colors, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
 import type { ChatMessage as ChatMessageType } from "../../src/lib/types";
 
@@ -55,13 +56,21 @@ export default function ChatScreen() {
   useEffect(() => {
     if (!isStreaming) refreshConversations();
   }, [isStreaming]);
+
+  // Wire the native header's ☰ / ＋ buttons to this screen's actions.
+  const { setHandlers } = useChatSession();
+  useEffect(() => {
+    setHandlers({
+      onMenu: () => setDrawerOpen(true),
+      onNewChat: () => newConversation(),
+    });
+  }, [setHandlers, newConversation]);
+
   const router = useRouter();
   const { width: screenWidth } = useWindowDimensions();
 
   const isWide = Platform.OS === "web" && screenWidth > MAX_CHAT_WIDTH;
   const fileCount = files.length;
-  const activeTitle =
-    conversations.find((c) => c.id === conversationId)?.title || "New chat";
 
   // Auto-scroll to bottom on new messages (longer delay for chart WebViews to mount)
   useEffect(() => {
@@ -96,13 +105,6 @@ export default function ChatScreen() {
 
   return (
     <KeyboardAvoidingView {...wrapperProps}>
-      {/* Session header: menu (past chats) · title · new chat */}
-      <View style={styles.header}>
-        <IconButton icon="menu" size={24} onPress={() => setDrawerOpen(true)} />
-        <Text style={styles.headerTitle} numberOfLines={1}>{activeTitle}</Text>
-        <IconButton icon="plus" size={24} onPress={() => newConversation()} />
-      </View>
-
       <ConversationDrawer
         visible={drawerOpen}
         conversations={conversations}
@@ -190,19 +192,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
-  },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    borderBottomWidth: 1,
-    borderBottomColor: colors.surfaceBorder,
-    backgroundColor: colors.surface,
-  },
-  headerTitle: {
-    flex: 1,
-    ...typography.subtitle2,
-    color: colors.text,
-    textAlign: "center",
   },
   warningBanner: {
     backgroundColor: "#FEF3C7",
