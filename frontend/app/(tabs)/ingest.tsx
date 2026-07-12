@@ -1,9 +1,11 @@
-import React, { useState } from "react";
-import { StyleSheet, View, ScrollView, Platform } from "react-native";
-import { Text, Button, Snackbar, ProgressBar, Badge } from "react-native-paper";
+import React, { useMemo, useState } from "react";
+import { StyleSheet, View, ScrollView, Platform, Pressable } from "react-native";
+import { Text, Button, Snackbar, ProgressBar, Badge, Searchbar, Chip } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
 import { useCameraPermissions } from "expo-camera";
 import { FileListItem } from "../../src/components/FileListItem";
+import { FilePreviewModal } from "../../src/components/FilePreviewModal";
 import { DeleteConfirmModal } from "../../src/components/DeleteConfirmModal";
 import { CameraCapture } from "../../src/components/CameraCapture";
 import { GlassCard } from "../../src/components/GlassCard";
@@ -16,6 +18,20 @@ import { createLogger } from "../../src/lib/logger";
 import type { FileItem } from "../../src/lib/types";
 
 const log = createLogger("IngestScreen");
+
+type FileFilter = "all" | "csv" | "bill";
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+function monthLabel(dateStr?: string): string {
+  if (!dateStr) return "Unknown date";
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return "Unknown date";
+  return `${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+}
 
 export default function IngestScreen() {
   const {
@@ -36,6 +52,34 @@ export default function IngestScreen() {
     { uri: string; name: string; type: string }[]
   >([]);
   const [deleteTarget, setDeleteTarget] = useState<FileItem | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<FileItem | null>(null);
+  const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState<FileFilter>("all");
+  const [collapsedMonths, setCollapsedMonths] = useState<Record<string, boolean>>({});
+
+  // Filter → sort newest-first → group into month buckets (already in newest order).
+  const groupedFiles = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const filtered = files
+      .filter((f) => typeFilter === "all" || f.type === typeFilter)
+      .filter((f) => !q || f.filename.toLowerCase().includes(q))
+      .sort((a, b) => (b.upload_date || "").localeCompare(a.upload_date || ""));
+
+    const groups: { month: string; items: FileItem[] }[] = [];
+    const index: Record<string, FileItem[]> = {};
+    for (const f of filtered) {
+      const label = monthLabel(f.upload_date);
+      if (!index[label]) {
+        index[label] = [];
+        groups.push({ month: label, items: index[label] });
+      }
+      index[label].push(f);
+    }
+    return groups;
+  }, [files, typeFilter, search]);
+
+  const toggleMonth = (month: string) =>
+    setCollapsedMonths((prev) => ({ ...prev, [month]: !prev[month] }));
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -267,15 +311,76 @@ export default function IngestScreen() {
         {files.length === 0 ? (
           <Text style={styles.emptyText}>No files uploaded yet.</Text>
         ) : (
-          files.map((file, index) => (
-            <FileListItem
-              key={file.id ?? `file-${index}`}
-              file={file}
-              onDelete={setDeleteTarget}
+          <>
+            {/* Search */}
+            <Searchbar
+              placeholder="Search files"
+              value={search}
+              onChangeText={setSearch}
+              style={styles.searchbar}
+              inputStyle={styles.searchInput}
+              icon="magnify"
             />
-          ))
+
+            {/* Type filter chips */}
+            <View style={styles.filterRow}>
+              {([
+                { key: "all", label: "All" },
+                { key: "csv", label: "CSVs" },
+                { key: "bill", label: "Receipts" },
+              ] as { key: FileFilter; label: string }[]).map((chip) => (
+                <Chip
+                  key={chip.key}
+                  selected={typeFilter === chip.key}
+                  onPress={() => setTypeFilter(chip.key)}
+                  style={[styles.filterChip, typeFilter === chip.key && styles.filterChipActive]}
+                  showSelectedCheck={false}
+                  compact
+                >
+                  {chip.label}
+                </Chip>
+              ))}
+            </View>
+
+            {/* Collapsible month groups */}
+            {groupedFiles.length === 0 ? (
+              <Text style={styles.emptyText}>No files match your search.</Text>
+            ) : (
+              groupedFiles.map(({ month, items }) => {
+                const collapsed = collapsedMonths[month];
+                return (
+                  <View key={month} style={styles.monthGroup}>
+                    <Pressable style={styles.monthHeader} onPress={() => toggleMonth(month)}>
+                      <MaterialCommunityIcons
+                        name={collapsed ? "chevron-right" : "chevron-down"}
+                        size={22}
+                        color={colors.textSecondary}
+                      />
+                      <Text style={styles.monthTitle}>{month}</Text>
+                      <Badge style={styles.monthBadge}>{items.length}</Badge>
+                    </Pressable>
+                    {!collapsed &&
+                      items.map((file, index) => (
+                        <FileListItem
+                          key={file.id ?? `file-${index}`}
+                          file={file}
+                          onDelete={setDeleteTarget}
+                          onPress={setPreviewTarget}
+                        />
+                      ))}
+                  </View>
+                );
+              })
+            )}
+          </>
         )}
       </ScrollView>
+
+      {/* File Preview (receipt image or CSV table) */}
+      <FilePreviewModal
+        file={previewTarget}
+        onClose={() => setPreviewTarget(null)}
+      />
 
       {/* Delete Confirmation */}
       <DeleteConfirmModal
@@ -379,6 +484,49 @@ const styles = StyleSheet.create({
   dismissButton: {
     alignSelf: "flex-start",
     marginTop: spacing.xs,
+  },
+  searchbar: {
+    marginBottom: spacing.md,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.surfaceBorder,
+    borderRadius: 12,
+    elevation: 0,
+  },
+  searchInput: {
+    fontSize: 14,
+    minHeight: 0,
+  },
+  filterRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginBottom: spacing.lg,
+  },
+  filterChip: {
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.surfaceBorder,
+  },
+  filterChipActive: {
+    backgroundColor: colors.primaryLight,
+    borderColor: colors.primary,
+  },
+  monthGroup: {
+    marginBottom: spacing.sm,
+  },
+  monthHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: spacing.sm,
+    gap: spacing.xs,
+  },
+  monthTitle: {
+    ...typography.subtitle2,
+    color: colors.textSecondary,
+    flex: 1,
+  },
+  monthBadge: {
+    backgroundColor: colors.textTertiary,
   },
   fileListHeader: {
     marginTop: spacing.xxl,
