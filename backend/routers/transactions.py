@@ -106,6 +106,7 @@ async def create_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Insert a manually-entered transaction. user_id always comes from JWT."""
+    user = _require_user(user)
     logger.info("Creating manual transaction for user_id=%s: %s", user["id"], body.description)
 
     user_id = user["id"]
@@ -131,7 +132,11 @@ async def create_transaction(
 
     try:
         sb = get_supabase(access_token=user.get("access_token"))
-        result = sb.table("Transaction").upsert([record], on_conflict="content_hash").execute()
+        # Dedup constraint is UNIQUE(user_id, content_hash) — the conflict target
+        # must name both columns or Postgres raises 42P10.
+        result = sb.table("Transaction").upsert(
+            [record], on_conflict="user_id,content_hash"
+        ).execute()
 
         if result.data:
             row = result.data[0]
