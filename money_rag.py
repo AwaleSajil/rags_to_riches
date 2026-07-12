@@ -612,8 +612,13 @@ Return ONLY a valid JSON array with one object per item, in the same order:
         except Exception as e:
             print(f"Error purging file data: {e}")
 
-    async def chat(self, query: str):
-        """Async generator that yields status events + final response."""
+    async def chat(self, query: str, history: Optional[list] = None):
+        """Async generator that yields status events + final response.
+
+        `history` is a list of prior {role, content} turns (from the DB) that give
+        the agent conversation context. Passed explicitly so memory survives
+        restarts rather than living only in the in-process checkpointer.
+        """
         server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
         
         mcp_client = MultiServerMCPClient(
@@ -662,7 +667,11 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                 checkpointer=self.memory,
             )
 
-            config = {"configurable": {"thread_id": "session_1"}}
+            import uuid
+            # Fresh thread per call — conversation memory comes from the passed
+            # `history`, so we don't double-accumulate in the checkpointer.
+            config = {"configurable": {"thread_id": uuid.uuid4().hex}}
+            input_messages = list(history or []) + [{"role": "user", "content": query}]
             
             chart_path = os.path.join(self.temp_dir, "latest_chart.json")
             if os.path.exists(chart_path):
@@ -676,7 +685,7 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             # Accumulate all AI text tokens across the full agent run
             ai_text_chunks: list[str] = []
             async for event in agent.astream_events(
-                {"messages": [{"role": "user", "content": query}]},
+                {"messages": input_messages},
                 config,
                 version="v2",
             ):

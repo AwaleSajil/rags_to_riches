@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from backend.dependencies import get_current_user
 from backend.schemas.chat import ChatRequest
-from backend.services import config_service
+from backend.services import config_service, conversation_service
 from backend.services.rag_manager import rag_manager
 
 logger = logging.getLogger("moneyrag.routers.chat")
@@ -18,66 +18,63 @@ router = APIRouter()
 async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
     logger.debug("Chat request from user_id=%s | message=%s", user["id"], body.message[:100])
 
-    logger.debug("Fetching config for user_id=%s", user["id"])
     config = await config_service.get_config(user)
     if not config:
         logger.warning("No config found for user_id=%s — returning 400", user["id"])
         raise HTTPException(status_code=400, detail="Account config required. Please configure your API key first.")
-    logger.debug("Config loaded — provider=%s, model=%s", config.get("llm_provider"), config.get("decode_model"))
 
-    logger.debug("Getting/creating RAG instance for user_id=%s", user["id"])
     rag = await rag_manager.get_or_create(user, config)
-    logger.debug("RAG instance ready for user_id=%s", user["id"])
+
+    # --- Conversation setup: resume an existing one or start a new one ---
+    if body.conversation_id:
+        conversation_id = body.conversation_id
+    else:
+        conv = await conversation_service.create_conversation(user)
+        conversation_id = conv["id"]
+    logger.debug("Chat in conversation_id=%s for user_id=%s", conversation_id, user["id"])
+
+    # Load prior turns for agent context, then persist this user message.
+    prior = await conversation_service.get_messages(user, conversation_id)
+    history = conversation_service.to_agent_history(prior)
+    await conversation_service.add_message(user, conversation_id, "user", body.message)
+    await conversation_service.set_title_from_first_message(user, conversation_id, body.message)
 
     async def event_generator():
+        # Let the client know which conversation this maps to (esp. brand-new ones).
+        yield f"event: conversation\ndata: {json.dumps({'conversation_id': conversation_id})}\n\n"
+
         event_count = 0
         start = time.perf_counter()
         try:
-            logger.debug("Starting SSE stream for user_id=%s", user["id"])
-            async for event in rag.chat(body.message):
+            async for event in rag.chat(body.message, history=history):
                 event_count += 1
-                event_type = event.get("type", "unknown")
-                logger.debug(
-                    "SSE event #%d type=%s for user_id=%s",
-                    event_count, event_type, user["id"],
-                )
 
                 if event["type"] == "final":
                     content = event.get("content", "")
-                    logger.debug(
-                        "Final event — content length=%d chars for user_id=%s",
-                        len(content), user["id"],
-                    )
+
                     charts = []
-                    # Extract chart JSON from ===CHART===...===ENDCHART=== markers
                     while "===CHART===" in content:
                         pre, rest = content.split("===CHART===", 1)
                         if "===ENDCHART===" in rest:
                             chart_json, after = rest.split("===ENDCHART===", 1)
                             charts.append(chart_json.strip())
                             content = pre + after
-                            logger.debug("Extracted chart JSON (%d chars)", len(chart_json))
                         else:
                             content = pre + rest
-                            logger.warning("Found ===CHART=== without matching ===ENDCHART===")
                             break
 
                     images = []
-                    # Extract image URLs from ===IMAGES===...===ENDIMAGES=== markers
                     while "===IMAGES===" in content:
                         pre, rest = content.split("===IMAGES===", 1)
                         if "===ENDIMAGES===" in rest:
                             images_json, after = rest.split("===ENDIMAGES===", 1)
                             content = pre + after
                             try:
-                                urls = json.loads(images_json.strip())
-                                images.extend(urls)
-                                logger.debug("Extracted %d image URLs", len(urls))
+                                images.extend(json.loads(images_json.strip()))
                             except json.JSONDecodeError:
                                 logger.warning("Failed to parse images JSON")
                         else:
                             content = pre + rest
-                            logger.warning("Found ===IMAGES=== without matching ===ENDIMAGES===")
                             break
 
                     pending_transactions = []
@@ -87,34 +84,47 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
                             tx_json, after = rest.split("===ENDCONFIRM_TX===", 1)
                             content = pre + after
                             try:
-                                tx_data = json.loads(tx_json.strip())
-                                pending_transactions.append(tx_data)
-                                logger.debug("Extracted pending transaction: %s", tx_data)
+                                pending_transactions.append(json.loads(tx_json.strip()))
                             except json.JSONDecodeError:
                                 logger.warning("Failed to parse pending transaction JSON")
                         else:
                             content = pre + rest
-                            logger.warning("Found ===CONFIRM_TX=== without matching ===ENDCONFIRM_TX===")
                             break
 
-                    logger.debug(
-                        "Final response: %d charts, %d images, %d pending_tx extracted, content length=%d",
-                        len(charts), len(images), len(pending_transactions), len(content.strip()),
+                    final_content = content.strip()
+
+                    # Persist the assistant turn so it survives reloads/restarts.
+                    try:
+                        await conversation_service.add_message(
+                            user, conversation_id, "assistant", final_content,
+                            charts=charts or None,
+                            images=images or None,
+                            pending_transactions=pending_transactions or None,
+                        )
+                    except Exception as e:
+                        logger.error("Failed to persist assistant message: %s", e, exc_info=True)
+
+                    yield (
+                        "event: final\ndata: "
+                        + json.dumps({
+                            "content": final_content,
+                            "charts": charts,
+                            "images": images,
+                            "pendingTransactions": pending_transactions,
+                        })
+                        + "\n\n"
                     )
-                    yield f"event: final\ndata: {json.dumps({'content': content.strip(), 'charts': charts, 'images': images, 'pendingTransactions': pending_transactions})}\n\n"
                 else:
                     yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
 
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.info(
-                "SSE stream complete for user_id=%s — %d events in %.1fms",
-                user["id"], event_count, elapsed_ms,
+                "SSE stream complete for user_id=%s conv=%s — %d events in %.1fms",
+                user["id"], conversation_id, event_count, elapsed_ms,
             )
             yield "event: done\ndata: {}\n\n"
         except Exception as e:
-            logger.error(
-                "SSE stream error for user_id=%s: %s", user["id"], e, exc_info=True,
-            )
+            logger.error("SSE stream error for user_id=%s: %s", user["id"], e, exc_info=True)
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(

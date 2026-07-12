@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from backend.routers import auth, config_router, files, chat, transactions
+from backend.routers import auth, config_router, files, chat, transactions, conversations
 from backend.services.rag_manager import rag_manager
 
 # ---------------------------------------------------------------------------
@@ -107,6 +107,7 @@ app.include_router(config_router.router, prefix="/api/v1/config", tags=["config"
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(transactions.router, prefix="/api/v1/transactions", tags=["transactions"])
+app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["conversations"])
 
 
 @app.get("/api/v1/health")

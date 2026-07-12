@@ -1,0 +1,115 @@
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from backend.dependencies import get_supabase
+
+logger = logging.getLogger("moneyrag.services.conversation")
+
+MAX_HISTORY = 12  # recent turns passed to the agent for context
+
+
+def _client(user: dict):
+    return get_supabase(user["access_token"])
+
+
+async def list_conversations(user: dict) -> List[Dict[str, Any]]:
+    def _run():
+        res = (
+            _client(user)
+            .table("Conversation")
+            .select("id,title,created_at,updated_at")
+            .eq("user_id", user["id"])
+            .order("updated_at", desc=True)
+            .execute()
+        )
+        return res.data or []
+    return await asyncio.to_thread(_run)
+
+
+async def create_conversation(user: dict, title: str = "New chat") -> Dict[str, Any]:
+    def _run():
+        res = (
+            _client(user)
+            .table("Conversation")
+            .insert({"user_id": user["id"], "title": title})
+            .execute()
+        )
+        return res.data[0]
+    return await asyncio.to_thread(_run)
+
+
+async def get_messages(user: dict, conversation_id: str) -> List[Dict[str, Any]]:
+    def _run():
+        res = (
+            _client(user)
+            .table("Message")
+            .select("*")
+            .eq("conversation_id", conversation_id)
+            .eq("user_id", user["id"])
+            .order("created_at")
+            .execute()
+        )
+        return res.data or []
+    return await asyncio.to_thread(_run)
+
+
+async def delete_conversation(user: dict, conversation_id: str) -> None:
+    def _run():
+        _client(user).table("Conversation").delete().eq("id", conversation_id).eq(
+            "user_id", user["id"]
+        ).execute()
+    await asyncio.to_thread(_run)
+
+
+async def add_message(
+    user: dict,
+    conversation_id: str,
+    role: str,
+    content: str,
+    charts: Optional[list] = None,
+    images: Optional[list] = None,
+    pending_transactions: Optional[list] = None,
+) -> Dict[str, Any]:
+    def _run():
+        client = _client(user)
+        record = {
+            "conversation_id": conversation_id,
+            "user_id": user["id"],
+            "role": role,
+            "content": content,
+            "charts": charts,
+            "images": images,
+            "pending_transactions": pending_transactions,
+        }
+        res = client.table("Message").insert(record).execute()
+        # Bump the conversation so it sorts to the top of the list.
+        client.table("Conversation").update(
+            {"updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", conversation_id).eq("user_id", user["id"]).execute()
+        return res.data[0]
+    return await asyncio.to_thread(_run)
+
+
+async def set_title_from_first_message(user: dict, conversation_id: str, message: str) -> None:
+    """Set the title from the first user message — only while it's still the default."""
+    title = " ".join((message or "").split())[:48].strip() or "New chat"
+    if len(message or "") > 48:
+        title += "…"
+
+    def _run():
+        _client(user).table("Conversation").update({"title": title}).eq(
+            "id", conversation_id
+        ).eq("user_id", user["id"]).eq("title", "New chat").execute()
+    await asyncio.to_thread(_run)
+
+
+def to_agent_history(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Map stored rows to the {role, content} the agent expects, capped to recent turns."""
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+        if m.get("content")
+    ]
+    return history[-MAX_HISTORY:]
