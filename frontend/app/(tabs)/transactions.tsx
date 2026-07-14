@@ -16,7 +16,7 @@ const MONTH_NAMES = [
 
 function monthLabel(dateStr: string | null): string {
   if (!dateStr) return "Unknown date";
-  const d = new Date(dateStr);
+  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? `${dateStr}T00:00:00` : dateStr);
   if (isNaN(d.getTime())) return "Unknown date";
   return `${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
 }
@@ -58,9 +58,38 @@ export default function TransactionsScreen() {
       )
       .sort((a, b) => (b.trans_date || "").localeCompare(a.trans_date || ""));
 
+    // A link means two source rows describe one real-world purchase. Collapse
+    // each linked component in the list, preferring the receipt because it has
+    // the reviewed items and tax breakdown. Neither source is deleted.
+    const byId = new Map(filtered.map((transaction) => [transaction.id, transaction]));
+    const visited = new Set<string>();
+    const visibleTransactions: TransactionListItem[] = [];
+    for (const transaction of filtered) {
+      if (visited.has(transaction.id)) continue;
+      const component: TransactionListItem[] = [];
+      const queue = [transaction.id];
+      while (queue.length) {
+        const currentId = queue.pop()!;
+        if (visited.has(currentId)) continue;
+        visited.add(currentId);
+        const current = byId.get(currentId);
+        if (!current) continue;
+        component.push(current);
+        for (const linkedId of current.linked_transaction_ids || []) {
+          if (!visited.has(linkedId) && byId.has(linkedId)) queue.push(linkedId);
+        }
+      }
+      component.sort((left, right) => {
+        const leftReceipt = left.source === "bill" ? 1 : 0;
+        const rightReceipt = right.source === "bill" ? 1 : 0;
+        return rightReceipt - leftReceipt;
+      });
+      visibleTransactions.push(component[0]);
+    }
+
     const groups: { month: string; items: TransactionListItem[] }[] = [];
     const index: Record<string, TransactionListItem[]> = {};
-    for (const t of filtered) {
+    for (const t of visibleTransactions) {
       const label = monthLabel(t.trans_date);
       if (!index[label]) {
         index[label] = [];
@@ -72,7 +101,7 @@ export default function TransactionsScreen() {
   }, [transactions, category, search]);
 
   const toggleMonth = (month: string) =>
-    setCollapsedMonths((prev) => ({ ...prev, [month]: !prev[month] }));
+    setCollapsedMonths((prev) => ({ ...prev, [month]: !(prev[month] ?? true) }));
 
   const openTransaction = (tx: TransactionListItem) => {
     router.push(`/transaction/${tx.id}`);
@@ -141,8 +170,16 @@ export default function TransactionsScreen() {
               <Text style={styles.emptyText}>No transactions match your search.</Text>
             ) : (
               groupedTransactions.map(({ month, items }) => {
-                const collapsed = collapsedMonths[month];
-                const monthTotal = items.reduce((sum, t) => sum + (t.amount ?? 0), 0);
+                // Keep the list compact on entry; users expand only the month
+                // they want to inspect.
+                const collapsed = collapsedMonths[month] ?? true;
+                // Spending is stored as a positive amount. Negative entries are
+                // credit-card payments/refunds and should not reduce the month's
+                // total cost shown in this header.
+                const monthTotal = items.reduce(
+                  (sum, t) => sum + Math.max(t.amount ?? 0, 0),
+                  0
+                );
                 return (
                   <View key={month} style={styles.monthGroup}>
                     <Pressable style={styles.monthHeader} onPress={() => toggleMonth(month)}>

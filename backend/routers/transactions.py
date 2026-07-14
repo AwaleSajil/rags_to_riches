@@ -5,6 +5,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from backend.dependencies import get_current_user, get_supabase
 from backend.schemas.transactions import (
+    ReceiptReviewInput,
     TransactionCreate,
     TransactionDetailsReplace,
     TransactionListItem,
@@ -13,6 +14,7 @@ from backend.schemas.transactions import (
     TransactionWithDetails,
 )
 from backend.services import transaction_service
+from backend.services.categories import normalize_category
 
 logger = logging.getLogger("moneyrag.routers.transactions")
 
@@ -58,6 +60,33 @@ async def get_transaction(
         raise HTTPException(status_code=500, detail=f"Failed to get transaction: {e}")
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
+
+
+@router.get("/receipt-review/{file_id}")
+async def get_receipt_review(
+    file_id: str,
+    user: dict = Depends(get_current_user),
+):
+    user = _require_user(user)
+    review = await transaction_service.get_receipt_review(user, file_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Receipt review is not available")
+    return review
+
+
+@router.post("/receipt-review/{file_id}/verify", response_model=TransactionWithDetails)
+async def verify_receipt_review(
+    file_id: str,
+    body: ReceiptReviewInput,
+    user: dict = Depends(get_current_user),
+):
+    user = _require_user(user)
+    review = body.model_dump()
+    review["date"] = review["date"].isoformat()
+    tx = await transaction_service.verify_receipt(user, file_id, review)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Receipt review is not available")
     return tx
 
 
@@ -144,7 +173,7 @@ async def create_transaction(
         "description": body.description,
         "amount": body.amount,
         "trans_date": date_str,
-        "category": body.category,
+        "category": normalize_category(body.category),
         "merchant_name": body.merchant_name or body.description,
         "source": "manual",
         "content_hash": content_hash,

@@ -2,6 +2,8 @@ import { apiJson } from "./api";
 import { createLogger } from "../lib/logger";
 import type {
   PendingTransaction,
+  ReceiptReviewDraft,
+  ReceiptReviewLineItem,
   TaxBreakdownEntry,
   TransactionListItem,
   TransactionWithDetails,
@@ -32,6 +34,33 @@ export async function listTransactions(
 
 export async function getTransaction(id: string): Promise<TransactionWithDetails> {
   return apiJson<TransactionWithDetails>(`/transactions/${id}`);
+}
+
+export async function getReceiptReview(fileId: string): Promise<ReceiptReviewDraft> {
+  return apiJson<ReceiptReviewDraft>(`/transactions/receipt-review/${fileId}`);
+}
+
+export interface ReceiptReviewPayload {
+  date: string;
+  time?: string | null;
+  merchant_name: string;
+  category: string;
+  location?: string | null;
+  total_amount?: number;
+  discount_total?: number; // order-level coupons subtracted from the basket
+  line_items: Required<ReceiptReviewLineItem>[];
+}
+
+export async function verifyReceiptReview(
+  fileId: string,
+  review: ReceiptReviewPayload
+): Promise<TransactionWithDetails> {
+  log.info("Verifying receipt review", { fileId, lineItemCount: review.line_items.length });
+  return apiJson<TransactionWithDetails>(`/transactions/receipt-review/${fileId}/verify`, {
+    method: "POST",
+    body: JSON.stringify(review),
+    timeout: 30000,
+  });
 }
 
 export interface TransactionUpdatePayload {
@@ -69,6 +98,7 @@ export interface TransactionDetailInput {
   item_description?: string | null;
   item_quantity?: number | null;
   item_unit_subtotal_price?: number | null;
+  item_savings?: number | null;
   tax_rate?: number | null;
 }
 

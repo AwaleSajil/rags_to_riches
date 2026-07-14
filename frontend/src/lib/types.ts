@@ -19,6 +19,7 @@ export interface FileItem {
   s3_key: string;
   upload_date: string;
   type: "csv" | "bill";
+  is_hidden?: boolean;
 }
 
 export interface PendingTransaction {
@@ -81,7 +82,13 @@ export interface TransactionListItem {
   subtotal: number | null;
   tax_total: number | null;
   tax_breakdown: TaxBreakdownEntry[] | null;
+  discount_total?: number | null; // order-level coupons subtracted from the basket
+  savings_total?: number | null; // total saved (item markdowns + coupons), display only
   source: string | null;
+  source_csv_id?: string | null;
+  source_bill_file_id?: string | null;
+  enriched_info?: string | null;
+  linked_transaction_ids?: string[];
   created_at: string | null;
 }
 
@@ -89,8 +96,9 @@ export interface TransactionDetailItem {
   id: string;
   item_description: string | null;
   item_quantity: number | null;
-  item_unit_subtotal_price: number | null; // pre-tax unit price
+  item_unit_subtotal_price: number | null; // pre-tax unit price actually paid (net of markdown)
   item_subtotal_price: number | null; // pre-tax line total (qty x unit)
+  item_savings?: number | null; // how much this line was marked down, display only
   tax_amount: number | null; // tax for this item
   taxable: boolean | null;
   tax_rate: number | null;
@@ -104,4 +112,32 @@ export interface TransactionWithDetails extends TransactionListItem {
   source_csv_id?: string | null;
   source_bill_file_id?: string | null;
   details: TransactionDetailItem[];
+}
+
+export interface ReceiptReviewLineItem {
+  item_description?: string;
+  item_quantity?: number;
+  item_unit_price?: number; // net price actually paid per unit
+  item_savings?: number; // markdown on this line, display only
+  tax_rate?: number;
+}
+
+export interface ReceiptDiscount {
+  label?: string;
+  amount?: number;
+}
+
+export interface ReceiptReviewDraft {
+  file_id: string;
+  filename: string;
+  extracted: {
+    date?: string;
+    time?: string | null;
+    merchant_name?: string;
+    category?: string;
+    location?: string | null;
+    total_amount?: number | string | null;
+    discounts?: ReceiptDiscount[]; // order-level coupons subtracted from the basket
+    line_items?: ReceiptReviewLineItem[];
+  };
 }

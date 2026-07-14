@@ -6,6 +6,7 @@ import pandas as pd
 import sqlite3
 import shutil
 import tempfile
+import re
 from typing import List, Optional
 from dataclasses import dataclass
 
@@ -121,10 +122,77 @@ class MoneyRAG:
             q = q.eq(k, v)
         q.execute()
 
+    def _link_new_csv_transactions(self, csv_id: str):
+        """Link, but never merge/delete, high-confidence matches from another
+        CSV or a receipt. This intentionally skips rows from the CSV currently
+        being ingested so identical purchases inside one statement remain distinct.
+        """
+        if not csv_id:
+            return
+        columns = "id,trans_date,amount,merchant_name,description,enriched_info,source,source_csv_id"
+        rows = self._db_select("Transaction", columns, {"user_id": self.user_id})
+        new_rows = [row for row in rows if row.get("source_csv_id") == csv_id]
+
+        def merchant_key(row):
+            value = str(row.get("merchant_name") or row.get("description") or "").lower()
+            return re.sub(r"[^a-z]", "", value)
+
+        def matches(left, right):
+            left_merchant, right_merchant = merchant_key(left), merchant_key(right)
+            if len(left_merchant) < 4 or len(right_merchant) < 4:
+                return False
+            # Receipt OCR often drops store numbers/suffixes, so allow one
+            # normalized merchant value to contain the other.
+            if left_merchant not in right_merchant and right_merchant not in left_merchant:
+                return False
+            try:
+                date_gap = abs((pd.to_datetime(left["trans_date"]).date() - pd.to_datetime(right["trans_date"]).date()).days)
+                amount_gap = abs(float(left["amount"]) - float(right["amount"]))
+            except (TypeError, ValueError):
+                return False
+            # Bank posting dates may differ by one day; allow small receipt/bank
+            # rounding differences but avoid merging independently made purchases.
+            return date_gap <= 1 and amount_gap <= 0.10
+
+        links = []
+        for row in new_rows:
+            for candidate in rows:
+                if candidate["id"] == row["id"] or candidate.get("source_csv_id") == csv_id:
+                    continue
+                if candidate.get("source") not in ("csv", "bill") or not matches(row, candidate):
+                    continue
+                left_id, right_id = sorted((str(row["id"]), str(candidate["id"])))
+                links.append({
+                    "user_id": self.user_id,
+                    "transaction_id": left_id,
+                    "linked_transaction_id": right_id,
+                    "match_type": "csv_receipt" if candidate.get("source") == "bill" else "csv_csv",
+                    "confidence": 1,
+                })
+                # CSV enrichment contains a useful merchant description. When
+                # it is linked to a receipt that has not been deep-enriched,
+                # carry that description to the receipt shown in the UI.
+                if (
+                    candidate.get("source") == "bill"
+                    and not candidate.get("enriched_info")
+                    and row.get("enriched_info")
+                ):
+                    self._db_update(
+                        "Transaction", {"enriched_info": row["enriched_info"]}, {"id": candidate["id"]}
+                    )
+        if links:
+            self._db_upsert(
+                "TransactionLink", links,
+                conflict_key="user_id,transaction_id,linked_transaction_id",
+            )
+
     async def setup_session(self, uploaded_files: List[dict]):
-        """Ingests CSVs and Bills, then sets up DBs."""
+        """Ingest CSVs and extract receipt drafts for the user to review."""
         # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
         all_duplicates = []
+        receipt_review_file_ids = []
+        has_committed_transactions = False
+        committed_csv_ids = []
         for file_info in uploaded_files:
             file_path = file_info["path"]
             file_name = os.path.basename(file_path)
@@ -132,21 +200,39 @@ class MoneyRAG:
             try:
                 if ext in ['png', 'jpg', 'jpeg']:
                     dups = await self._ingest_bill(file_path, file_info.get("file_id"))
+                    if file_info.get("file_id"):
+                        receipt_review_file_ids.append(file_info["file_id"])
                 else:
                     dups = await self._ingest_csv(file_path, file_info.get("file_id"))
+                    has_committed_transactions = True
+                    if file_info.get("file_id"):
+                        committed_csv_ids.append(str(file_info["file_id"]))
                 if dups:
                     all_duplicates.extend(dups)
             except Exception as e:
                 raise RuntimeError(f"Failed to ingest '{file_name}': {e}") from e
 
-        try:
-            self._emit_progress("embedding", 0, 0, "Syncing to vector database...")
-            self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
-            self.vector_store_client = self._sync_to_vectordb()
-            self._emit_progress("embedding", 1, 1, "Vector sync complete")
-        except Exception as e:
-            raise RuntimeError(f"Failed to sync to vector store: {e}") from e
-        return all_duplicates
+        # Receipt data is deliberately not indexed until the user reviews it.
+        # A normal CSV upload indexes only the rows from that file. An empty
+        # file list is used by the settings flow to rebuild all vectors after
+        # an embedding-model change.
+        if committed_csv_ids:
+            try:
+                self._emit_progress("embedding", 0, 0, "Indexing newly uploaded transactions...")
+                self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
+                self.vector_store_client = self._sync_csv_files_to_vectordb(committed_csv_ids)
+                self._emit_progress("embedding", 1, 1, "New transaction vectors complete")
+            except Exception as e:
+                raise RuntimeError(f"Failed to sync to vector store: {e}") from e
+        elif has_committed_transactions or not uploaded_files:
+            try:
+                self._emit_progress("embedding", 0, 0, "Rebuilding vector database...")
+                self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
+                self.vector_store_client = self._sync_to_vectordb()
+                self._emit_progress("embedding", 1, 1, "Vector rebuild complete")
+            except Exception as e:
+                raise RuntimeError(f"Failed to sync to vector store: {e}") from e
+        return all_duplicates, receipt_review_file_ids
 
     def _emit_progress(self, stage: str, total: int, done: int, detail: str = ""):
         """Emit a progress update as a JSON line to stderr for the parent process to parse."""
@@ -359,7 +445,9 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             amount_str = str(round(float(row['amount']), 2))
             words = str(row.get('merchant_name', row['description'])).lower().strip().split()
             merch = ''.join(c for c in (words[0] if words else "") if c.isalnum())
-            return f"{date_str}{amount_str}{merch}"
+            # The source file id makes every CSV row durable. A later CSV export
+            # can be linked to it, but must never overwrite or remove it.
+            return f"{csv_id or filename}|{date_str}|{amount_str}|{merch}"
 
         # An occurrence counter (in file order) distinguishes genuinely-distinct rows
         # that share date+amount+merchant (e.g. two $5 coffees the same day), while
@@ -404,11 +492,17 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             saved_rows += len(batch)
             self._emit_progress("saving", total_rows, saved_rows)
 
+        try:
+            self._link_new_csv_transactions(csv_id)
+        except Exception as e:
+            # Linking is supplementary; never reject a valid CSV upload if the
+            # migration has not yet been applied or matching fails.
+            print(f"   ⚠️ Transaction linking skipped: {e}")
+
         return duplicates
 
     async def _ingest_bill(self, file_path, file_id=None):
         import base64
-        import hashlib
         import json
         from langchain_core.messages import HumanMessage
         
@@ -423,13 +517,15 @@ Return ONLY a valid JSON array with one object per description, in the same orde
 
         schema = {
             "date": "YYYY-MM-DD",
+            "time": "HH:MM in 24-hour local receipt time, or null if not visible",
             "merchant_name": "Merchant",
-            "category": "Dining",
+            "category": "One of: Groceries, Dining, Shopping, Transportation, Utilities, Healthcare, Entertainment, Travel, Personal Care, or Uncategorized",
             "location": "Store address or city/state if visible on the receipt, else null",
             "subtotal": 100.00,
             "tax_lines": [{"label": "Sales Tax", "rate": 8.25, "amount": 8.25}],
             "total_amount": 108.25,
-            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "item_total_price": 10.0, "tax_rate": 8.25}]
+            "discounts": [{"label": "Coupon", "amount": 5.00}],
+            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "item_savings": 0.0, "tax_rate": 8.25}]
         }
 
         # Vision extraction — single LLM call to extract all structured data
@@ -437,12 +533,32 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         prompt = (
             "Extract structured data from this receipt/bill. Return strictly valid JSON matching this schema: "
             f"{json.dumps(schema)}.\n"
-            "- 'subtotal' is the pre-tax sum; 'total_amount' is the final amount charged.\n"
+            "- 'total_amount' is the final amount actually charged (the balance/total paid).\n"
+            "- 'subtotal' is the pre-tax sum of what was paid, AFTER any item markdowns.\n"
+            "- Extract the receipt's purchase time when shown, normalized to 24-hour HH:MM. "
+            "Use null when the time is not visible.\n"
+            "- Choose category only from the category list in the schema; use Uncategorized if unsure.\n"
             "- 'tax_lines': one entry per DISTINCT tax rate shown. Receipts may have several "
             "(e.g. 0% for groceries and 8.25% for general goods). Use [] if no tax is shown.\n"
             "- Different item TYPES can carry different tax rates (e.g. groceries are often "
             "exempt at 0% while general goods are taxed, and this varies by locale). Set each "
-            "line item's 'tax_rate' to the percentage applied to THAT item (0 if not taxed)."
+            "line item's 'tax_rate' to the percentage applied to THAT item (0 if not taxed).\n"
+            "DISCOUNTS AND SAVINGS — read carefully, they are commonly misread:\n"
+            "- 'item_unit_price' MUST be the price ACTUALLY PAID per unit. When an item shows a "
+            "markdown (a 'SAVINGS x.xx-' line and/or a 'PRICE YOU PAY' amount below its regular "
+            "price), use the reduced/'PRICE YOU PAY' figure, NOT the higher struck/regular price.\n"
+            "- 'item_savings': when a line shows a markdown — a 'SAVINGS x.xx-' amount printed under "
+            "it and/or a struck regular price above its 'PRICE YOU PAY' — set item_savings to that "
+            "printed SAVINGS figure as a POSITIVE number (e.g. 'SAVINGS 1.95-' -> 1.95). Copy the "
+            "number shown on the receipt; do not compute it. Use 0 only when no savings/markdown is "
+            "printed for that line. It is informational only — the price is already net, so never "
+            "subtract item_savings from any total.\n"
+            "- 'discounts': ONLY order-level coupons that reduce the whole basket (e.g. '$5 off $50', "
+            "a store coupon applied at the end). These ARE subtracted from the total. Use [] if none. "
+            "Do NOT put per-item markdowns here.\n"
+            "- IGNORE the summary recap block ('SAVINGS SUMMARY', 'Card Savings', 'Your Total "
+            "Savings', 'CARD SAVINGS', loyalty points). It only restates savings already applied to "
+            "the item prices — it is NOT a line item, tax, or discount and must never be subtracted."
         )
         message = HumanMessage(
             content=[
@@ -463,209 +579,26 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         # Save the raw OCR JSON back to the BillFile record
         if file_id:
             try:
-                self._db_update("BillFile", {"raw_ocr_string": json.dumps(extracted)}, {"id": file_id})
+                import re
+                extension = os.path.splitext(filename)[1] or ".jpg"
+                merchant_slug = re.sub(
+                    r"[^A-Za-z0-9]+", "_", str(extracted.get("merchant_name") or "receipt")
+                ).strip("_") or "receipt"
+                date_slug = str(extracted.get("date") or "nodate").replace("-", "")
+                time_slug = re.sub(r"[^0-9]", "", str(extracted.get("time") or ""))
+                friendly_name = f"{merchant_slug}_{date_slug}{f'_{time_slug}' if time_slug else ''}{extension}"
+                # Only the display name changes; s3_key remains stable for previews.
+                self._db_update("BillFile", {
+                    "raw_ocr_string": json.dumps(extracted),
+                    "filename": friendly_name,
+                }, {"id": file_id})
             except Exception as e:
-                print(f"   ⚠️ Failed to save raw_ocr_string to BillFile: {e}")
-        
-        # Enrich merchant + all line items in a single LLM call
-        raw_merchant = extracted.get('merchant_name', 'Unknown')
-        line_items = extracted.get('line_items', [])
-        all_names = [raw_merchant] + [item.get('item_description', '') for item in line_items]
-        total_to_enrich = len(all_names)
-        self._emit_progress("enriching", total_to_enrich, 0, f"Enriching {total_to_enrich} items...")
+                print(f"   ⚠️ Failed to save OCR receipt data: {e}")
 
-        # Deep enrichment: web search for richer context
-        search_context = ""
-        if self.deep_enrichment:
-            search_results = {}
-            for name in all_names:
-                try:
-                    sr = await self.search_tool.ainvoke(f"What type of product or business is '{name}'?")
-                    search_results[name] = sr[:200]
-                except Exception:
-                    search_results[name] = ""
-            if any(search_results.values()):
-                search_context = "\n\nWeb search context:\n" + "\n".join(
-                    f"- {n}: {s}" for n, s in search_results.items() if s
-                )
-
-        enrich_prompt = ChatPromptTemplate.from_template("""
-You are a financial data assistant. For each item description below, provide a clean name and a one-sentence description.
-The first item is the merchant/store. The rest are line items from a receipt.
-
-Item descriptions:
-{descriptions_json}
-
-Return ONLY a valid JSON array with one object per item, in the same order:
-[
-  {{"description": "<original>", "clean_name": "<clean 1-4 word name>", "enriched_info": "<one sentence>"}},
-  ...
-]
-""")
-        enrich_chain = enrich_prompt | self.llm | JsonOutputParser()
-        
-        try:
-            enriched_list = await enrich_chain.ainvoke({"descriptions_json": json.dumps(all_names) + search_context})
-            # First result is the merchant
-            if isinstance(enriched_list, list) and len(enriched_list) > 0:
-                merchant_info = enriched_list[0]
-                clean_merchant = merchant_info.get("clean_name", raw_merchant)
-                enriched_info = merchant_info.get("enriched_info", "")
-                # Remaining results are line items
-                for idx, item in enumerate(line_items):
-                    if idx + 1 < len(enriched_list):
-                        item['enriched_info'] = enriched_list[idx + 1].get("enriched_info", "")
-                    else:
-                        item['enriched_info'] = ""
-            else:
-                clean_merchant = raw_merchant
-                enriched_info = ""
-        except Exception as e:
-            print(f"   ⚠️ Batch enrichment failed: {e}")
-            clean_merchant = raw_merchant
-            enriched_info = ""
-            for item in line_items:
-                item['enriched_info'] = ""
-
-        self._emit_progress("enriching", total_to_enrich, total_to_enrich, "Enrichment complete")
-
-        # Calculate content_hash
-        date_str = str(extracted.get('date', '')).strip()
-        amount_str = str(round(float(extracted.get('total_amount', 0)), 2))
-        merch_hash = str(clean_merchant).lower().strip().split()[0] if clean_merchant else ""
-        merch_hash = ''.join(c for c in merch_hash if c.isalnum())
-        # Fold in a signature of the line items so two DIFFERENT receipts that happen
-        # to share date+amount+merchant don't collide; re-uploading the same photo
-        # yields the same items, so it still dedups correctly.
-        items_sig = "|".join(sorted(
-            str(it.get('item_description', '')).strip().lower() for it in line_items
-        ))
-        hash_input = f"{date_str}{amount_str}{merch_hash}{items_sig}"
-        content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
-        
-        # Rename the stored bill to a friendly {merchant}_{yyyymmdd} display label.
-        # (Only the BillFile.filename shown in the UI — the storage key is left stable.)
-        if file_id:
-            import re
-            ext = os.path.splitext(filename)[1] or ".jpg"
-            slug = re.sub(r"[^A-Za-z0-9]+", "_", str(clean_merchant or "receipt")).strip("_") or "receipt"
-            ymd = date_str.replace("-", "") if date_str else "nodate"
-            try:
-                self._db_update("BillFile", {"filename": f"{slug}_{ymd}{ext}"}, {"id": file_id})
-            except Exception as e:
-                print(f"   ⚠️ Failed to rename BillFile: {e}")
-
-        # --- Tax (bill-level, supports multiple rates) ---
-        total = abs(float(extracted.get('total_amount', 0) or 0))
-        try:
-            subtotal = float(extracted['subtotal']) if extracted.get('subtotal') is not None else None
-        except (TypeError, ValueError):
-            subtotal = None
-
-        tax_breakdown = []
-        for t in (extracted.get('tax_lines') or []):
-            try:
-                tax_breakdown.append({
-                    "label": str(t.get('label', 'Tax')),
-                    "rate": float(t['rate']) if t.get('rate') is not None else None,
-                    "amount": round(float(t.get('amount', 0) or 0), 2),
-                })
-            except (TypeError, ValueError):
-                continue
-        tax_total = round(sum(t['amount'] for t in tax_breakdown), 2) if tax_breakdown else None
-        # If no explicit tax lines but we have a subtotal, derive tax from the gap.
-        if tax_total is None and subtotal is not None:
-            derived = round(total - subtotal, 2)
-            tax_total = derived if derived > 0.001 else None
-
-        # Reconcile subtotal + tax against the total; log (don't fail) on mismatch.
-        if subtotal is not None and tax_total is not None:
-            if abs(round(subtotal + tax_total, 2) - total) > 0.02:
-                print(f"   ⚠️ Tax mismatch: subtotal {subtotal} + tax {tax_total} != total {total}")
-
-        # Build transaction record
-        tx_record = {
-            "user_id": self.user_id,
-            "trans_date": date_str,
-            "amount": total,
-            "description": raw_merchant,
-            "merchant_name": clean_merchant,
-            "category": extracted.get('category', 'Uncategorized'),
-            "content_hash": content_hash,
-            "source": 'bill',
-            "enriched_info": enriched_info,
-            "location": extracted.get('location') or None,
-            "subtotal": subtotal,
-            "tax_total": tax_total,
-            "tax_breakdown": tax_breakdown or None
-        }
-        if file_id:
-            tx_record["source_bill_file_id"] = file_id
-            
-        # Check duplicate before upserting
-        existing_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
-        is_duplicate = len(existing_rows) > 0
-        duplicates = [{"date": tx_record['trans_date'], "merchant": tx_record['merchant_name'], "amount": tx_record['amount']}] if is_duplicate else []
-
-        # Save transaction
-        self._emit_progress("saving", 1, 0, "Saving transaction...")
-        try:
-            self._db_upsert("Transaction", [tx_record], conflict_key="user_id,content_hash")
-        except Exception as e:
-            tx_record.pop('merchant_name', None)
-            tx_record.pop('content_hash', None)
-            tx_record.pop('source', None)
-            try:
-                self._db_insert("Transaction", [tx_record])
-            except Exception as e2:
-                print(f"   ❌ Fallback insert failed: {e2}")
-
-        # Get the transaction ID to link details
-        try:
-            fetch_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
-            tx_id = fetch_rows[0]['id'] if fetch_rows else None
-        except Exception:
-            tx_id = None
-
-        if tx_id and line_items:
-            details = []
-            for item in line_items:
-                try:
-                    item_rate = float(item['tax_rate']) if item.get('tax_rate') is not None else None
-                except (TypeError, ValueError):
-                    item_rate = None
-                taxable = (item_rate is not None and item_rate > 0)
-                # The LLM reports printed (pre-tax) unit/line prices; those are the
-                # *subtotal* columns. Derive per-item tax from the rate, then the
-                # post-tax line total.
-                try:
-                    line_subtotal = float(item.get('item_total_price', 0) or 0)
-                except (TypeError, ValueError):
-                    line_subtotal = 0.0
-                unit_subtotal = item.get('item_unit_price', item.get('item_total_price', 0))
-                tax_amount = round(line_subtotal * item_rate / 100.0, 2) if taxable else 0.0
-                item_total = round(line_subtotal + tax_amount, 2)
-                details.append({
-                    "transaction_id": tx_id,
-                    "user_id": self.user_id,
-                    "bill_file_id": file_id,
-                    "item_description": item.get('item_description', ''),
-                    "item_quantity": item.get('item_quantity', 1),
-                    "item_unit_subtotal_price": unit_subtotal,
-                    "item_subtotal_price": line_subtotal,
-                    "tax_amount": tax_amount,
-                    "tax_rate": item_rate,
-                    "taxable": taxable,
-                    "item_total_price": item_total,
-                    "enriched_info": item.get('enriched_info', '')
-                })
-            try:
-                self._db_insert("TransactionDetail", details)
-            except Exception as e:
-                print(f"   ⚠️ Failed to insert details (table might not exist): {e}")
-
-        self._emit_progress("saving", 1, 1, "Complete")
-        return duplicates
+        # Do not create a transaction from OCR automatically. The mobile app
+        # presents this draft to the user, who may correct it before verifying.
+        self._emit_progress("review", 1, 1, "Receipt extracted — waiting for review")
+        return []
 
     def _sync_to_vectordb(self):
         # Fetch only THIS USER'S transactions to sync into VectorDB
@@ -686,6 +619,24 @@ Return ONLY a valid JSON array with one object per item, in the same order:
 
         vdb = get_vector_client()
         return vdb.sync_transactions(df, details_df, self.user_id, self.embeddings, progress_callback=_progress)
+
+    def _sync_csv_files_to_vectordb(self, csv_ids: List[str]):
+        """Incrementally embed only transactions belonging to newly uploaded CSVs."""
+        rows = self._db_select("Transaction", "*", {"user_id": self.user_id})
+        csv_id_set = {str(csv_id) for csv_id in csv_ids}
+        new_rows = [row for row in rows if str(row.get("source_csv_id") or "") in csv_id_set]
+        df = pd.DataFrame(new_rows)
+        if df.empty:
+            return None
+
+        def _progress(detail, total, done):
+            self._emit_progress("embedding", total, done, detail)
+
+        # CSV transactions do not have receipt line items, so there is no need
+        # to fetch or re-embed the user's entire TransactionDetail table.
+        return get_vector_client().sync_transactions(
+            df, pd.DataFrame(), self.user_id, self.embeddings, progress_callback=_progress
+        )
 
     async def delete_file(self, file_id: str, file_type: str = 'csv'):
         """Force delete a file and all its transactions from the database and vector store."""

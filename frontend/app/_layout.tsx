@@ -58,6 +58,16 @@ function RootLayoutNav() {
           headerTitleStyle: { fontWeight: "700" },
         }}
       />
+      <Stack.Screen
+        name="receipt-review/[fileId]"
+        options={{
+          headerShown: true,
+          title: "Review receipt",
+          headerStyle: { backgroundColor: colors.surface },
+          headerTintColor: colors.text,
+          headerTitleStyle: { fontWeight: "700" },
+        }}
+      />
     </Stack>
   );
 }

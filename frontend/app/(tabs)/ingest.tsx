@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View, ScrollView, Platform, Pressable } from "react-native";
 import { Text, Button, Snackbar, ProgressBar, Badge, Searchbar, Chip } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -16,6 +16,7 @@ import { useFiles } from "../../src/hooks/useFiles";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
 import type { FileItem } from "../../src/lib/types";
+import { useRouter } from "expo-router";
 
 const log = createLogger("IngestScreen");
 
@@ -34,24 +35,38 @@ function monthLabel(dateStr?: string): string {
 }
 
 export default function IngestScreen() {
+  const router = useRouter();
   const {
     files,
     isLoading,
     isUploading,
     isIngesting,
     isDeleting,
+    visibilityFileId,
     error,
     duplicates,
+    receiptReviewFileIds,
     ingestionProgress,
     uploadFiles,
     deleteFile,
+    toggleFileVisibility,
     clearDuplicates,
   } = useFiles();
+
+  useEffect(() => {
+    if (!receiptReviewFileIds.length) return;
+    const [fileId, ...remaining] = receiptReviewFileIds;
+    router.push({
+      pathname: "/receipt-review/[fileId]",
+      params: { fileId, remaining: remaining.join(",") },
+    });
+  }, [receiptReviewFileIds, router]);
 
   const [pickedFiles, setPickedFiles] = useState<
     { uri: string; name: string; type: string }[]
   >([]);
   const [deleteTarget, setDeleteTarget] = useState<FileItem | null>(null);
+  const deleteInFlight = useRef(false);
   const [previewTarget, setPreviewTarget] = useState<FileItem | null>(null);
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<FileFilter>("all");
@@ -149,6 +164,11 @@ export default function IngestScreen() {
     setPickedFiles((prev) => prev.filter((_, i) => i !== index));
   };
 
+  const handleReviewReceipt = (file: FileItem) => {
+    setPreviewTarget(null);
+    router.push({ pathname: "/receipt-review/[fileId]", params: { fileId: file.id } });
+  };
+
   const handleIngest = async () => {
     if (pickedFiles.length === 0) return;
     log.info("Ingest button pressed", {
@@ -171,22 +191,29 @@ export default function IngestScreen() {
   };
 
   const handleDeleteConfirm = async () => {
-    if (!deleteTarget) return;
-    log.info("Delete confirmed", {
-      fileId: deleteTarget.id,
-      filename: deleteTarget.filename,
-      type: deleteTarget.type,
-    });
-    const ok = await deleteFile(deleteTarget.id, deleteTarget.type);
-    if (ok) {
-      log.info("File deleted successfully", { filename: deleteTarget.filename });
-      setSnackbar({
-        visible: true,
-        message: `Deleted ${deleteTarget.filename}`,
-        error: false,
-      });
-    }
+    if (!deleteTarget || deleteInFlight.current) return;
+    deleteInFlight.current = true;
+    const target = deleteTarget;
+    // Close immediately so a double tap cannot issue a second DELETE request.
     setDeleteTarget(null);
+    log.info("Delete confirmed", {
+      fileId: target.id,
+      filename: target.filename,
+      type: target.type,
+    });
+    try {
+      const ok = await deleteFile(target.id, target.type);
+      if (ok) {
+        log.info("File deleted successfully", { filename: target.filename });
+        setSnackbar({
+          visible: true,
+          message: `Deleted ${target.filename}`,
+          error: false,
+        });
+      }
+    } finally {
+      deleteInFlight.current = false;
+    }
   };
 
   if (isLoading) {
@@ -366,6 +393,8 @@ export default function IngestScreen() {
                           file={file}
                           onDelete={setDeleteTarget}
                           onPress={setPreviewTarget}
+                          onToggleVisibility={toggleFileVisibility}
+                          isTogglingVisibility={visibilityFileId === file.id}
                         />
                       ))}
                   </View>
@@ -380,12 +409,14 @@ export default function IngestScreen() {
       <FilePreviewModal
         file={previewTarget}
         onClose={() => setPreviewTarget(null)}
+        onReviewReceipt={handleReviewReceipt}
       />
 
       {/* Delete Confirmation */}
       <DeleteConfirmModal
         visible={!!deleteTarget}
         filename={deleteTarget?.filename || ""}
+        loading={isDeleting}
         onConfirm={handleDeleteConfirm}
         onDismiss={() => setDeleteTarget(null)}
       />

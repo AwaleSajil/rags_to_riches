@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   StyleSheet,
   View,
@@ -32,13 +32,17 @@ import type { TransactionWithDetails, TransactionDetailItem } from "../../src/li
 
 const log = createLogger("TransactionDetail");
 
+// Deep enrichment can take up to ~a minute (a sequential web search per line
+// item + an LLM pass), so poll well past that before giving up.
+const MAX_ENRICHMENT_POLLS = 12;
+
 function money(n: number | null | undefined): string {
   return `$${(n ?? 0).toFixed(2)}`;
 }
 
 function formatDate(dateStr: string | null): string {
   if (!dateStr) return "—";
-  const d = new Date(dateStr);
+  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? `${dateStr}T00:00:00` : dateStr);
   if (isNaN(d.getTime())) return dateStr;
   return d.toLocaleDateString(undefined, {
     weekday: "short",
@@ -78,6 +82,7 @@ interface DetailFormState {
   item_description: string;
   item_quantity: string;
   item_unit_subtotal_price: string;
+  item_savings: string;
   tax_rate: string;
 }
 
@@ -91,6 +96,7 @@ function toDetailForm(d: TransactionDetailItem): DetailFormState {
     item_description: d.item_description ?? "",
     item_quantity: numStr(d.item_quantity),
     item_unit_subtotal_price: numStr(d.item_unit_subtotal_price),
+    item_savings: numStr(d.item_savings),
     tax_rate: numStr(d.tax_rate),
   };
 }
@@ -100,7 +106,7 @@ function detailSnapshot(rows: DetailFormState[]): string {
   return rows
     .map(
       (r) =>
-        `${r.item_description.trim()}|${r.item_quantity.trim()}|${r.item_unit_subtotal_price.trim()}|${r.tax_rate.trim()}`
+        `${r.item_description.trim()}|${r.item_quantity.trim()}|${r.item_unit_subtotal_price.trim()}|${r.item_savings.trim()}|${r.tax_rate.trim()}`
     )
     .join("~");
 }
@@ -138,6 +144,12 @@ function LineItem({ item }: { item: TransactionDetailItem }) {
             {money(item.item_subtotal_price)} + {money(item.tax_amount)} tax
           </Text>
         )}
+        {(item.item_savings ?? 0) > 0 && (
+          <Text style={styles.lineItemSavings}>Saved {money(item.item_savings)}</Text>
+        )}
+        {item.enriched_info ? (
+          <Text style={styles.enrichedInfo}>{item.enriched_info}</Text>
+        ) : null}
       </View>
       <View style={styles.lineItemRight}>
         <Text style={styles.lineItemTotal}>{money(item.item_total_price)}</Text>
@@ -168,6 +180,7 @@ export default function TransactionDetailScreen() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
+  const [enrichmentRefreshes, setEnrichmentRefreshes] = useState(0);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -190,6 +203,26 @@ export default function TransactionDetailScreen() {
       if (!isEditing) load();
     }, [load, isEditing])
   );
+
+  // Deep enrichment runs after receipt verification as a background task that
+  // web-searches the merchant and every line item *sequentially* before an LLM
+  // pass, so it can take up to a minute for a long receipt. Poll with backoff
+  // over a wide-enough window (instead of a fixed 10s) so the descriptions
+  // appear without the user having to leave and re-open the screen. Stops the
+  // moment everything is enriched.
+  useEffect(() => {
+    if (!transaction || isEditing || transaction.source !== "bill") return;
+    if (enrichmentRefreshes >= MAX_ENRICHMENT_POLLS) return;
+    const complete = Boolean(transaction.enriched_info) && transaction.details.every((d) => Boolean(d.enriched_info));
+    if (complete) return;
+    // 2.5s, 5s, 7.5s, then 10s each — ~100s total across MAX_ENRICHMENT_POLLS.
+    const delay = Math.min(2500 + enrichmentRefreshes * 2500, 10000);
+    const timer = setTimeout(() => {
+      setEnrichmentRefreshes((count) => count + 1);
+      load();
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [transaction, isEditing, enrichmentRefreshes, load]);
 
   const startEdit = () => {
     if (!transaction) return;
@@ -222,6 +255,7 @@ export default function TransactionDetailScreen() {
         item_description: "",
         item_quantity: "1",
         item_unit_subtotal_price: "",
+        item_savings: "",
         tax_rate: "",
       },
     ]);
@@ -292,6 +326,7 @@ export default function TransactionDetailScreen() {
         for (const [field, label] of [
           ["item_quantity", "Quantity"],
           ["item_unit_subtotal_price", "Unit price"],
+          ["item_savings", "Savings"],
           ["tax_rate", "Tax rate"],
         ] as const) {
           const raw = r[field].trim();
@@ -310,6 +345,7 @@ export default function TransactionDetailScreen() {
         item_description: r.item_description.trim(),
         item_quantity: numOrNull(r.item_quantity),
         item_unit_subtotal_price: numOrNull(r.item_unit_subtotal_price),
+        item_savings: numOrNull(r.item_savings),
         tax_rate: numOrNull(r.tax_rate) ?? 0,
       }));
     }
@@ -376,22 +412,28 @@ export default function TransactionDetailScreen() {
   const hasTax =
     tx.subtotal != null ||
     tx.tax_total != null ||
-    (tx.tax_breakdown != null && tx.tax_breakdown.length > 0);
+    (tx.tax_breakdown != null && tx.tax_breakdown.length > 0) ||
+    (tx.discount_total ?? 0) > 0 ||
+    (tx.savings_total ?? 0) > 0;
 
   // -------- Edit mode --------
   if (isEditing && form) {
     const hasLineItems = detailForms.length > 0;
+    // An order-level discount lives on the header (not the line items) and can't
+    // be edited here; carry it through so the preview total matches what the
+    // server will store (subtotal + tax - discount).
+    const orderDiscount = tx.discount_total ?? 0;
     // Header totals are derived from the line items when they exist.
     const liveTotals = detailForms.reduce(
       (acc, r) => {
         const t = computeRowTotals(r);
         acc.subtotal += t.subtotal;
         acc.tax += t.tax;
-        acc.total += t.total;
         return acc;
       },
-      { subtotal: 0, tax: 0, total: 0 }
+      { subtotal: 0, tax: 0 }
     );
+    const liveTotal = liveTotals.subtotal + liveTotals.tax - orderDiscount;
     return (
       <KeyboardAvoidingView
         style={styles.container}
@@ -542,6 +584,15 @@ export default function TransactionDetailScreen() {
                         style={styles.detailNumInput}
                         dense
                       />
+                      <TextInput
+                        mode="outlined"
+                        label="Saved $"
+                        value={row.item_savings}
+                        onChangeText={(v) => setDetailField(row.key, "item_savings", v)}
+                        keyboardType="decimal-pad"
+                        style={styles.detailNumInput}
+                        dense
+                      />
                     </View>
                     <Text style={styles.detailComputed}>
                       {money(totals.subtotal)}
@@ -564,12 +615,20 @@ export default function TransactionDetailScreen() {
                   <Text style={styles.totalsLabel}>Tax</Text>
                   <Text style={styles.totalsValue}>{money(liveTotals.tax)}</Text>
                 </View>
+                {orderDiscount > 0 && (
+                  <View style={styles.totalsRow}>
+                    <Text style={styles.totalsLabel}>Discount</Text>
+                    <Text style={styles.totalsValue}>−{money(orderDiscount)}</Text>
+                  </View>
+                )}
                 <View style={styles.totalsRow}>
                   <Text style={styles.totalsLabelBold}>Total</Text>
-                  <Text style={styles.totalsValueBold}>{money(liveTotals.total)}</Text>
+                  <Text style={styles.totalsValueBold}>{money(liveTotal)}</Text>
                 </View>
                 <Text style={styles.derivedNote}>
-                  Header subtotal, tax, and total are computed from these line items.
+                  {orderDiscount > 0
+                    ? "Header subtotal and tax come from these line items; the order discount is applied to the total."
+                    : "Header subtotal, tax, and total are computed from these line items."}
                 </Text>
               </>
             )}
@@ -652,6 +711,9 @@ export default function TransactionDetailScreen() {
               <Text style={styles.location}>{tx.location}</Text>
             </View>
           ) : null}
+          {tx.enriched_info ? (
+            <Text style={styles.merchantInfo}>{tx.enriched_info}</Text>
+          ) : null}
         </GlassCard>
 
         {/* Actions */}
@@ -702,11 +764,23 @@ export default function TransactionDetailScreen() {
                 <Text style={styles.totalsValue}>{money(tx.tax_total)}</Text>
               </View>
             )}
+            {(tx.discount_total ?? 0) > 0 && (
+              <View style={styles.totalsRow}>
+                <Text style={styles.totalsLabel}>Discount</Text>
+                <Text style={styles.totalsValue}>−{money(tx.discount_total)}</Text>
+              </View>
+            )}
             <Divider style={styles.divider} />
             <View style={styles.totalsRow}>
               <Text style={styles.totalsLabelBold}>Total</Text>
               <Text style={styles.totalsValueBold}>{money(tx.amount)}</Text>
             </View>
+            {(tx.savings_total ?? 0) > 0 && (
+              <View style={styles.totalsRow}>
+                <Text style={styles.savingsLabel}>You saved</Text>
+                <Text style={styles.savingsValue}>{money(tx.savings_total)}</Text>
+              </View>
+            )}
           </GlassCard>
         )}
 
@@ -845,6 +919,12 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     textAlign: "center",
   },
+  merchantInfo: {
+    ...typography.body2,
+    color: colors.textSecondary,
+    textAlign: "center",
+    marginTop: spacing.md,
+  },
   topActions: {
     flexDirection: "row",
     gap: spacing.md,
@@ -913,6 +993,28 @@ const styles = StyleSheet.create({
     ...typography.caption,
     color: colors.textTertiary,
     marginTop: 2,
+  },
+  lineItemSavings: {
+    ...typography.caption,
+    color: colors.success,
+    marginTop: 2,
+  },
+  savingsLabel: {
+    ...typography.body2,
+    color: colors.success,
+    flexShrink: 1,
+    marginRight: spacing.sm,
+  },
+  savingsValue: {
+    ...typography.body2,
+    color: colors.success,
+    fontWeight: "600",
+  },
+  enrichedInfo: {
+    ...typography.caption,
+    color: colors.textSecondary,
+    marginTop: spacing.xs,
+    lineHeight: 18,
   },
   lineItemRight: {
     alignItems: "flex-end",

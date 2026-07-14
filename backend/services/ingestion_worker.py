@@ -53,7 +53,7 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
     try:
         logger.debug("Calling rag.setup_session with %d files", len(uploaded_files_info))
         session_start = time.perf_counter()
-        duplicates = await rag.setup_session(uploaded_files_info)
+        duplicates, receipt_review_file_ids = await rag.setup_session(uploaded_files_info)
         session_ms = (time.perf_counter() - session_start) * 1000
         logger.info(
             "Ingestion worker complete — user_id=%s, %d files processed in %.1fms, %d duplicates",
@@ -64,7 +64,10 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
         raise RuntimeError(f"Ingestion failed: {e}") from e
 
     # Output result as JSON on stdout for the parent process to parse
-    print(json.dumps({"duplicates": duplicates or []}))
+    print(json.dumps({
+        "duplicates": duplicates or [],
+        "receipt_review_file_ids": receipt_review_file_ids or [],
+    }))
 
 
 if __name__ == "__main__":

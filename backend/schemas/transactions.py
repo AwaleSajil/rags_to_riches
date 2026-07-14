@@ -1,7 +1,8 @@
 from datetime import date
+import re
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class TransactionCreate(BaseModel):
@@ -48,7 +49,11 @@ class TransactionListItem(BaseModel):
     subtotal: Optional[float] = None
     tax_total: Optional[float] = None
     tax_breakdown: Optional[Any] = None
+    discount_total: Optional[float] = None
+    savings_total: Optional[float] = None
     source: Optional[str] = None
+    enriched_info: Optional[str] = None
+    linked_transaction_ids: List[str] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 
@@ -64,6 +69,7 @@ class TransactionDetailItem(BaseModel):
     item_quantity: Optional[float] = None
     item_unit_subtotal_price: Optional[float] = None
     item_subtotal_price: Optional[float] = None
+    item_savings: Optional[float] = None
     tax_amount: Optional[float] = None
     taxable: Optional[bool] = None
     tax_rate: Optional[float] = None
@@ -80,6 +86,7 @@ class TransactionDetailInput(BaseModel):
     item_quantity: Optional[float] = None
     item_unit_subtotal_price: Optional[float] = None
     item_subtotal_price: Optional[float] = None
+    item_savings: Optional[float] = None
     tax_amount: Optional[float] = None
     taxable: Optional[bool] = None
     tax_rate: Optional[float] = None
@@ -91,6 +98,41 @@ class TransactionDetailsReplace(BaseModel):
     """Replace the full set of line items for a transaction."""
 
     details: List[TransactionDetailInput] = Field(default_factory=list)
+
+
+class ReceiptReviewLineItem(BaseModel):
+    item_description: str = ""
+    item_quantity: float = Field(default=1, ge=0)
+    # Net price actually paid per unit (after any item-level markdown).
+    item_unit_price: float = Field(default=0, ge=0)
+    # How much this line was marked down (regular price minus what was paid);
+    # informational only, never subtracted from a total.
+    item_savings: float = Field(default=0, ge=0)
+    tax_rate: float = Field(default=0, ge=0)
+
+
+class ReceiptReviewInput(BaseModel):
+    """User-corrected OCR data. A receipt becomes a transaction only on verify."""
+
+    date: date
+    time: Optional[str] = None
+    merchant_name: str = Field(min_length=1)
+    category: str = "Uncategorized"
+    location: Optional[str] = None
+    total_amount: Optional[float] = Field(default=None, gt=0)
+    # Order-level coupons subtracted from the whole basket (not item markdowns).
+    discount_total: Optional[float] = Field(default=None, ge=0)
+    line_items: List[ReceiptReviewLineItem] = Field(default_factory=list)
+
+    @field_validator("time")
+    @classmethod
+    def _validate_time(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized):
+            raise ValueError("time must use 24-hour HH:MM format")
+        return normalized
 
 
 class TransactionWithDetails(TransactionListItem):
