@@ -70,6 +70,7 @@ export interface TransactionUpdatePayload {
   amount?: number;
   category?: string;
   location?: string;
+  note?: string | null;
   subtotal?: number;
   tax_total?: number;
   tax_breakdown?: TaxBreakdownEntry[];

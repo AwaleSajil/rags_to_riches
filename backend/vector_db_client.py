@@ -96,8 +96,17 @@ class VectorDBClient:
             merchant = row.get('merchant_name', '') or row.get('description', '')
             category = row.get('category', 'Uncategorized')
             enriched = row.get('enriched_info', '')
-            base_text = f"{merchant} ({category})"
-            texts.append(f"{base_text} — {enriched}" if enriched else base_text)
+            note = row.get('note', '')
+            if note is None or (isinstance(note, float) and pd.isna(note)):
+                note = ''
+            # The user's note is embedded alongside merchant/category so notes
+            # are semantically searchable (e.g. "the dinner I expensed").
+            parts = [f"{merchant} ({category})"]
+            if enriched:
+                parts.append(str(enriched))
+            if note:
+                parts.append(f"Note: {note}")
+            texts.append(" — ".join(parts))
 
             meta_cols = ['id', 'amount', 'category', 'trans_date']
             if 'merchant_name' in row: meta_cols.append('merchant_name')

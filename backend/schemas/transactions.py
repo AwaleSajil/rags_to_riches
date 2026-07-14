@@ -22,6 +22,7 @@ class TransactionUpdate(BaseModel):
     amount: Optional[float] = Field(default=None, gt=0)
     category: Optional[str] = None
     location: Optional[str] = None
+    note: Optional[str] = None
     subtotal: Optional[float] = Field(default=None, ge=0)
     tax_total: Optional[float] = Field(default=None, ge=0)
     tax_breakdown: Optional[List[Dict[str, Any]]] = None
@@ -46,6 +47,7 @@ class TransactionListItem(BaseModel):
     category: Optional[str] = None
     merchant_name: Optional[str] = None
     location: Optional[str] = None
+    note: Optional[str] = None
     subtotal: Optional[float] = None
     tax_total: Optional[float] = None
     tax_breakdown: Optional[Any] = None

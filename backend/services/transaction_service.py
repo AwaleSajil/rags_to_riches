@@ -12,9 +12,9 @@ from backend.services.categories import normalize_category
 
 logger = logging.getLogger("moneyrag.services.transaction")
 
-# Fields whose value feeds the pgvector document text (merchant + category) —
-# a change to any of them requires re-embedding the transaction's vector.
-_VECTOR_TEXT_FIELDS = ("merchant_name", "category")
+# Fields whose value feeds the pgvector document text (merchant, category, and
+# the user's note) — a change to any of them requires re-embedding the vector.
+_VECTOR_TEXT_FIELDS = ("merchant_name", "category", "note")
 
 # Columns returned for the browser list. `enriched_info` is used only as a
 # lightweight indicator that Deep Enrichment completed for this receipt.
@@ -22,7 +22,7 @@ _LIST_COLUMNS = (
     "id,trans_date,description,amount,category,merchant_name,location,"
     "subtotal,tax_total,tax_breakdown,discount_total,savings_total,"
     "source,source_csv_id,source_bill_file_id,"
-    "enriched_info,created_at"
+    "note,enriched_info,created_at"
 )
 
 

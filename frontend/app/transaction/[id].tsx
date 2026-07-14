@@ -181,6 +181,9 @@ export default function TransactionDetailScreen() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
   const [enrichmentRefreshes, setEnrichmentRefreshes] = useState(0);
+  const [editingNote, setEditingNote] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -374,6 +377,34 @@ export default function TransactionDetailScreen() {
       setSnackbar({ visible: true, message: e.message || "Update failed", error: true });
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const startEditNote = () => {
+    setNoteDraft(transaction?.note ?? "");
+    setEditingNote(true);
+  };
+
+  const saveNote = async () => {
+    if (!id || !transaction) return;
+    const next = noteDraft.trim();
+    if (next === (transaction.note ?? "")) {
+      setEditingNote(false);
+      return;
+    }
+    setSavingNote(true);
+    try {
+      // Sending "" clears the note; the server re-indexes the vector so the
+      // note becomes (or stops being) searchable.
+      const updated = await transactionService.updateTransaction(id, { note: next });
+      setTransaction(updated);
+      setEditingNote(false);
+      setSnackbar({ visible: true, message: next ? "Note saved" : "Note removed", error: false });
+    } catch (e: any) {
+      log.error("Failed to save note", e);
+      setSnackbar({ visible: true, message: e.message || "Could not save note", error: true });
+    } finally {
+      setSavingNote(false);
     }
   };
 
@@ -739,6 +770,62 @@ export default function TransactionDetailScreen() {
           </Button>
         </View>
 
+        {/* Notes card — add/edit while viewing; the note is also indexed for search */}
+        <GlassCard style={styles.card}>
+          <View style={styles.notesHeader}>
+            <Text style={styles.sectionTitle}>Note</Text>
+            {!editingNote && (
+              <Button
+                mode="text"
+                compact
+                icon={tx.note ? "pencil-outline" : "plus"}
+                onPress={startEditNote}
+              >
+                {tx.note ? "Edit" : "Add note"}
+              </Button>
+            )}
+          </View>
+          {editingNote ? (
+            <>
+              <TextInput
+                mode="outlined"
+                placeholder="Add a note — e.g. “split with Alex”, “reimburse from work”…"
+                value={noteDraft}
+                onChangeText={setNoteDraft}
+                multiline
+                numberOfLines={3}
+                autoFocus
+                style={styles.noteInput}
+              />
+              <View style={styles.noteActions}>
+                <Button
+                  mode="outlined"
+                  onPress={() => setEditingNote(false)}
+                  disabled={savingNote}
+                  style={styles.actionButton}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  mode="contained"
+                  onPress={saveNote}
+                  loading={savingNote}
+                  disabled={savingNote}
+                  style={styles.actionButton}
+                >
+                  Save
+                </Button>
+              </View>
+            </>
+          ) : tx.note ? (
+            <Text style={styles.noteText}>{tx.note}</Text>
+          ) : (
+            <Text style={styles.notePlaceholder}>
+              No note yet. Notes are searchable across your transactions.
+            </Text>
+          )}
+        </GlassCard>
+
         {/* Tax breakdown card */}
         {hasTax && (
           <GlassCard style={styles.card}>
@@ -929,6 +1016,29 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: spacing.md,
     marginBottom: spacing.lg,
+  },
+  notesHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  noteText: {
+    ...typography.body2,
+    color: colors.text,
+    lineHeight: 20,
+  },
+  notePlaceholder: {
+    ...typography.body2,
+    color: colors.textSecondary,
+  },
+  noteInput: {
+    backgroundColor: colors.surface,
+    marginTop: spacing.xs,
+  },
+  noteActions: {
+    flexDirection: "row",
+    gap: spacing.md,
+    marginTop: spacing.md,
   },
   actionButton: {
     flex: 1,

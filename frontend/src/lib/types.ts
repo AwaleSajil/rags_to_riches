@@ -79,6 +79,7 @@ export interface TransactionListItem {
   category: string | null;
   merchant_name: string | null;
   location: string | null;
+  note?: string | null; // free-text note the user attached; also indexed for search
   subtotal: number | null;
   tax_total: number | null;
   tax_breakdown: TaxBreakdownEntry[] | null;
