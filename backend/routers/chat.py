@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -12,6 +13,25 @@ from backend.services.rag_manager import rag_manager
 logger = logging.getLogger("moneyrag.routers.chat")
 
 router = APIRouter()
+
+# Preview LLM models intermittently return transient server errors (5xx /
+# UNAVAILABLE / overloaded). Auto-retry the generation a couple of times before
+# surfacing an error, but only while nothing has streamed to the client yet.
+_MAX_CHAT_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 1.5
+_TRANSIENT_ERROR_KEYS = (
+    "500", "502", "503", "internal", "unavailable", "overloaded",
+    "temporarily", "deadline", "timeout", "timed out", "try again",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for provider errors that a retry is likely to clear (not quota/auth)."""
+    low = str(exc).lower()
+    if any(k in low for k in ("quota", "resource_exhausted", "rate limit", "429",
+                              "api key", "permission_denied", "unauthenticated", "401", "403")):
+        return False
+    return any(k in low for k in _TRANSIENT_ERROR_KEYS)
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -60,93 +80,115 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
     await conversation_service.add_message(user, conversation_id, "user", body.message)
     await conversation_service.set_title_from_first_message(user, conversation_id, body.message)
 
+    async def _stream_once():
+        """One full generation attempt, yielding SSE strings. Raises on failure."""
+        event_count = 0
+        start = time.perf_counter()
+        async for event in rag.chat(body.message, history=history):
+            event_count += 1
+
+            if event["type"] == "final":
+                content = event.get("content", "")
+
+                charts = []
+                while "===CHART===" in content:
+                    pre, rest = content.split("===CHART===", 1)
+                    if "===ENDCHART===" in rest:
+                        chart_json, after = rest.split("===ENDCHART===", 1)
+                        charts.append(chart_json.strip())
+                        content = pre + after
+                    else:
+                        content = pre + rest
+                        break
+
+                images = []
+                while "===IMAGES===" in content:
+                    pre, rest = content.split("===IMAGES===", 1)
+                    if "===ENDIMAGES===" in rest:
+                        images_json, after = rest.split("===ENDIMAGES===", 1)
+                        content = pre + after
+                        try:
+                            images.extend(json.loads(images_json.strip()))
+                        except json.JSONDecodeError:
+                            logger.warning("Failed to parse images JSON")
+                    else:
+                        content = pre + rest
+                        break
+
+                pending_transactions = []
+                while "===CONFIRM_TX===" in content:
+                    pre, rest = content.split("===CONFIRM_TX===", 1)
+                    if "===ENDCONFIRM_TX===" in rest:
+                        tx_json, after = rest.split("===ENDCONFIRM_TX===", 1)
+                        content = pre + after
+                        try:
+                            pending_transactions.append(json.loads(tx_json.strip()))
+                        except json.JSONDecodeError:
+                            logger.warning("Failed to parse pending transaction JSON")
+                    else:
+                        content = pre + rest
+                        break
+
+                final_content = content.strip()
+
+                # Persist the assistant turn so it survives reloads/restarts.
+                try:
+                    await conversation_service.add_message(
+                        user, conversation_id, "assistant", final_content,
+                        charts=charts or None,
+                        images=images or None,
+                        pending_transactions=pending_transactions or None,
+                    )
+                except Exception as e:
+                    logger.error("Failed to persist assistant message: %s", e, exc_info=True)
+
+                yield (
+                    "event: final\ndata: "
+                    + json.dumps({
+                        "content": final_content,
+                        "charts": charts,
+                        "images": images,
+                        "pendingTransactions": pending_transactions,
+                    })
+                    + "\n\n"
+                )
+            else:
+                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "SSE stream complete for user_id=%s conv=%s — %d events in %.1fms",
+            user["id"], conversation_id, event_count, elapsed_ms,
+        )
+        yield "event: done\ndata: {}\n\n"
+
     async def event_generator():
         # Let the client know which conversation this maps to (esp. brand-new ones).
         yield f"event: conversation\ndata: {json.dumps({'conversation_id': conversation_id})}\n\n"
 
-        event_count = 0
-        start = time.perf_counter()
-        try:
-            async for event in rag.chat(body.message, history=history):
-                event_count += 1
-
-                if event["type"] == "final":
-                    content = event.get("content", "")
-
-                    charts = []
-                    while "===CHART===" in content:
-                        pre, rest = content.split("===CHART===", 1)
-                        if "===ENDCHART===" in rest:
-                            chart_json, after = rest.split("===ENDCHART===", 1)
-                            charts.append(chart_json.strip())
-                            content = pre + after
-                        else:
-                            content = pre + rest
-                            break
-
-                    images = []
-                    while "===IMAGES===" in content:
-                        pre, rest = content.split("===IMAGES===", 1)
-                        if "===ENDIMAGES===" in rest:
-                            images_json, after = rest.split("===ENDIMAGES===", 1)
-                            content = pre + after
-                            try:
-                                images.extend(json.loads(images_json.strip()))
-                            except json.JSONDecodeError:
-                                logger.warning("Failed to parse images JSON")
-                        else:
-                            content = pre + rest
-                            break
-
-                    pending_transactions = []
-                    while "===CONFIRM_TX===" in content:
-                        pre, rest = content.split("===CONFIRM_TX===", 1)
-                        if "===ENDCONFIRM_TX===" in rest:
-                            tx_json, after = rest.split("===ENDCONFIRM_TX===", 1)
-                            content = pre + after
-                            try:
-                                pending_transactions.append(json.loads(tx_json.strip()))
-                            except json.JSONDecodeError:
-                                logger.warning("Failed to parse pending transaction JSON")
-                        else:
-                            content = pre + rest
-                            break
-
-                    final_content = content.strip()
-
-                    # Persist the assistant turn so it survives reloads/restarts.
-                    try:
-                        await conversation_service.add_message(
-                            user, conversation_id, "assistant", final_content,
-                            charts=charts or None,
-                            images=images or None,
-                            pending_transactions=pending_transactions or None,
-                        )
-                    except Exception as e:
-                        logger.error("Failed to persist assistant message: %s", e, exc_info=True)
-
-                    yield (
-                        "event: final\ndata: "
-                        + json.dumps({
-                            "content": final_content,
-                            "charts": charts,
-                            "images": images,
-                            "pendingTransactions": pending_transactions,
-                        })
-                        + "\n\n"
-                    )
-                else:
-                    yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
-
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.info(
-                "SSE stream complete for user_id=%s conv=%s — %d events in %.1fms",
-                user["id"], conversation_id, event_count, elapsed_ms,
-            )
-            yield "event: done\ndata: {}\n\n"
-        except Exception as e:
-            logger.error("SSE stream error for user_id=%s: %s", user["id"], e, exc_info=True)
-            yield f"event: error\ndata: {json.dumps({'error': _friendly_error(e)})}\n\n"
+        # Retry a transient provider failure a couple of times, but only while
+        # nothing has streamed yet — once tokens/tool events reach the client we
+        # can't cleanly restart, so we surface the error instead of duplicating.
+        for attempt in range(_MAX_CHAT_ATTEMPTS):
+            streamed_any = False
+            try:
+                async for sse in _stream_once():
+                    streamed_any = True
+                    yield sse
+                return
+            except Exception as e:
+                transient = _is_transient(e)
+                can_retry = transient and not streamed_any and attempt < _MAX_CHAT_ATTEMPTS - 1
+                logger.error(
+                    "SSE stream error for user_id=%s (attempt %d/%d, transient=%s, retrying=%s): %s",
+                    user["id"], attempt + 1, _MAX_CHAT_ATTEMPTS, transient, can_retry, e,
+                    exc_info=True,
+                )
+                if can_retry:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                yield f"event: error\ndata: {json.dumps({'error': _friendly_error(e)})}\n\n"
+                return
 
     return StreamingResponse(
         event_generator(),
