@@ -7,7 +7,7 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
-import { ActivityIndicator, IconButton, Text } from "react-native-paper";
+import { ActivityIndicator, Button, IconButton, Text } from "react-native-paper";
 import { getSupabase } from "../lib/supabase";
 import { colors, spacing, typography } from "../styles/theme";
 import { createLogger } from "../lib/logger";
@@ -18,6 +18,7 @@ const log = createLogger("FilePreviewModal");
 interface FilePreviewModalProps {
   file: FileItem | null;
   onClose: () => void;
+  onReviewReceipt?: (file: FileItem) => void;
 }
 
 // Minimal CSV parser that respects double-quoted fields (which may contain commas).
@@ -50,7 +51,7 @@ function parseCsv(text: string, maxRows = 100): string[][] {
   return rows;
 }
 
-export function FilePreviewModal({ file, onClose }: FilePreviewModalProps) {
+export function FilePreviewModal({ file, onClose, onReviewReceipt }: FilePreviewModalProps) {
   const { width, height } = useWindowDimensions();
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -175,6 +176,18 @@ export function FilePreviewModal({ file, onClose }: FilePreviewModalProps) {
               )}
             </View>
           )}
+
+          {!loading && !error && file?.type === "bill" && (
+            <View style={styles.receiptActions}>
+              <Button
+                mode="contained"
+                icon="pencil-outline"
+                onPress={() => onReviewReceipt?.(file)}
+              >
+                Review / edit extracted data
+              </Button>
+            </View>
+          )}
         </View>
       </View>
     </Modal>
@@ -218,6 +231,10 @@ const styles = StyleSheet.create({
     color: colors.textTertiary,
     textAlign: "center",
     padding: spacing.sm,
+  },
+  receiptActions: {
+    paddingTop: spacing.sm,
+    alignItems: "center",
   },
   errorText: {
     color: colors.error,

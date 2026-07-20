@@ -82,6 +82,20 @@ async def get_ingestion_status(user: dict = Depends(get_current_user)):
     return status
 
 
+@router.patch("/{file_id}/visibility")
+async def set_file_visibility(
+    file_id: str,
+    type: str = Query(..., description="File type: csv or bill"),
+    hidden: bool = Query(..., description="Whether to hide this file's transactions"),
+    user: dict = Depends(get_current_user),
+):
+    try:
+        is_hidden = await file_service.set_file_visibility(user, file_id, type, hidden)
+        return {"message": "File visibility updated", "is_hidden": is_hidden}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @router.delete("/{file_id}")
 async def delete_file(
     file_id: str,

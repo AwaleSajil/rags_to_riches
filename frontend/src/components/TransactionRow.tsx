@@ -12,7 +12,9 @@ interface TransactionRowProps {
 
 function formatDay(dateStr: string | null): string {
   if (!dateStr) return "";
-  const d = new Date(dateStr);
+  // PostgreSQL DATE values have no timezone. Parsing YYYY-MM-DD directly as
+  // UTC shifts them to the previous local day in timezones west of Greenwich.
+  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? `${dateStr}T00:00:00` : dateStr);
   if (isNaN(d.getTime())) return dateStr;
   return d.toLocaleDateString(undefined, {
     month: "short",
@@ -42,6 +44,14 @@ export function TransactionRow({ transaction, onPress }: TransactionRowProps) {
           {formatDay(transaction.trans_date)}
           {transaction.category ? ` · ${transaction.category}` : ""}
         </Text>
+        {transaction.enriched_info ? (
+          <View style={styles.enrichedBadge}>
+            <Text style={styles.enrichedText}>Enriched</Text>
+          </View>
+        ) : null}
+        {(transaction.linked_transaction_ids?.length ?? 0) > 0 ? (
+          <Text style={styles.linkedText}>Linked source{transaction.linked_transaction_ids!.length > 1 ? "s" : ""}</Text>
+        ) : null}
       </View>
       <Text style={styles.amount}>${amount.toFixed(2)}</Text>
       <MaterialCommunityIcons
@@ -87,6 +97,19 @@ const styles = StyleSheet.create({
   meta: {
     ...typography.caption,
     color: colors.textSecondary,
+  },
+  enrichedBadge: {
+    marginTop: 3,
+  },
+  enrichedText: {
+    ...typography.caption,
+    color: colors.success,
+    fontWeight: "700",
+  },
+  linkedText: {
+    ...typography.caption,
+    color: colors.textTertiary,
+    marginTop: 3,
   },
   amount: {
     ...typography.subtitle2,

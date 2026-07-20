@@ -24,8 +24,10 @@ export function useFiles() {
   const [isUploading, setIsUploading] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [visibilityFileId, setVisibilityFileId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
+  const [receiptReviewFileIds, setReceiptReviewFileIds] = useState<string[]>([]);
   const [ingestionProgress, setIngestionProgress] = useState<IngestionProgress | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -66,6 +68,13 @@ export function useFiles() {
             setDuplicates(status.duplicates);
           }
           // Reload files now that ingestion is done
+          const data = await fileService.listFiles();
+          setFiles(data);
+        } else if (status.status === "review") {
+          stopPolling();
+          setIsIngesting(false);
+          setIngestionProgress(null);
+          setReceiptReviewFileIds(status.receipt_review_file_ids || []);
           const data = await fileService.listFiles();
           setFiles(data);
         } else if (status.status === "failed") {
@@ -115,6 +124,7 @@ export function useFiles() {
     setIsUploading(true);
     setError(null);
     setDuplicates([]);
+    setReceiptReviewFileIds([]);
     try {
       await fileService.uploadFiles(pickedFiles);
       log.info("Upload complete - reloading file list and starting ingestion poll");
@@ -148,6 +158,23 @@ export function useFiles() {
     }
   };
 
+  const toggleFileVisibility = async (file: FileItem) => {
+    setVisibilityFileId(file.id);
+    try {
+      const result = await fileService.setFileVisibility(file.id, file.type, !file.is_hidden);
+      setFiles((current) => current.map((item) =>
+        item.id === file.id ? { ...item, is_hidden: result.is_hidden } : item
+      ));
+      return true;
+    } catch (e: any) {
+      log.error("toggleFileVisibility failed", e);
+      setError(e.message);
+      return false;
+    } finally {
+      setVisibilityFileId(null);
+    }
+  };
+
   const clearDuplicates = useCallback(() => {
     setDuplicates([]);
   }, []);
@@ -158,11 +185,14 @@ export function useFiles() {
     isUploading,
     isIngesting,
     isDeleting,
+    visibilityFileId,
     error,
     duplicates,
+    receiptReviewFileIds,
     ingestionProgress,
     uploadFiles,
     deleteFile,
+    toggleFileVisibility,
     loadFiles,
     clearDuplicates,
   };

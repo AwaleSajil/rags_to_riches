@@ -50,7 +50,7 @@ export const API_URL = getApiUrl();
  * Uses getSession() for the local cache, or refreshSession() to force
  * a server-side refresh when the cached token has been rejected.
  */
-async function getAccessToken(forceRefresh = false): Promise<string | null> {
+export async function getAccessToken(forceRefresh = false): Promise<string | null> {
   try {
     const supabase = await getSupabase();
     if (forceRefresh) {

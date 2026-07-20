@@ -227,15 +227,22 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
 
         if proc.returncode == 0:
             duplicates = []
+            receipt_review_file_ids = []
             if stdout:
                 for line in reversed(stdout.decode().strip().split("\n")):
                     try:
                         result = json.loads(line)
                         duplicates = result.get("duplicates", [])
+                        receipt_review_file_ids = result.get("receipt_review_file_ids", [])
                         break
                     except (json.JSONDecodeError, ValueError):
                         continue
-            ingestion_status[user_id] = {"status": "complete", "error": None, "duplicates": duplicates}
+            ingestion_status[user_id] = {
+                "status": "review" if receipt_review_file_ids else "complete",
+                "error": None,
+                "duplicates": duplicates,
+                "receipt_review_file_ids": receipt_review_file_ids,
+            }
             logger.info(
                 "Background ingestion complete for user_id=%s — PID=%d, %.1fms, %d duplicates",
                 user_id, proc.pid, elapsed_ms, len(duplicates),
@@ -309,6 +316,23 @@ async def delete_file(user: dict, file_id: str, file_type: str):
 
     logger.info("File '%s' (id=%s) fully deleted for user_id=%s", filename, file_id, user["id"])
     return filename
+
+
+def _set_file_visibility_sync(access_token: str, file_id: str, file_type: str, hidden: bool) -> bool:
+    table = "CSVFile" if file_type == "csv" else "BillFile"
+    client = get_supabase(access_token)
+    result = client.table(table).update({"is_hidden": hidden}).eq("id", file_id).execute()
+    if not result.data:
+        raise ValueError("File not found")
+    return bool(result.data[0].get("is_hidden"))
+
+
+async def set_file_visibility(user: dict, file_id: str, file_type: str, hidden: bool) -> bool:
+    if file_type not in ("csv", "bill"):
+        raise ValueError("Invalid file type")
+    return await asyncio.to_thread(
+        _set_file_visibility_sync, user["access_token"], file_id, file_type, hidden
+    )
 
 
 def _delete_fallback_sync(access_token: str, file_id: str, file_type: str):

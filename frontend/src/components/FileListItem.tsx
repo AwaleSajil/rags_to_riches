@@ -9,9 +9,11 @@ interface FileListItemProps {
   file: FileItem;
   onDelete: (file: FileItem) => void;
   onPress?: (file: FileItem) => void;
+  onToggleVisibility?: (file: FileItem) => void;
+  isTogglingVisibility?: boolean;
 }
 
-export function FileListItem({ file, onDelete, onPress }: FileListItemProps) {
+export function FileListItem({ file, onDelete, onPress, onToggleVisibility, isTogglingVisibility }: FileListItemProps) {
   const isCSV = file.type === "csv";
   const iconName = isCSV ? "file-delimited" : "file-image";
   const iconColor = isCSV ? colors.success : colors.warning;
@@ -33,8 +35,15 @@ export function FileListItem({ file, onDelete, onPress }: FileListItemProps) {
             {file.upload_date?.slice(0, 10) ?? "N/A"} · tap to preview
           </Text>
         </View>
-        <MaterialCommunityIcons name="eye-outline" size={18} color={colors.textTertiary} />
       </Pressable>
+      <IconButton
+        icon={file.is_hidden ? "eye-off-outline" : "eye-outline"}
+        iconColor={colors.textSecondary}
+        size={20}
+        onPress={() => onToggleVisibility?.(file)}
+        disabled={isTogglingVisibility}
+        accessibilityLabel={file.is_hidden ? "Show transactions from this file" : "Hide transactions from this file"}
+      />
       <IconButton
         icon="trash-can-outline"
         iconColor={colors.error}
