@@ -33,15 +33,22 @@ def _validate_token_sync(token: str, supabase_url: str, supabase_key: str) -> di
     return {"id": res.user.id, "email": res.user.email}
 
 
-async def get_current_user(
+async def get_optional_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     settings: Settings = Depends(get_settings),
 ) -> dict | None:
+    """Resolve the bearer token if one was sent, else None.
+
+    Only for endpoints that legitimately serve anonymous callers — currently
+    just login/register, which accept either a token or email+password. Every
+    other route wants `get_current_user`, which rejects anonymous requests
+    instead of handing back a None that the route would dereference.
+    """
     if not credentials:
         return None
-        
+
     token = credentials.credentials
-    logger.debug("get_current_user called — token=%s...", token[:20])
+    logger.debug("get_optional_user called — token=%s...", token[:20])
     try:
         user_info = await asyncio.to_thread(
             _validate_token_sync, token, settings.SUPABASE_URL, settings.SUPABASE_KEY
@@ -56,3 +63,22 @@ async def get_current_user(
     except Exception as e:
         logger.error("Auth failed (unexpected): %s", e, exc_info=True)
         raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")
+
+
+async def get_current_user(
+    user: dict | None = Depends(get_optional_user),
+) -> dict:
+    """The authenticated user, or a 401. Never returns None.
+
+    Routes annotate `user: dict` and immediately index `user["id"]`, so an
+    anonymous request used to raise TypeError and surface as a 500 — this
+    turns that into the 401 the client is equipped to handle and retry.
+    """
+    if user is None:
+        logger.debug("Rejecting unauthenticated request — no bearer credentials")
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user

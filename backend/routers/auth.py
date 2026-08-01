@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from backend.schemas.auth import LoginRequest, RegisterRequest, AuthResponse, UserInfo
 from backend.config import get_settings, Settings
-from backend.dependencies import get_current_user
+from backend.dependencies import get_current_user, get_optional_user
 from supabase import create_client
 
 logger = logging.getLogger("moneyrag.routers.auth")
@@ -14,12 +14,15 @@ router = APIRouter()
 @router.post("/login")
 async def login(
     body: LoginRequest | None = None,
-    user: dict | None = Depends(get_current_user), 
+    user: dict | None = Depends(get_optional_user), 
     settings: Settings = Depends(get_settings)
 ):
     try:
         # If accessed via Swagger/Postman with raw credentials, generate the token first
-        if body and body.email and body.password and (not user or getattr(user, "email", None) is None):
+        # `user` is a dict from a validated token, so it always carries an email —
+        # the old `getattr(user, "email", None)` read None off the dict every time
+        # and re-ran the password flow even for callers who sent a good token.
+        if body and body.email and body.password and not user:
             logger.debug("Generating token dynamically for Swagger UI login email=%s", body.email)
             client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
             res = client.auth.sign_in_with_password({
@@ -54,11 +57,14 @@ async def login(
 @router.post("/register")
 async def register(
     body: RegisterRequest | None = None,
-    user: dict | None = Depends(get_current_user), 
+    user: dict | None = Depends(get_optional_user), 
     settings: Settings = Depends(get_settings)
 ):
     try:
-        if body and body.email and body.password and (not user or getattr(user, "email", None) is None):
+        # `user` is a dict from a validated token, so it always carries an email —
+        # the old `getattr(user, "email", None)` read None off the dict every time
+        # and re-ran the password flow even for callers who sent a good token.
+        if body and body.email and body.password and not user:
             logger.debug("Generating token dynamically for Swagger UI register email=%s", body.email)
             client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
             res = client.auth.sign_up({

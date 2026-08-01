@@ -21,12 +21,6 @@ logger = logging.getLogger("moneyrag.routers.transactions")
 router = APIRouter()
 
 
-def _require_user(user: dict | None) -> dict:
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user
-
-
 @router.get("", response_model=List[TransactionListItem])
 async def list_transactions(
     category: Optional[str] = Query(None, description="Exact category match"),
@@ -36,7 +30,6 @@ async def list_transactions(
     user: dict = Depends(get_current_user),
 ):
     """List the current user's transactions, newest first, with optional filters."""
-    user = _require_user(user)
     try:
         return await transaction_service.list_transactions(
             user, category=category, start_date=start_date, end_date=end_date, q=q
@@ -52,7 +45,6 @@ async def get_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Fetch one transaction plus its line items (ordered), including tax breakdown."""
-    user = _require_user(user)
     try:
         tx = await transaction_service.get_transaction(user, transaction_id)
     except Exception as e:
@@ -68,7 +60,6 @@ async def get_receipt_review(
     file_id: str,
     user: dict = Depends(get_current_user),
 ):
-    user = _require_user(user)
     review = await transaction_service.get_receipt_review(user, file_id)
     if review is None:
         raise HTTPException(status_code=404, detail="Receipt review is not available")
@@ -81,7 +72,6 @@ async def verify_receipt_review(
     body: ReceiptReviewInput,
     user: dict = Depends(get_current_user),
 ):
-    user = _require_user(user)
     review = body.model_dump()
     review["date"] = review["date"].isoformat()
     tx = await transaction_service.verify_receipt(user, file_id, review)
@@ -97,7 +87,6 @@ async def update_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Update editable fields. Re-embeds the vector if merchant/category changed."""
-    user = _require_user(user)
     changes = body.model_dump(exclude_unset=True)
     if "trans_date" in changes and changes["trans_date"] is not None:
         changes["trans_date"] = changes["trans_date"].isoformat()
@@ -120,7 +109,6 @@ async def replace_details(
     user: dict = Depends(get_current_user),
 ):
     """Replace all line items for a transaction (edit/add/delete in one shot)."""
-    user = _require_user(user)
     details = [d.model_dump() for d in body.details]
     try:
         tx = await transaction_service.replace_details(user, transaction_id, details)
@@ -138,7 +126,6 @@ async def delete_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Delete a transaction (line items cascade) and remove its vector(s)."""
-    user = _require_user(user)
     try:
         deleted = await transaction_service.delete_transaction(user, transaction_id)
     except Exception as e:
@@ -155,7 +142,6 @@ async def create_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Insert a manually-entered transaction. user_id always comes from JWT."""
-    user = _require_user(user)
     logger.info("Creating manual transaction for user_id=%s: %s", user["id"], body.description)
 
     user_id = user["id"]
@@ -163,7 +149,10 @@ async def create_transaction(
     # Content hash (same algorithm as money_rag.py _ingest_csv)
     date_str = body.trans_date.isoformat()
     amount_str = str(round(body.amount, 2))
-    merchant = (body.merchant_name or body.description).lower().strip().split()[0]
+    # split() on an all-whitespace name yields [], so index only when non-empty —
+    # the hash just loses its merchant component, which dedup tolerates.
+    merchant_words = (body.merchant_name or body.description).lower().strip().split()
+    merchant = merchant_words[0] if merchant_words else ""
     merchant_clean = "".join(c for c in merchant if c.isalnum())
     hash_input = f"{date_str}{amount_str}{merchant_clean}"
     content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
