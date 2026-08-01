@@ -1,7 +1,9 @@
 import "react-native-url-polyfill/auto";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { API_URL } from "../services/api";
+// From lib/apiUrl rather than services/api: api.ts imports this module for the
+// access token, so importing it back would form a require cycle.
+import { API_URL } from "./apiUrl";
 
 let _client: SupabaseClient | null = null;
 let _initPromise: Promise<SupabaseClient> | null = null;

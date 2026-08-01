@@ -58,7 +58,13 @@ export default function ReceiptReviewScreen() {
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
 
   const load = useCallback(async () => {
-    if (!fileId) return;
+    if (!fileId) {
+      // Same trap as transaction/[id]: `loading` starts true, so an early
+      // return here would strand the screen on its spinner.
+      setLoading(false);
+      setError("No receipt was specified.");
+      return;
+    }
     setLoading(true);
     setError(null);
     try {

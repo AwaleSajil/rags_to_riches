@@ -186,7 +186,15 @@ export default function TransactionDetailScreen() {
   const [savingNote, setSavingNote] = useState(false);
 
   const load = useCallback(async () => {
-    if (!id) return;
+    if (!id) {
+      // isLoading starts true, so returning early here used to leave the screen
+      // on "Loading transaction..." forever. Surface it instead — this is only
+      // reachable via a bad deep link or a stray navigation.
+      log.warn("Transaction screen opened without an id");
+      setIsLoading(false);
+      setError("No transaction was specified.");
+      return;
+    }
     setIsLoading(true);
     setError(null);
     try {

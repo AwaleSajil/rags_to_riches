@@ -30,30 +30,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     log.info("Checking for existing session on mount...");
 
     let subscription: { unsubscribe: () => void } | null = null;
+    let cancelled = false;
 
-    getSupabase().then((supabase) => {
-      // Verify session on mount by refreshing with the server.
-      // getSession() only returns the local cache which may be stale
-      // (e.g. session revoked server-side). refreshSession() validates
-      // and returns a fresh token, or null if the session is truly dead.
-      supabase.auth.refreshSession().then(({ data: { session }, error }) => {
-        if (error) {
-          log.warn("Session refresh failed on mount", { error: error.message });
-        }
-        if (session?.user) {
-          log.info("Valid session found", {
-            userId: session.user.id,
-            email: session.user.email,
-            tokenExpiry: session.expires_at,
-          });
-          setUser({ id: session.user.id, email: session.user.email! });
-        } else {
-          log.info("No valid session found");
-        }
-        setLoading(false);
-      });
+    async function bootstrap() {
+      const supabase = await getSupabase();
 
-      // Listen for auth state changes (token refresh, sign-in, sign-out)
+      // Register the listener BEFORE the network call. If the refresh below
+      // fails we still want sign-in events to reach the app — previously the
+      // subscription was set up after it, so a failed refresh left the app with
+      // no way to ever learn about a login.
       const { data } = supabase.auth.onAuthStateChange((event, session) => {
         log.info("Auth state changed", {
           event,
@@ -70,9 +55,53 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       });
       subscription = data.subscription;
-    });
+      if (cancelled) {
+        subscription.unsubscribe();
+        return;
+      }
+
+      // Verify session on mount by refreshing with the server.
+      // getSession() only returns the local cache which may be stale
+      // (e.g. session revoked server-side). refreshSession() validates
+      // and returns a fresh token, or null if the session is truly dead.
+      try {
+        const { data: { session }, error } = await supabase.auth.refreshSession();
+        if (error) {
+          log.warn("Session refresh failed on mount", { error: error.message });
+        }
+        if (session?.user) {
+          log.info("Valid session found", {
+            userId: session.user.id,
+            email: session.user.email,
+            tokenExpiry: session.expires_at,
+          });
+          setUser({ id: session.user.id, email: session.user.email! });
+        } else {
+          log.info("No valid session found");
+        }
+      } catch (e: any) {
+        // A rejected refresh (device offline, DNS failure, captive portal)
+        // must not strand the app: fall through to the login screen, which the
+        // user can retry from, rather than an indefinite spinner.
+        log.warn("Session refresh threw on mount — continuing unauthenticated", {
+          error: e?.message ?? String(e),
+        });
+      }
+    }
+
+    bootstrap()
+      .catch((e: any) => {
+        // getSupabase() itself failed (bad/missing config). Nothing works
+        // without a client, but showing login beats hanging on a spinner.
+        log.error("Auth bootstrap failed", { error: e?.message ?? String(e) });
+      })
+      .finally(() => {
+        // The single place loading is cleared, so every path above reaches it.
+        if (!cancelled) setLoading(false);
+      });
 
     return () => {
+      cancelled = true;
       log.debug("Unsubscribing auth state listener");
       subscription?.unsubscribe();
     };

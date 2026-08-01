@@ -11,6 +11,14 @@ import { createLogger } from "../src/lib/logger";
 
 const log = createLogger("Navigation");
 
+// Without this the Stack's first declared child (transaction/[id]) can win the
+// initial route, so the app boots into a detail screen with no id and sits on
+// its "Loading transaction..." spinner. index.tsx is the real entry point — it
+// redirects to login or the tabs once auth resolves.
+export const unstable_settings = {
+  initialRouteName: "index",
+};
+
 function RootLayoutNav() {
   const { user, loading } = useAuth();
   const segments = useSegments();
@@ -28,13 +36,17 @@ function RootLayoutNav() {
 
     if (loading) return;
 
-    const inAuthGroup = segments[0] === "(tabs)";
+    // Every screen except login needs a session — including transaction/[id]
+    // and receipt-review/[fileId], which sit outside the (tabs) group. Guarding
+    // only (tabs) left those reachable while logged out, where they mount, fire
+    // requests that 401, and sit on a spinner instead of bouncing to login.
+    const onLoginScreen = segments[0] === "login";
 
-    if (!user && inAuthGroup) {
-      log.info("Redirecting to /login (unauthenticated user in auth group)");
+    if (!user && !onLoginScreen) {
+      log.info("Redirecting to /login (unauthenticated)", { from: segments.join("/") });
       router.replace("/login");
-    } else if (user && !inAuthGroup && (segments[0] === "login" || segments[0] === undefined)) {
-      log.info("Redirecting to /(tabs)/chat (authenticated user outside tabs)");
+    } else if (user && (onLoginScreen || segments[0] === undefined)) {
+      log.info("Redirecting to /(tabs)/chat (authenticated user on entry screen)");
       router.replace("/(tabs)/chat");
     }
   }, [user, loading, segments]);

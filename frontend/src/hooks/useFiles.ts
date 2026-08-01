@@ -18,6 +18,14 @@ export interface IngestionProgress {
   detail?: string;
 }
 
+const POLL_INTERVAL_MS = 2000;
+// "idle" is expected for a poll or two while the worker spins up; beyond that
+// the server has forgotten the job (most likely it restarted).
+const MAX_IDLE_POLLS = 5;
+// Absolute ceiling regardless of what the server reports, so a worker wedged in
+// "processing" can't spin the UI indefinitely either.
+const MAX_INGESTION_MS = 15 * 60 * 1000;
+
 export function useFiles() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -30,6 +38,9 @@ export function useFiles() {
   const [receiptReviewFileIds, setReceiptReviewFileIds] = useState<string[]>([]);
   const [ingestionProgress, setIngestionProgress] = useState<IngestionProgress | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // loadFiles is defined below and depends on nothing, but the poller needs to
+  // call it; a ref avoids reordering the hook or a circular useCallback dep.
+  const loadFilesRef = useRef<(() => Promise<void>) | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -44,10 +55,45 @@ export function useFiles() {
     setIngestionProgress(null);
     log.info("Starting ingestion status polling");
 
+    // The backend tracks ingestion in an in-memory dict, so a restart mid-run
+    // loses the job and the endpoint reports "idle" forever. Without these two
+    // guards the interval never clears and the spinner never stops.
+    let consecutiveIdle = 0;
+    const startedAt = Date.now();
+
+    const giveUp = (message: string) => {
+      log.warn("Ingestion polling gave up", { message });
+      stopPolling();
+      setIsIngesting(false);
+      setIngestionProgress(null);
+      setError(message);
+      loadFilesRef.current?.();
+    };
+
     pollRef.current = setInterval(async () => {
       try {
         const status = await fileService.getIngestionStatus();
         log.debug("Ingestion poll result", status);
+
+        if (Date.now() - startedAt > MAX_INGESTION_MS) {
+          giveUp(
+            "Ingestion is taking longer than expected. Pull to refresh to check whether it finished."
+          );
+          return;
+        }
+
+        // "idle" right after upload is a normal race with the worker starting;
+        // sustained "idle" means the backend no longer knows about the job.
+        if (status.status === "idle") {
+          consecutiveIdle++;
+          if (consecutiveIdle >= MAX_IDLE_POLLS) {
+            giveUp(
+              "Lost track of the upload — the server may have restarted. Pull to refresh to check whether it finished."
+            );
+          }
+          return;
+        }
+        consecutiveIdle = 0;
 
         // Update progress if available
         if (status.stage) {
@@ -86,7 +132,7 @@ export function useFiles() {
       } catch (e: any) {
         log.error("Ingestion poll error", e);
       }
-    }, 2000);  // Poll faster for progress updates
+    }, POLL_INTERVAL_MS);
   }, [stopPolling]);
 
   useEffect(() => {
@@ -108,6 +154,8 @@ export function useFiles() {
       setIsLoading(false);
     }
   }, []);
+
+  loadFilesRef.current = loadFiles;
 
   useEffect(() => {
     log.debug("useFiles mounted - loading files");
