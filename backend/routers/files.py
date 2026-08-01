@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import tempfile
 from typing import Annotated, List
 
@@ -10,6 +11,60 @@ from backend.services import file_service
 logger = logging.getLogger("moneyrag.routers.files")
 
 router = APIRouter()
+
+# Anything not recognised as an image is handed to the CSV parser, so the
+# allowlist is what keeps a .pdf or an iPhone .heic from being silently parsed
+# as a spreadsheet. Matches the picker's filter in frontend/app/(tabs)/ingest.tsx.
+ALLOWED_EXTENSIONS = frozenset({".csv", ".png", ".jpg", ".jpeg"})
+
+# Receipts and bank exports are small; this is generous for both and keeps a
+# single request from filling the disk.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def _safe_filename(raw: str | None) -> str:
+    """Reduce a client-supplied filename to a bare, allowlisted basename.
+
+    The name reaches both `os.path.join(temp_dir, ...)` and the storage key, so
+    a value like `../../etc/passwd` would otherwise escape the temp directory
+    and land somewhere it shouldn't. Strips any directory component (both
+    separators, since the client may be on Windows) plus null bytes, then
+    requires a known extension.
+    """
+    name = (raw or "").replace("\\", "/").split("/")[-1].replace("\x00", "").strip()
+    # Leading dots would make the file hidden, or resolve to "." / ".." outright.
+    name = name.lstrip(".")
+    if not name:
+        raise ValueError("A file was uploaded without a usable filename")
+
+    extension = os.path.splitext(name)[1].lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise ValueError(
+            f"'{name}' has an unsupported type. Upload a CSV or a PNG/JPG image."
+        )
+    return name
+
+
+async def _save_within_limit(upload: UploadFile, destination: str) -> int:
+    """Stream one upload to disk, aborting if it exceeds MAX_UPLOAD_BYTES.
+
+    Written in chunks rather than a single `.read()` so a large file is never
+    held in memory in full.
+    """
+    total = 0
+    with open(destination, "wb") as fh:
+        while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                raise ValueError(
+                    f"'{upload.filename}' is larger than the "
+                    f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit"
+                )
+            fh.write(chunk)
+    if total == 0:
+        raise ValueError(f"'{upload.filename}' is empty")
+    return total
 
 
 @router.get("")
@@ -44,15 +99,11 @@ async def upload_files(
 
     try:
         for f in files:
-            local_path = os.path.join(temp_dir, f.filename)
-            content = await f.read()
-            logger.debug(
-                "Saving file '%s' (%d bytes) to %s",
-                f.filename, len(content), local_path,
-            )
-            with open(local_path, "wb") as fh:
-                fh.write(content)
-            saved_files.append({"local_path": local_path, "filename": f.filename})
+            filename = _safe_filename(f.filename)
+            local_path = os.path.join(temp_dir, filename)
+            written = await _save_within_limit(f, local_path)
+            logger.debug("Saved file '%s' (%d bytes) to %s", filename, written, local_path)
+            saved_files.append({"local_path": local_path, "filename": filename})
 
         logger.debug("All files saved to temp — calling upload_and_ingest")
         file_ids = await file_service.upload_and_ingest(user, saved_files)
@@ -65,9 +116,14 @@ async def upload_files(
             "file_ids": file_ids,
         }
     except ValueError as e:
+        # Rejected before ingestion started, so nothing else is reading temp_dir.
+        shutil.rmtree(temp_dir, ignore_errors=True)
         logger.warning("Upload validation error for user_id=%s: %s", user["id"], e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # upload_and_ingest only spawns its background task on success, so a
+        # raise here likewise means no one is left holding these paths.
+        shutil.rmtree(temp_dir, ignore_errors=True)
         logger.error("Upload failed for user_id=%s: %s", user["id"], e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
