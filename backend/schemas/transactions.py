@@ -6,11 +6,21 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class TransactionCreate(BaseModel):
-    description: str
+    description: str = Field(min_length=1)
     amount: float = Field(gt=0)
     trans_date: date
     category: str = "Uncategorized"
     merchant_name: Optional[str] = None
+
+    @field_validator("description")
+    @classmethod
+    def _description_not_blank(cls, value: str) -> str:
+        # min_length alone still admits "   ", which would store an unlabelled
+        # transaction and leave the dedup hash with nothing to key on.
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("description must not be blank")
+        return stripped
 
 
 class TransactionUpdate(BaseModel):

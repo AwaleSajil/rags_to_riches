@@ -8,7 +8,7 @@ from typing import List
 from backend.dependencies import get_supabase
 from backend.db_client import get_db_client
 from backend.services.rag_manager import rag_manager
-from backend.services import config_service
+from backend.services import background, config_service
 
 logger = logging.getLogger("moneyrag.services.file_service")
 
@@ -144,7 +144,10 @@ async def upload_and_ingest(user: dict, saved_files: List[dict]) -> List[str]:
             "Spawning ingestion subprocess for user_id=%s — %d files",
             user["id"], len(uploaded_files_info),
         )
-        asyncio.create_task(_run_ingestion_subprocess(user, config, uploaded_files_info))
+        background.spawn(
+            _run_ingestion_subprocess(user, config, uploaded_files_info),
+            name=f"ingest:{user['id']}",
+        )
     else:
         logger.debug("No files to ingest for user_id=%s", user["id"])
 

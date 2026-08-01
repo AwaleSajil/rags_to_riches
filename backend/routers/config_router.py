@@ -44,10 +44,13 @@ async def update_config(body: ConfigUpdate, user: dict = Depends(get_current_use
         if old_embed and old_embed != new_embed:
             logger.info("Embedding model changed from %s to %s for user_id=%s — triggering vector sync", old_embed, new_embed, user["id"])
             from backend.services.file_service import _run_ingestion_subprocess, ingestion_status
-            import asyncio
+            from backend.services import background
             ingestion_status[user["id"]] = {"status": "processing", "error": None}
             # Pass empty file list; worker will re-embed existing DB transactions into pgvector
-            asyncio.create_task(_run_ingestion_subprocess(user, record, []))
+            background.spawn(
+                _run_ingestion_subprocess(user, record, []),
+                name=f"reembed:{user['id']}",
+            )
             
         logger.info("Config updated and RAG invalidated for user_id=%s", user["id"])
         return record
