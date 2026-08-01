@@ -50,25 +50,33 @@ class MoneyRAG:
         else:
             self.supabase = create_client(url, key)
         
-        # Set API Keys
+        # Keys are passed straight to each client rather than exported to
+        # os.environ: one process serves every logged-in user, so a global would
+        # mean whoever constructed a MoneyRAG last decides which key everyone's
+        # requests are billed to.
+        self.api_key = api_key
         if self.llm_provider == "google":
-            os.environ["GOOGLE_API_KEY"] = api_key
-            self.embeddings = GoogleGenerativeAIEmbeddings(model=embedding_model_name)
+            self.embeddings = GoogleGenerativeAIEmbeddings(
+                model=embedding_model_name, google_api_key=api_key
+            )
             provider_name = "google_genai"
         else:
-            os.environ["OPENAI_API_KEY"] = api_key
-            self.embeddings = OpenAIEmbeddings(model=embedding_model_name)
+            self.embeddings = OpenAIEmbeddings(
+                model=embedding_model_name, openai_api_key=api_key
+            )
             provider_name = "openai"
 
         # Initialize LLM
         self.llm = init_chat_model(
             self.model_name,
             model_provider=provider_name,
+            api_key=api_key,
         )
 
-        # Temporary paths for this session
+        # Temporary paths for this session. temp_dir is handed to the MCP server
+        # through its own env at launch (see chat()) — never via os.environ here,
+        # which another user's instance would immediately overwrite.
         self.temp_dir = tempfile.mkdtemp()
-        os.environ["DATA_DIR"] = self.temp_dir # Harmonize with mcp_server.py 
         self.db_path = os.path.join(self.temp_dir, "money_rag.db")
         
         self.db: Optional[SQLDatabase] = None
@@ -674,8 +682,14 @@ Return ONLY a valid JSON array with one object per description, in the same orde
                         "CURRENT_USER_ID": self.user_id,
                         "CURRENT_EMBEDDING_PROVIDER": self.llm_provider,
                         "CURRENT_EMBEDDING_MODEL": self.embedding_model_name,
+                        # This user's own key, so the MCP server never depends on
+                        # a process-wide GOOGLE_API_KEY/OPENAI_API_KEY.
+                        "CURRENT_LLM_API_KEY": self.api_key or "",
                         # So MCP tools can sign private-bucket storage URLs as this user.
                         "CURRENT_ACCESS_TOKEN": self.access_token or "",
+                        # Chart/image handoff directory, unique to this instance —
+                        # otherwise concurrent users overwrite each other's output.
+                        "DATA_DIR": self.temp_dir,
                     },
                 }
             }

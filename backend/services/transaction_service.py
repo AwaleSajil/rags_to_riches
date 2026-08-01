@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from backend.dependencies import get_supabase
-from backend.services import config_service
+from backend.services import background, config_service
 from backend.services.categories import normalize_category
 
 logger = logging.getLogger("moneyrag.services.transaction")
@@ -388,7 +388,10 @@ async def verify_receipt(user: dict, file_id: str, review: Dict[str, Any]) -> Op
         if config and config.get("deep_enrichment"):
             # The user has already verified the OCR fields. Enrichment is an
             # automatic follow-up and never requires a second confirmation.
-            asyncio.create_task(_deep_enrich_verified_receipt(user, tx["id"], config))
+            background.spawn(
+                _deep_enrich_verified_receipt(user, tx["id"], config),
+                name=f"enrich:{tx['id']}",
+            )
         elif config:
             # This is the first point at which a reviewed receipt enters search.
             await asyncio.to_thread(_reembed_transaction, tx, tx["details"], user["id"], config)
@@ -398,19 +401,26 @@ async def verify_receipt(user: dict, file_id: str, review: Dict[str, Any]) -> Op
 
 
 def _build_embeddings(config: dict):
-    """Construct the user's embedding model from their AccountConfig."""
+    """Construct the user's embedding model from their AccountConfig.
+
+    The key goes to the constructor, not os.environ — this process handles every
+    user's requests, so a global would let the most recent caller's key be used
+    to embed someone else's data.
+    """
     provider = (config.get("llm_provider") or "").lower()
     api_key = config.get("api_key")
     model = config.get("embedding_model")
     if provider == "google":
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-        os.environ["GOOGLE_API_KEY"] = api_key
-        return GoogleGenerativeAIEmbeddings(model=model or "gemini-embedding-001")
+        return GoogleGenerativeAIEmbeddings(
+            model=model or "gemini-embedding-001", google_api_key=api_key
+        )
     from langchain_openai import OpenAIEmbeddings
 
-    os.environ["OPENAI_API_KEY"] = api_key
-    return OpenAIEmbeddings(model=model or "text-embedding-3-small")
+    return OpenAIEmbeddings(
+        model=model or "text-embedding-3-small", openai_api_key=api_key
+    )
 
 
 def _save_enrichment_sync(
@@ -469,15 +479,11 @@ async def _deep_enrich_verified_receipt(user: dict, transaction_id: str, config:
             f"- {name}: {result[:200]}" for name, result in search_results.items() if result
         )
         provider = (config.get("llm_provider") or "").lower()
-        if provider == "google":
-            os.environ["GOOGLE_API_KEY"] = config["api_key"]
-            provider_name = "google_genai"
-        else:
-            os.environ["OPENAI_API_KEY"] = config["api_key"]
-            provider_name = "openai"
+        provider_name = "google_genai" if provider == "google" else "openai"
         llm = init_chat_model(
             config.get("decode_model") or "gemini-3-flash-preview",
             model_provider=provider_name,
+            api_key=config["api_key"],
         )
         prompt = ChatPromptTemplate.from_template("""
 You are a financial data assistant. Give a concise, helpful one-sentence description

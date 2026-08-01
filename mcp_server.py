@@ -1,18 +1,25 @@
+import json
+import os
+from typing import Optional
+
 import pandas as pd
 import plotly.express as px
 from fastmcp import FastMCP
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from dotenv import load_dotenv
-import os
-from typing import Optional
 
 from textwrap import dedent
+
+from backend.sql_guard import SqlGuardError, readonly_cursor, validate_select
 
 # Load environment variables (API keys, etc.)
 load_dotenv()
 
-# Define paths to your data
+# Per-chat scratch directory for chart/image handoff to the UI, injected by
+# money_rag when it launches this server. It must be per-instance: a shared
+# default would let one user's chart be picked up by another user's response.
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_data"))
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # Initialize the MCP Server
 mcp = FastMCP("Money RAG Financial Analyst")
@@ -37,13 +44,27 @@ def _quote_table(name: str) -> str:
     """Quote a table name appropriately for Postgres."""
     return f'"{name}"'  # Postgres uses double-quoted identifiers
 
-def _execute_query(conn, query: str):
-    """Execute a query and return (rows, column_names). Works with psycopg2."""
-    cursor = conn.cursor()
-    cursor.execute(query)
-    results = cursor.fetchall()
-    column_names = [desc[0] for desc in cursor.description] if cursor.description else []
-    return results, column_names
+def _run_guarded_query(query: str):
+    """Validate LLM-written SQL, then run it read-only. Returns (rows, columns).
+
+    Every tool that executes model-authored SQL goes through here. The
+    connection uses DATABASE_URL, which is the superuser role and bypasses RLS,
+    so validation is the only thing standing between a prompt injection and the
+    whole database — see backend/sql_guard.py. Raises SqlGuardError when the
+    query is rejected; callers surface that text to the model so it can retry.
+    """
+    user_id = get_current_user_id()
+    validate_select(query, user_id)
+
+    conn = get_db_connection()
+    try:
+        cursor = readonly_cursor(conn)
+        cursor.execute(query)
+        results = cursor.fetchall()
+        column_names = [desc[0] for desc in cursor.description] if cursor.description else []
+        return results, column_names
+    finally:
+        conn.close()
 
 def get_schema_info() -> str:
     """Get database schema information."""
@@ -140,24 +161,8 @@ def query_database(query: str) -> str:
     - List recent transactions: SELECT trans_date, description, amount, category FROM Transaction ORDER BY trans_date DESC LIMIT 5;
     - Spending by category: SELECT category, SUM(amount) FROM Transaction WHERE amount > 0 GROUP BY category;
     """
-    # Security: Only allow SELECT queries
-    query_upper = query.strip().upper()
-    if not query_upper.startswith("SELECT") and not query_upper.startswith("WITH"):
-        return "Error: Only SELECT queries are allowed"
-
-    # Forbidden operations
-    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE"]
-    if any(f" {word} " in f" {query_upper} " for word in forbidden):
-        return f"Error: Query contains forbidden operation. Only SELECT queries allowed."
-
-    user_id = get_current_user_id()
-    if user_id not in query:
-        return f"Error: You forgot to include the security filter (WHERE user_id = '{user_id}') in your query! Try again."
-
     try:
-        conn = get_db_connection()
-        results, column_names = _execute_query(conn, query)
-        conn.close()
+        results, column_names = _run_guarded_query(query)
 
         if not results:
             return "No results found"
@@ -169,6 +174,8 @@ def query_database(query: str) -> str:
             formatted_results.append(str(row))
 
         return "\n".join(formatted_results)
+    except SqlGuardError as e:
+        return f"Query rejected: {e}"
     except Exception as e:
         return f"Database Error: {str(e)}"
 
@@ -192,13 +199,16 @@ def semantic_search(query: str, top_k: int = 5) -> str:
 
         # Use the SAME embedding model the transactions were synced with, injected
         # by money_rag when it launches this MCP server. Falls back to Gemini.
+        # The key is passed to the constructor rather than read from a process-wide
+        # env var, so it stays tied to the user this server was launched for.
         provider = os.environ.get("CURRENT_EMBEDDING_PROVIDER", "google")
         model = os.environ.get("CURRENT_EMBEDDING_MODEL", "gemini-embedding-001")
+        api_key = os.environ.get("CURRENT_LLM_API_KEY") or None
         if provider == "google":
-            embeddings = GoogleGenerativeAIEmbeddings(model=model)
+            embeddings = GoogleGenerativeAIEmbeddings(model=model, google_api_key=api_key)
         else:
             from langchain_openai import OpenAIEmbeddings
-            embeddings = OpenAIEmbeddings(model=model)
+            embeddings = OpenAIEmbeddings(model=model, openai_api_key=api_key)
 
         results = vdb.semantic_search(query, user_id=user_id, top_k=top_k, embeddings_model=embeddings)
         
@@ -238,16 +248,10 @@ def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_co
         A natural language summary confirming chart generation.
     """
     try:
-        user_id = get_current_user_id()
-        if user_id not in sql_query:
-            return f'{{"error": "You forgot the WHERE user_id = \\"{user_id}\\" security clause!"}}'
-            
-        conn = get_db_connection()
-        results, columns = _execute_query(conn, sql_query)
-        conn.close()
+        results, columns = _run_guarded_query(sql_query)
         df = pd.DataFrame(results, columns=columns)
         if df.empty:
-            return '{"error": "No data found for this query."}'
+            return json.dumps({"error": "No data found for this query."})
         if chart_type == "bar":
             fig = px.bar(df, x=x_col, y=y_col, title=title, color=color_col)
         elif chart_type == "pie":
@@ -257,7 +261,7 @@ def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_co
         elif chart_type == "scatter":
             fig = px.scatter(df, x=x_col, y=y_col, title=title, color=color_col)
         else:
-            return f'{{"error": "Unsupported chart type: {chart_type}"}}'
+            return json.dumps({"error": f"Unsupported chart type: {chart_type}"})
 
         # Mobile-friendly color palette (high contrast, accessible)
         mobile_colors = [
@@ -303,9 +307,11 @@ def generate_interactive_chart(sql_query: str, chart_type: str, x_col: str, y_co
             "You MUST now write a detailed text summary of the data and key insights for the user. "
             "Do NOT include the raw chart JSON in your response."
         )
-        
+
+    except SqlGuardError as e:
+        return json.dumps({"error": f"Query rejected: {e}"})
     except Exception as e:
-        return f'{{"error": "Failed to generate chart: {str(e)}"}}'
+        return json.dumps({"error": f"Failed to generate chart: {e}"})
 @mcp.tool()
 def get_bill_images(sql_query: str) -> str:
     """
@@ -326,16 +332,10 @@ def get_bill_images(sql_query: str) -> str:
         JSON string containing the public image URLs.
     """
     try:
-        user_id = get_current_user_id()
-        if user_id not in sql_query:
-            return f'{{"error": "You forgot the WHERE user_id = \\"{user_id}\\" security clause!"}}'
-            
-        conn = get_db_connection()
-        results, _ = _execute_query(conn, sql_query)
-        conn.close()
+        results, _ = _run_guarded_query(sql_query)
 
         if not results:
-            return '{"error": "No bills found for this query."}'
+            return json.dumps({"error": "No bills found for this query."})
 
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
@@ -365,19 +365,19 @@ def get_bill_images(sql_query: str) -> str:
                     urls.append(signed_url)
 
         if not urls:
-            return '{"error": "No image keys found in result set."}'
-            
-        import json
-        
+            return json.dumps({"error": "No image keys found in result set."})
+
         # Write image URLs to a temp file that the main UI can pick up and render alongside the chat
         chart_path = os.path.join(DATA_DIR, "latest_images.json")
         with open(chart_path, "w") as f:
             json.dump(urls, f)
             
         return "Images retrieved successfully! I have sent the image URLs to the user's UI. You can tell the user the receipt is attached."
-        
+
+    except SqlGuardError as e:
+        return json.dumps({"error": f"Query rejected: {e}"})
     except Exception as e:
-        return f'{{"error": "Failed to retrieve images: {str(e)}"}}'
+        return json.dumps({"error": f"Failed to retrieve images: {e}"})
 
 @mcp.tool()
 def propose_transaction(
