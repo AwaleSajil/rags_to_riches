@@ -7,9 +7,14 @@ import { AuthProvider, useAuth } from "../src/providers/AuthProvider";
 import { ChatSessionProvider } from "../src/providers/ChatSessionProvider";
 import { theme, colors } from "../src/styles/theme";
 import { LoadingSpinner } from "../src/components/LoadingSpinner";
+import { RouteErrorBoundary } from "../src/components/RouteErrorBoundary";
 import { createLogger } from "../src/lib/logger";
 
 const log = createLogger("Navigation");
+
+// expo-router renders this instead of the tree below when a route throws while
+// rendering. Without it an uncaught error is a white screen with no way back.
+export { RouteErrorBoundary as ErrorBoundary };
 
 // Without this the Stack's first declared child (transaction/[id]) can win the
 // initial route, so the app boots into a detail screen with no id and sits on
