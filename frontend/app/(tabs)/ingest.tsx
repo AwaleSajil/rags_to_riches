@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { StyleSheet, View, ScrollView, Platform, Pressable } from "react-native";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { StyleSheet, View, SectionList, Platform, Pressable, RefreshControl } from "react-native";
 import { Text, Button, Snackbar, ProgressBar, Badge, Searchbar, Chip } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
@@ -15,8 +15,9 @@ import { LoadingSpinner } from "../../src/components/LoadingSpinner";
 import { useFiles } from "../../src/hooks/useFiles";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
+import { openReview } from "../../src/lib/reviewRouting";
 import type { FileItem } from "../../src/lib/types";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 
 const log = createLogger("IngestScreen");
 
@@ -26,6 +27,17 @@ const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
+
+// One shared empty array, so collapsing a month doesn't hand SectionList a new
+// `data` identity every render and re-render the whole list.
+const NO_ROWS: FileItem[] = [];
+
+type MonthSection = {
+  title: string;
+  count: number;
+  collapsed: boolean;
+  data: FileItem[];
+};
 
 function monthLabel(dateStr?: string): string {
   if (!dateStr) return "Unknown date";
@@ -45,22 +57,32 @@ export default function IngestScreen() {
     visibilityFileId,
     error,
     duplicates,
-    receiptReviewFileIds,
+    reviewItems,
     ingestionProgress,
     uploadFiles,
     deleteFile,
     toggleFileVisibility,
+    loadFiles,
     clearDuplicates,
   } = useFiles();
 
+  // Reload whenever this tab comes into view. Tab screens stay MOUNTED when you
+  // switch away, so useFiles' mount-time load runs exactly once — the first time
+  // this tab is ever opened. A photo taken in Chat therefore never appeared here
+  // until a manual pull-to-refresh, even though it had uploaded fine. Chat and
+  // Transactions already did this; Files was the only tab that did not.
+  //
+  // Each screen holds its own useFiles() state, so Chat refreshing its copy does
+  // nothing for this one.
+  useFocusEffect(
+    useCallback(() => {
+      loadFiles();
+    }, [loadFiles])
+  );
+
   useEffect(() => {
-    if (!receiptReviewFileIds.length) return;
-    const [fileId, ...remaining] = receiptReviewFileIds;
-    router.push({
-      pathname: "/receipt-review/[fileId]",
-      params: { fileId, remaining: remaining.join(",") },
-    });
-  }, [receiptReviewFileIds, router]);
+    openReview(router, reviewItems);
+  }, [reviewItems, router]);
 
   const [pickedFiles, setPickedFiles] = useState<
     { uri: string; name: string; type: string }[]
@@ -93,8 +115,23 @@ export default function IngestScreen() {
     return groups;
   }, [files, typeFilter, search]);
 
-  const toggleMonth = (month: string) =>
-    setCollapsedMonths((prev) => ({ ...prev, [month]: !prev[month] }));
+  // Collapsing swaps a section's rows for an empty array rather than rebuilding
+  // the groups, so toggling a month never re-runs the filtering above.
+  const sections = useMemo<MonthSection[]>(
+    () =>
+      groupedFiles.map((group) => ({
+        title: group.month,
+        count: group.items.length,
+        collapsed: !!collapsedMonths[group.month],
+        data: collapsedMonths[group.month] ? NO_ROWS : group.items,
+      })),
+    [groupedFiles, collapsedMonths]
+  );
+
+  const toggleMonth = useCallback(
+    (month: string) => setCollapsedMonths((prev) => ({ ...prev, [month]: !prev[month] })),
+    []
+  );
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -155,8 +192,14 @@ export default function IngestScreen() {
     setCameraOpen(true);
   };
 
-  const handleCameraCapture = (photo: { uri: string; name: string; type: string }) => {
-    log.info("Camera photo captured", { name: photo.name, type: photo.type });
+  const handleCameraCapture = (
+    photo: { uri: string; name: string; type: string },
+    place?: string | null
+  ) => {
+    // The batch path has no per-photo location field, so a place captured here
+    // is not carried through. Receipts get their address off the receipt itself,
+    // which is better than a fix anyway; a shelf price wants the chat capture.
+    log.info("Camera photo captured", { name: photo.name, type: photo.type, place: !!place });
     setPickedFiles((prev) => [...prev, photo]);
   };
 
@@ -166,7 +209,13 @@ export default function IngestScreen() {
 
   const handleReviewReceipt = (file: FileItem) => {
     setPreviewTarget(null);
-    router.push({ pathname: "/receipt-review/[fileId]", params: { fileId: file.id } });
+    // Route on what the photo actually is. This used to open the receipt form
+    // on whatever was tapped, so a price tag in this list led to a form that
+    // would turn a shelf price into spending that never happened. Rows from
+    // before migration 014 have no kind; treat those as receipts, which is what
+    // they are — the column was added precisely because everything until then
+    // was one.
+    openReview(router, [{ file_id: file.id, kind: file.kind ?? "receipt" }]);
   };
 
   const handleIngest = async () => {
@@ -216,194 +265,233 @@ export default function IngestScreen() {
     }
   };
 
-  if (isLoading) {
+  const keyExtractor = useCallback(
+    (file: FileItem, index: number) => file.id ?? `file-${index}`,
+    []
+  );
+
+  const renderItem = useCallback(
+    ({ item }: { item: FileItem }) => (
+      <FileListItem
+        file={item}
+        onDelete={setDeleteTarget}
+        onPress={setPreviewTarget}
+        onToggleVisibility={toggleFileVisibility}
+        isTogglingVisibility={visibilityFileId === item.id}
+      />
+    ),
+    [toggleFileVisibility, visibilityFileId]
+  );
+
+  const renderSectionHeader = useCallback(
+    ({ section }: { section: MonthSection }) => (
+      <Pressable style={styles.monthHeader} onPress={() => toggleMonth(section.title)}>
+        <MaterialCommunityIcons
+          name={section.collapsed ? "chevron-right" : "chevron-down"}
+          size={22}
+          color={colors.textSecondary}
+        />
+        <Text style={styles.monthTitle}>{section.title}</Text>
+        <Badge style={styles.monthBadge}>{section.count}</Badge>
+      </Pressable>
+    ),
+    [toggleMonth]
+  );
+
+  // Replaces the `marginBottom` the wrapping <View> used to give each group.
+  const renderSectionFooter = useCallback(() => <View style={styles.sectionGap} />, []);
+
+  // Only on the FIRST load. Returning the spinner on every isLoading would tear
+  // the whole screen down mid-pull the moment a refresh started, taking the
+  // RefreshControl's own spinner and the gesture with it.
+  if (isLoading && files.length === 0) {
     return <LoadingSpinner message="Loading files..." />;
   }
 
-  return (
-    <View style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* Section 1: Upload Drop Zone */}
-        <UploadDropZone
-          onPickFiles={handlePickFiles}
-          onOpenCamera={handleOpenCamera}
-        />
+  // Passed as an ELEMENT, not a function. An inline `() => <.../>` is a new
+  // component type on every render, so SectionList would unmount and remount
+  // this whole block — and the Searchbar would lose focus on every keystroke.
+  const listHeader = (
+    <>
+      {/* Section 1: Upload Drop Zone */}
+      <UploadDropZone
+        onPickFiles={handlePickFiles}
+        onOpenCamera={handleOpenCamera}
+      />
 
-        {/* Section 2: Picked Files */}
-        {pickedFiles.length > 0 && (
-          <GlassCard variant="elevated" style={styles.pickedSection}>
-            <Text style={styles.pickedTitle}>
-              {pickedFiles.length} file{pickedFiles.length > 1 ? "s" : ""} selected
-            </Text>
-            <View style={styles.chipRow}>
-              {pickedFiles.map((f, i) => (
-                <PickedFileChip
-                  key={`${f.name}-${i}`}
-                  name={f.name}
-                  type={f.type}
-                  onRemove={() => handleRemovePickedFile(i)}
-                />
-              ))}
-            </View>
-            <Button
-              mode="contained"
-              icon="upload"
-              onPress={handleIngest}
-              loading={isUploading}
-              disabled={isUploading}
-              style={styles.ingestButton}
-              labelStyle={styles.ingestButtonLabel}
-            >
-              {isUploading ? "Uploading..." : `Ingest ${pickedFiles.length} File${pickedFiles.length > 1 ? "s" : ""}`}
-            </Button>
-          </GlassCard>
-        )}
-
-        {/* Section 3: Ingestion Progress */}
-        {isIngesting && (
-          <GlassCard style={styles.progressSection}>
-            <Text style={styles.progressText}>
-              {ingestionProgress?.stage === "parsing" && "📄 Parsing CSV..."}
-              {ingestionProgress?.stage === "enriching" && "✨ Enriching merchants..."}
-              {ingestionProgress?.stage === "saving" && "💾 Saving to database..."}
-              {ingestionProgress?.stage === "embedding" && "🧠 Building search index..."}
-              {!ingestionProgress?.stage && "Processing your files..."}
-            </Text>
-            <ProgressBar
-              indeterminate={
-                !ingestionProgress?.stage ||
-                ingestionProgress.total === 0
-              }
-              progress={
-                ingestionProgress && ingestionProgress.total > 0
-                  ? ingestionProgress.done / ingestionProgress.total
-                  : 0
-              }
-              color={colors.primary}
-              style={styles.progressBar}
-            />
-            <Text style={styles.progressSubtext}>
-              {ingestionProgress && ingestionProgress.total > 0
-                ? `${ingestionProgress.done} / ${ingestionProgress.total}${ingestionProgress.detail ? ` — ${ingestionProgress.detail}` : ""}`
-                : "Starting up..."}
-            </Text>
-          </GlassCard>
-        )}
-
-        {/* Section 4: Duplicate Warnings */}
-        {duplicates.length > 0 && (
-          <GlassCard variant="flat" style={styles.duplicateCard}>
-            <Text style={styles.duplicateTitle}>
-              {duplicates.length} duplicate transaction{duplicates.length > 1 ? "s" : ""} detected
-            </Text>
-            <Text style={styles.duplicateSubtitle}>
-              These were merged/skipped during ingestion:
-            </Text>
-            {duplicates.slice(0, 10).map((d, i) => (
-              <Text key={i} style={styles.duplicateItem}>
-                {d.date} - {d.merchant} - ${Number(d.amount).toFixed(2)}
-              </Text>
+      {/* Section 2: Picked Files */}
+      {pickedFiles.length > 0 && (
+        <GlassCard variant="elevated" style={styles.pickedSection}>
+          <Text style={styles.pickedTitle}>
+            {pickedFiles.length} file{pickedFiles.length > 1 ? "s" : ""} selected
+          </Text>
+          <View style={styles.chipRow}>
+            {pickedFiles.map((f, i) => (
+              <PickedFileChip
+                key={`${f.name}-${i}`}
+                name={f.name}
+                type={f.type}
+                onRemove={() => handleRemovePickedFile(i)}
+              />
             ))}
-            {duplicates.length > 10 && (
-              <Text style={styles.duplicateSubtitle}>
-                ...and {duplicates.length - 10} more
-              </Text>
-            )}
-            <Button
-              mode="text"
-              onPress={clearDuplicates}
-              compact
-              style={styles.dismissButton}
-            >
-              Dismiss
-            </Button>
-          </GlassCard>
-        )}
-
-        {/* Section 5: Your Files */}
-        <View style={styles.fileListHeader}>
-          <View style={styles.fileListTitleRow}>
-            <Text style={styles.fileListTitle}>Your Files</Text>
-            {files.length > 0 && (
-              <Badge style={styles.fileCount}>{files.length}</Badge>
-            )}
           </View>
-          {files.length > 0 && (
-            <Text style={styles.fileListSubtitle}>
-              {files.filter(f => f.type === "csv").length} CSV, {files.filter(f => f.type === "bill").length} receipt{files.filter(f => f.type === "bill").length !== 1 ? "s" : ""}
+          <Button
+            mode="contained"
+            icon="upload"
+            onPress={handleIngest}
+            loading={isUploading}
+            disabled={isUploading}
+            style={styles.ingestButton}
+            labelStyle={styles.ingestButtonLabel}
+          >
+            {isUploading ? "Uploading..." : `Ingest ${pickedFiles.length} File${pickedFiles.length > 1 ? "s" : ""}`}
+          </Button>
+        </GlassCard>
+      )}
+
+      {/* Section 3: Ingestion Progress */}
+      {isIngesting && (
+        <GlassCard style={styles.progressSection}>
+          <Text style={styles.progressText}>
+            {ingestionProgress?.stage === "parsing" && "📄 Parsing CSV..."}
+            {ingestionProgress?.stage === "enriching" && "✨ Enriching merchants..."}
+            {ingestionProgress?.stage === "saving" && "💾 Saving to database..."}
+            {ingestionProgress?.stage === "embedding" && "🧠 Building search index..."}
+            {!ingestionProgress?.stage && "Processing your files..."}
+          </Text>
+          <ProgressBar
+            indeterminate={
+              !ingestionProgress?.stage ||
+              ingestionProgress.total === 0
+            }
+            progress={
+              ingestionProgress && ingestionProgress.total > 0
+                ? ingestionProgress.done / ingestionProgress.total
+                : 0
+            }
+            color={colors.primary}
+            style={styles.progressBar}
+          />
+          <Text style={styles.progressSubtext}>
+            {ingestionProgress && ingestionProgress.total > 0
+              ? `${ingestionProgress.done} / ${ingestionProgress.total}${ingestionProgress.detail ? ` — ${ingestionProgress.detail}` : ""}`
+              : "Starting up..."}
+          </Text>
+        </GlassCard>
+      )}
+
+      {/* Section 4: Duplicate Warnings */}
+      {duplicates.length > 0 && (
+        <GlassCard variant="flat" style={styles.duplicateCard}>
+          <Text style={styles.duplicateTitle}>
+            {duplicates.length} duplicate transaction{duplicates.length > 1 ? "s" : ""} detected
+          </Text>
+          <Text style={styles.duplicateSubtitle}>
+            These were merged/skipped during ingestion:
+          </Text>
+          {duplicates.slice(0, 10).map((d, i) => (
+            <Text key={i} style={styles.duplicateItem}>
+              {d.date} - {d.merchant} - ${Number(d.amount).toFixed(2)}
+            </Text>
+          ))}
+          {duplicates.length > 10 && (
+            <Text style={styles.duplicateSubtitle}>
+              ...and {duplicates.length - 10} more
             </Text>
           )}
+          <Button
+            mode="text"
+            onPress={clearDuplicates}
+            compact
+            style={styles.dismissButton}
+          >
+            Dismiss
+          </Button>
+        </GlassCard>
+      )}
+
+      {/* Section 5: Your Files */}
+      <View style={styles.fileListHeader}>
+        <View style={styles.fileListTitleRow}>
+          <Text style={styles.fileListTitle}>Your Files</Text>
+          {files.length > 0 && (
+            <Badge style={styles.fileCount}>{files.length}</Badge>
+          )}
         </View>
-
-        {files.length === 0 ? (
-          <Text style={styles.emptyText}>No files uploaded yet.</Text>
-        ) : (
-          <>
-            {/* Search */}
-            <Searchbar
-              placeholder="Search files"
-              value={search}
-              onChangeText={setSearch}
-              style={styles.searchbar}
-              inputStyle={styles.searchInput}
-              icon="magnify"
-            />
-
-            {/* Type filter chips */}
-            <View style={styles.filterRow}>
-              {([
-                { key: "all", label: "All" },
-                { key: "csv", label: "CSVs" },
-                { key: "bill", label: "Receipts" },
-              ] as { key: FileFilter; label: string }[]).map((chip) => (
-                <Chip
-                  key={chip.key}
-                  selected={typeFilter === chip.key}
-                  onPress={() => setTypeFilter(chip.key)}
-                  style={[styles.filterChip, typeFilter === chip.key && styles.filterChipActive]}
-                  showSelectedCheck={false}
-                  compact
-                >
-                  {chip.label}
-                </Chip>
-              ))}
-            </View>
-
-            {/* Collapsible month groups */}
-            {groupedFiles.length === 0 ? (
-              <Text style={styles.emptyText}>No files match your search.</Text>
-            ) : (
-              groupedFiles.map(({ month, items }) => {
-                const collapsed = collapsedMonths[month];
-                return (
-                  <View key={month} style={styles.monthGroup}>
-                    <Pressable style={styles.monthHeader} onPress={() => toggleMonth(month)}>
-                      <MaterialCommunityIcons
-                        name={collapsed ? "chevron-right" : "chevron-down"}
-                        size={22}
-                        color={colors.textSecondary}
-                      />
-                      <Text style={styles.monthTitle}>{month}</Text>
-                      <Badge style={styles.monthBadge}>{items.length}</Badge>
-                    </Pressable>
-                    {!collapsed &&
-                      items.map((file, index) => (
-                        <FileListItem
-                          key={file.id ?? `file-${index}`}
-                          file={file}
-                          onDelete={setDeleteTarget}
-                          onPress={setPreviewTarget}
-                          onToggleVisibility={toggleFileVisibility}
-                          isTogglingVisibility={visibilityFileId === file.id}
-                        />
-                      ))}
-                  </View>
-                );
-              })
-            )}
-          </>
+        {files.length > 0 && (
+          <Text style={styles.fileListSubtitle}>
+            {files.filter(f => f.type === "csv").length} CSV, {files.filter(f => f.type === "bill").length} receipt{files.filter(f => f.type === "bill").length !== 1 ? "s" : ""}
+          </Text>
         )}
-      </ScrollView>
+      </View>
+
+      {files.length === 0 ? (
+        <Text style={styles.emptyText}>No files uploaded yet.</Text>
+      ) : (
+        <>
+          {/* Search */}
+          <Searchbar
+            placeholder="Search files"
+            value={search}
+            onChangeText={setSearch}
+            style={styles.searchbar}
+            inputStyle={styles.searchInput}
+            icon="magnify"
+          />
+
+          {/* Type filter chips */}
+          <View style={styles.filterRow}>
+            {([
+              { key: "all", label: "All" },
+              { key: "csv", label: "CSVs" },
+              { key: "bill", label: "Receipts" },
+            ] as { key: FileFilter; label: string }[]).map((chip) => (
+              <Chip
+                key={chip.key}
+                selected={typeFilter === chip.key}
+                onPress={() => setTypeFilter(chip.key)}
+                style={[styles.filterChip, typeFilter === chip.key && styles.filterChipActive]}
+                showSelectedCheck={false}
+                compact
+              >
+                {chip.label}
+              </Chip>
+            ))}
+          </View>
+
+          {/* Not SectionList's ListEmptyComponent: that also fires when every
+              month happens to be collapsed. */}
+          {sections.length === 0 && (
+            <Text style={styles.emptyText}>No files match your search.</Text>
+          )}
+        </>
+      )}
+    </>
+  );
+
+  return (
+    <View style={styles.container}>
+      {/* Collapsible month groups. Virtualized, so a long upload history mounts
+          only the rows on screen instead of every row at once. */}
+      <SectionList
+        sections={sections}
+        keyExtractor={keyExtractor}
+        renderItem={renderItem}
+        renderSectionHeader={renderSectionHeader}
+        renderSectionFooter={renderSectionFooter}
+        ListHeaderComponent={listHeader}
+        contentContainerStyle={styles.scrollContent}
+        // The month headers have no background of their own, so sticking them
+        // would let rows scroll through the text.
+        stickySectionHeadersEnabled={false}
+        keyboardShouldPersistTaps="handled"
+        initialNumToRender={12}
+        maxToRenderPerBatch={12}
+        windowSize={11}
+        refreshControl={
+          <RefreshControl refreshing={isLoading} onRefresh={loadFiles} tintColor={colors.primary} />
+        }
+      />
 
       {/* File Preview (receipt image or CSV table) */}
       <FilePreviewModal
@@ -542,8 +630,8 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primaryLight,
     borderColor: colors.primary,
   },
-  monthGroup: {
-    marginBottom: spacing.sm,
+  sectionGap: {
+    height: spacing.sm,
   },
   monthHeader: {
     flexDirection: "row",

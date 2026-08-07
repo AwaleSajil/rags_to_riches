@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState } from "react";
-import { StyleSheet, View, ScrollView, Pressable, RefreshControl } from "react-native";
+import { StyleSheet, View, ScrollView, Pressable, RefreshControl, SectionList } from "react-native";
 import { Text, Searchbar, Chip, Badge } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter, useFocusEffect } from "expo-router";
@@ -13,6 +13,18 @@ const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
+
+// One shared empty array, so collapsing a month doesn't hand SectionList a new
+// `data` identity every render and re-render the whole list.
+const NO_ROWS: TransactionListItem[] = [];
+
+type MonthSection = {
+  title: string;
+  count: number;
+  total: number;
+  collapsed: boolean;
+  data: TransactionListItem[];
+};
 
 function monthLabel(dateStr: string | null): string {
   if (!dateStr) return "Unknown date";
@@ -46,7 +58,7 @@ export default function TransactionsScreen() {
   }, [transactions]);
 
   // Filter (category + text) → sort newest-first → group into month buckets.
-  const groupedTransactions = useMemo(() => {
+  const monthGroups = useMemo(() => {
     const q = search.trim().toLowerCase();
     const filtered = transactions
       .filter((t) => category === "all" || t.category === category)
@@ -97,112 +109,164 @@ export default function TransactionsScreen() {
       }
       index[label].push(t);
     }
-    return groups;
+    // Spending is stored as a positive amount. Negative entries are credit-card
+    // payments/refunds and should not reduce the month's total cost.
+    return groups.map(({ month, items }) => ({
+      month,
+      items,
+      total: items.reduce((sum, t) => sum + Math.max(t.amount ?? 0, 0), 0),
+    }));
   }, [transactions, category, search]);
 
-  const toggleMonth = (month: string) =>
-    setCollapsedMonths((prev) => ({ ...prev, [month]: !(prev[month] ?? true) }));
+  // Collapsing swaps a section's rows for an empty array rather than rebuilding
+  // the groups, so toggling a month never re-runs the filtering and link
+  // resolution above.
+  const sections = useMemo<MonthSection[]>(
+    () =>
+      monthGroups.map((group) => {
+        // Keep the list compact on entry; users expand only the month they
+        // want to inspect.
+        const collapsed = collapsedMonths[group.month] ?? true;
+        return {
+          title: group.month,
+          count: group.items.length,
+          total: group.total,
+          collapsed,
+          data: collapsed ? NO_ROWS : group.items,
+        };
+      }),
+    [monthGroups, collapsedMonths]
+  );
 
-  const openTransaction = (tx: TransactionListItem) => {
-    router.push(`/transaction/${tx.id}`);
-  };
+  const toggleMonth = useCallback(
+    (month: string) =>
+      setCollapsedMonths((prev) => ({ ...prev, [month]: !(prev[month] ?? true) })),
+    []
+  );
+
+  const openTransaction = useCallback(
+    (tx: TransactionListItem) => {
+      router.push(`/transaction/${tx.id}`);
+    },
+    [router]
+  );
+
+  const keyExtractor = useCallback((tx: TransactionListItem) => tx.id, []);
+
+  const renderItem = useCallback(
+    ({ item }: { item: TransactionListItem }) => (
+      <TransactionRow transaction={item} onPress={openTransaction} />
+    ),
+    [openTransaction]
+  );
+
+  const renderSectionHeader = useCallback(
+    ({ section }: { section: MonthSection }) => (
+      <Pressable style={styles.monthHeader} onPress={() => toggleMonth(section.title)}>
+        <MaterialCommunityIcons
+          name={section.collapsed ? "chevron-right" : "chevron-down"}
+          size={22}
+          color={colors.textSecondary}
+        />
+        <Text style={styles.monthTitle}>{section.title}</Text>
+        <Text style={styles.monthTotal}>${section.total.toFixed(2)}</Text>
+        <Badge style={styles.monthBadge}>{section.count}</Badge>
+      </Pressable>
+    ),
+    [toggleMonth]
+  );
+
+  // Replaces the `marginBottom` the wrapping <View> used to give each group.
+  const renderSectionFooter = useCallback(() => <View style={styles.sectionGap} />, []);
 
   if (isLoading && transactions.length === 0) {
     return <LoadingSpinner message="Loading transactions..." />;
   }
 
+  // Passed as an ELEMENT, not a function. An inline `() => <.../>` is a new
+  // component type on every render, so SectionList would unmount and remount
+  // this whole block — and the Searchbar would lose focus on every keystroke.
+  const listHeader = (
+    <>
+      <View style={styles.header}>
+        <View style={styles.titleRow}>
+          <Text style={styles.title}>Transactions</Text>
+          {transactions.length > 0 && (
+            <Badge style={styles.count}>{transactions.length}</Badge>
+          )}
+        </View>
+      </View>
+
+      {transactions.length === 0 ? (
+        <Text style={styles.emptyText}>
+          No transactions yet. Upload a CSV or receipt in the Files tab to get started.
+        </Text>
+      ) : (
+        <>
+          <Searchbar
+            placeholder="Search merchant or description"
+            value={search}
+            onChangeText={setSearch}
+            style={styles.searchbar}
+            inputStyle={styles.searchInput}
+            icon="magnify"
+          />
+
+          {/* Category filter chips */}
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.filterRow}
+          >
+            {[{ key: "all", label: "All" }, ...categories.map((c) => ({ key: c, label: c }))].map(
+              (chip) => (
+                <Chip
+                  key={chip.key}
+                  selected={category === chip.key}
+                  onPress={() => setCategory(chip.key)}
+                  style={[styles.filterChip, category === chip.key && styles.filterChipActive]}
+                  showSelectedCheck={false}
+                  compact
+                >
+                  {chip.label}
+                </Chip>
+              )
+            )}
+          </ScrollView>
+
+          {/* Not SectionList's ListEmptyComponent: that also fires when every
+              month happens to be collapsed, which is the normal opening state. */}
+          {sections.length === 0 && (
+            <Text style={styles.emptyText}>No transactions match your search.</Text>
+          )}
+        </>
+      )}
+    </>
+  );
+
   return (
     <View style={styles.container}>
-      <ScrollView
+      {/* Collapsible month groups. Virtualized, so a year of statements mounts
+          only the rows on screen instead of every row at once. */}
+      <SectionList
+        sections={sections}
+        keyExtractor={keyExtractor}
+        renderItem={renderItem}
+        renderSectionHeader={renderSectionHeader}
+        renderSectionFooter={renderSectionFooter}
+        ListHeaderComponent={listHeader}
         contentContainerStyle={styles.scrollContent}
+        // The month headers have no background of their own, so sticking them
+        // would let rows scroll through the text.
+        stickySectionHeadersEnabled={false}
+        keyboardShouldPersistTaps="handled"
+        initialNumToRender={12}
+        maxToRenderPerBatch={12}
+        windowSize={11}
         refreshControl={
           <RefreshControl refreshing={isLoading} onRefresh={refresh} tintColor={colors.primary} />
         }
-      >
-        <View style={styles.header}>
-          <View style={styles.titleRow}>
-            <Text style={styles.title}>Transactions</Text>
-            {transactions.length > 0 && (
-              <Badge style={styles.count}>{transactions.length}</Badge>
-            )}
-          </View>
-        </View>
-
-        {transactions.length === 0 ? (
-          <Text style={styles.emptyText}>
-            No transactions yet. Upload a CSV or receipt in the Files tab to get started.
-          </Text>
-        ) : (
-          <>
-            <Searchbar
-              placeholder="Search merchant or description"
-              value={search}
-              onChangeText={setSearch}
-              style={styles.searchbar}
-              inputStyle={styles.searchInput}
-              icon="magnify"
-            />
-
-            {/* Category filter chips */}
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.filterRow}
-            >
-              {[{ key: "all", label: "All" }, ...categories.map((c) => ({ key: c, label: c }))].map(
-                (chip) => (
-                  <Chip
-                    key={chip.key}
-                    selected={category === chip.key}
-                    onPress={() => setCategory(chip.key)}
-                    style={[styles.filterChip, category === chip.key && styles.filterChipActive]}
-                    showSelectedCheck={false}
-                    compact
-                  >
-                    {chip.label}
-                  </Chip>
-                )
-              )}
-            </ScrollView>
-
-            {/* Collapsible month groups */}
-            {groupedTransactions.length === 0 ? (
-              <Text style={styles.emptyText}>No transactions match your search.</Text>
-            ) : (
-              groupedTransactions.map(({ month, items }) => {
-                // Keep the list compact on entry; users expand only the month
-                // they want to inspect.
-                const collapsed = collapsedMonths[month] ?? true;
-                // Spending is stored as a positive amount. Negative entries are
-                // credit-card payments/refunds and should not reduce the month's
-                // total cost shown in this header.
-                const monthTotal = items.reduce(
-                  (sum, t) => sum + Math.max(t.amount ?? 0, 0),
-                  0
-                );
-                return (
-                  <View key={month} style={styles.monthGroup}>
-                    <Pressable style={styles.monthHeader} onPress={() => toggleMonth(month)}>
-                      <MaterialCommunityIcons
-                        name={collapsed ? "chevron-right" : "chevron-down"}
-                        size={22}
-                        color={colors.textSecondary}
-                      />
-                      <Text style={styles.monthTitle}>{month}</Text>
-                      <Text style={styles.monthTotal}>${monthTotal.toFixed(2)}</Text>
-                      <Badge style={styles.monthBadge}>{items.length}</Badge>
-                    </Pressable>
-                    {!collapsed &&
-                      items.map((tx) => (
-                        <TransactionRow key={tx.id} transaction={tx} onPress={openTransaction} />
-                      ))}
-                  </View>
-                );
-              })
-            )}
-          </>
-        )}
-      </ScrollView>
+      />
     </View>
   );
 }
@@ -257,8 +321,8 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primaryLight,
     borderColor: colors.primary,
   },
-  monthGroup: {
-    marginBottom: spacing.sm,
+  sectionGap: {
+    height: spacing.sm,
   },
   monthHeader: {
     flexDirection: "row",

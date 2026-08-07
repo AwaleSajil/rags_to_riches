@@ -23,7 +23,7 @@ function formatDay(dateStr: string | null): string {
   });
 }
 
-export function TransactionRow({ transaction, onPress }: TransactionRowProps) {
+function TransactionRowComponent({ transaction, onPress }: TransactionRowProps) {
   const isBill = transaction.source === "bill";
   const iconName = isBill ? "receipt-text-outline" : "bank-outline";
   const amount = transaction.amount ?? 0;
@@ -62,6 +62,11 @@ export function TransactionRow({ transaction, onPress }: TransactionRowProps) {
     </Pressable>
   );
 }
+
+// The list re-renders on every keystroke in the search box and on every refresh
+// state change. Without this, each of those re-renders every mounted row even
+// though nothing about the row changed.
+export const TransactionRow = React.memo(TransactionRowComponent);
 
 const styles = StyleSheet.create({
   container: {

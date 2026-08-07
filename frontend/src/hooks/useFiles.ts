@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import * as fileService from "../services/fileService";
 import { createLogger } from "../lib/logger";
+import type { ReviewItem } from "../services/fileService";
 import type { FileItem } from "../lib/types";
 
 const log = createLogger("useFiles");
@@ -35,7 +36,9 @@ export function useFiles() {
   const [visibilityFileId, setVisibilityFileId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
-  const [receiptReviewFileIds, setReceiptReviewFileIds] = useState<string[]>([]);
+  // Photos awaiting review, each tagged receipt | price_tag | unknown so the
+  // screen can route to the right form instead of assuming everything is a receipt.
+  const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
   const [ingestionProgress, setIngestionProgress] = useState<IngestionProgress | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // loadFiles is defined below and depends on nothing, but the poller needs to
@@ -120,7 +123,15 @@ export function useFiles() {
           stopPolling();
           setIsIngesting(false);
           setIngestionProgress(null);
-          setReceiptReviewFileIds(status.receipt_review_file_ids || []);
+          // Fall back to the old field so a client running against a
+          // not-yet-updated backend still routes its receipts somewhere.
+          setReviewItems(
+            status.review_items ??
+              (status.receipt_review_file_ids || []).map((file_id) => ({
+                file_id,
+                kind: "receipt" as const,
+              }))
+          );
           const data = await fileService.listFiles();
           setFiles(data);
         } else if (status.status === "failed") {
@@ -172,7 +183,7 @@ export function useFiles() {
     setIsUploading(true);
     setError(null);
     setDuplicates([]);
-    setReceiptReviewFileIds([]);
+    setReviewItems([]);
     try {
       await fileService.uploadFiles(pickedFiles);
       log.info("Upload complete - reloading file list and starting ingestion poll");
@@ -206,7 +217,10 @@ export function useFiles() {
     }
   };
 
-  const toggleFileVisibility = async (file: FileItem) => {
+  // Stable identity: this is a prop on every row in the file list, so a new
+  // function each render would defeat FileListItem's memoization and re-render
+  // the whole visible list on every keystroke in the search box.
+  const toggleFileVisibility = useCallback(async (file: FileItem) => {
     setVisibilityFileId(file.id);
     try {
       const result = await fileService.setFileVisibility(file.id, file.type, !file.is_hidden);
@@ -221,7 +235,7 @@ export function useFiles() {
     } finally {
       setVisibilityFileId(null);
     }
-  };
+  }, []);
 
   const clearDuplicates = useCallback(() => {
     setDuplicates([]);
@@ -236,7 +250,7 @@ export function useFiles() {
     visibilityFileId,
     error,
     duplicates,
-    receiptReviewFileIds,
+    reviewItems,
     ingestionProgress,
     uploadFiles,
     deleteFile,

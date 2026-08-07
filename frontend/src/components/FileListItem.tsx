@@ -13,7 +13,7 @@ interface FileListItemProps {
   isTogglingVisibility?: boolean;
 }
 
-export function FileListItem({ file, onDelete, onPress, onToggleVisibility, isTogglingVisibility }: FileListItemProps) {
+function FileListItemComponent({ file, onDelete, onPress, onToggleVisibility, isTogglingVisibility }: FileListItemProps) {
   const isCSV = file.type === "csv";
   const iconName = isCSV ? "file-delimited" : "file-image";
   const iconColor = isCSV ? colors.success : colors.warning;
@@ -53,6 +53,11 @@ export function FileListItem({ file, onDelete, onPress, onToggleVisibility, isTo
     </View>
   );
 }
+
+// The list re-renders on every keystroke in the search box and on every upload
+// progress tick. Without this, each of those re-renders every mounted row even
+// though nothing about the row changed.
+export const FileListItem = React.memo(FileListItemComponent);
 
 const styles = StyleSheet.create({
   container: {
