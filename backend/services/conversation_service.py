@@ -41,17 +41,62 @@ async def create_conversation(user: dict, title: str = "New chat") -> Dict[str, 
 
 
 async def get_messages(user: dict, conversation_id: str) -> List[Dict[str, Any]]:
+    """Load a conversation, with any photos it referred to resolved to URLs.
+
+    A capture used to vanish on reload: the photo lived only as a local file URI
+    in the running app and the turn was never written down. Anything the user
+    CONFIRMED is stored, so it can come back — it just needs a fresh signed URL,
+    because the one shown at the time has long expired.
+    """
     def _run():
-        res = (
-            _client(user)
-            .table("Message")
+        client = _client(user)
+        rows = (
+            client.table("Message")
             .select("*")
             .eq("conversation_id", conversation_id)
             .eq("user_id", user["id"])
             .order("created_at")
             .execute()
-        )
-        return res.data or []
+        ).data or []
+
+        wanted = {
+            str(file_id)
+            for row in rows
+            for file_id in (row.get("bill_file_ids") or [])
+        }
+        if not wanted:
+            return rows
+
+        keys = {
+            str(f["id"]): f["s3_key"]
+            for f in (
+                client.table("BillFile").select("id,s3_key")
+                .in_("id", list(wanted)).eq("user_id", user["id"]).execute().data or []
+            )
+        }
+        for row in rows:
+            urls = list(row.get("images") or [])
+            for file_id in row.get("bill_file_ids") or []:
+                key = keys.get(str(file_id))
+                if not key:
+                    # The photo was deleted since. Showing nothing is right; the
+                    # turn stays, which is the honest record of what happened.
+                    continue
+                try:
+                    signed = client.storage.from_("money-rag-files").create_signed_url(key, 3600)
+                    url = (
+                        signed.get("signedURL")
+                        or signed.get("signedUrl")
+                        or signed.get("signed_url")
+                    )
+                    if url:
+                        urls.append(url)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Could not sign %s for replay: %s", key, e)
+            if urls:
+                row["images"] = urls
+        return rows
+
     return await asyncio.to_thread(_run)
 
 
@@ -71,6 +116,7 @@ async def add_message(
     charts: Optional[list] = None,
     images: Optional[list] = None,
     pending_transactions: Optional[list] = None,
+    bill_file_ids: Optional[list] = None,
 ) -> Dict[str, Any]:
     def _run():
         client = _client(user)
@@ -82,6 +128,9 @@ async def add_message(
             "charts": charts,
             "images": images,
             "pending_transactions": pending_transactions,
+            # Stored as ids, never as URLs: a signed URL lasts an hour and would
+            # reload as a broken image. Resolved afresh on every read.
+            "bill_file_ids": bill_file_ids,
         }
         res = client.table("Message").insert(record).execute()
         # Bump the conversation so it sorts to the top of the list.

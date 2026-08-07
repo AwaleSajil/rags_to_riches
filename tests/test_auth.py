@@ -27,6 +27,8 @@ PROTECTED_ROUTES = [
     ("PUT", "/api/v1/transactions/abc/details"),
     ("DELETE", "/api/v1/transactions/abc"),
     ("GET", "/api/v1/transactions/receipt-review/abc"),
+    ("POST", "/api/v1/captures"),
+    ("POST", "/api/v1/captures/abc/kind"),
     ("POST", "/api/v1/auth/logout"),
 ]
 
@@ -69,3 +71,68 @@ def test_login_is_reachable_without_a_token(anon_client):
     # It fails (no such user / no network), but not with the dependency's
     # "Not authenticated" — that would mean the guard blocked it too early.
     assert response.json().get("detail") != "Not authenticated"
+
+
+# --- one account per email --------------------------------------------------
+#
+# The User table mirrors auth.users but, until migration 019, asserted nothing
+# about email: both writers conflict on `id`, so two auth rows carrying the same
+# address would have landed as two rows. The index is the backstop; these cover
+# the normalisation that keeps callers from ever reaching it.
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Sam@Example.com", "sam@example.com"),
+        ("  sam@example.com  ", "sam@example.com"),
+        ("SAM@EXAMPLE.COM", "sam@example.com"),
+        ("sam@example.com", "sam@example.com"),
+    ],
+)
+def test_email_is_folded_to_one_form(raw, expected):
+    """Matches the lower(email) unique index, so a case variant is the same
+    account rather than a second row the index has to refuse."""
+    from backend.routers.auth import normalize_email
+
+    assert normalize_email(raw) == expected
+
+
+def test_email_normalisation_survives_none():
+    from backend.routers.auth import normalize_email
+
+    assert normalize_email(None) is None
+
+
+def test_gmail_local_conventions_are_left_alone():
+    """Dots and +suffixes are Gmail's convention, not email's. Collapsing them
+    would merge addresses that are different people at other providers."""
+    from backend.routers.auth import normalize_email
+
+    assert normalize_email("a.b+tag@example.com") == "a.b+tag@example.com"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "User already registered",
+        "duplicate key value violates unique constraint \"user_email_lower_key\"",
+        "AuthApiError: user_already_exists",
+        "23505",
+    ],
+)
+def test_duplicate_signup_is_recognised(message):
+    """Both layers can refuse the second account and they word it differently;
+    each must still reach the user as one clear 409."""
+    from backend.routers.auth import _is_duplicate_email
+
+    assert _is_duplicate_email(Exception(message)) is True
+
+
+@pytest.mark.parametrize("message", ["network timeout", "invalid password", ""])
+def test_unrelated_failures_are_not_called_duplicates(message):
+    """A 409 telling someone the address is taken when the real fault was a
+    timeout sends them off to recover an account that does not exist."""
+    from backend.routers.auth import _is_duplicate_email
+
+    assert _is_duplicate_email(Exception(message)) is False

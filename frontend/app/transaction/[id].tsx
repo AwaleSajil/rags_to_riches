@@ -81,7 +81,10 @@ interface DetailFormState {
   key: string;
   item_description: string;
   item_quantity: string;
-  item_unit_subtotal_price: string;
+  // Not edited here, but held so it survives a save — the server replaces every
+  // line item wholesale, so anything the form drops is deleted from the row.
+  item_quantity_unit: string;
+  unit_quantity_subtotal: string;
   item_savings: string;
   tax_rate: string;
 }
@@ -95,7 +98,8 @@ function toDetailForm(d: TransactionDetailItem): DetailFormState {
     key: d.id,
     item_description: d.item_description ?? "",
     item_quantity: numStr(d.item_quantity),
-    item_unit_subtotal_price: numStr(d.item_unit_subtotal_price),
+    item_quantity_unit: d.item_quantity_unit ?? "",
+    unit_quantity_subtotal: numStr(d.unit_quantity_subtotal),
     item_savings: numStr(d.item_savings),
     tax_rate: numStr(d.tax_rate),
   };
@@ -106,7 +110,7 @@ function detailSnapshot(rows: DetailFormState[]): string {
   return rows
     .map(
       (r) =>
-        `${r.item_description.trim()}|${r.item_quantity.trim()}|${r.item_unit_subtotal_price.trim()}|${r.item_savings.trim()}|${r.tax_rate.trim()}`
+        `${r.item_description.trim()}|${r.item_quantity.trim()}|${r.unit_quantity_subtotal.trim()}|${r.item_savings.trim()}|${r.tax_rate.trim()}`
     )
     .join("~");
 }
@@ -114,7 +118,7 @@ function detailSnapshot(rows: DetailFormState[]): string {
 // Live per-row totals so the editor shows what will be saved.
 function computeRowTotals(r: DetailFormState) {
   const qty = parseFloat(r.item_quantity);
-  const unit = parseFloat(r.item_unit_subtotal_price);
+  const unit = parseFloat(r.unit_quantity_subtotal);
   const rate = parseFloat(r.tax_rate);
   const subtotal =
     (isNaN(qty) ? 1 : qty) * (isNaN(unit) ? 0 : unit);
@@ -124,7 +128,7 @@ function computeRowTotals(r: DetailFormState) {
 
 function LineItem({ item }: { item: TransactionDetailItem }) {
   const qty = item.item_quantity;
-  const unit = item.item_unit_subtotal_price;
+  const unit = item.unit_quantity_subtotal;
   const showQtyLine = qty != null && unit != null;
   const isTaxable = item.taxable === true || (item.tax_rate ?? 0) > 0;
 
@@ -265,7 +269,8 @@ export default function TransactionDetailScreen() {
         key: newDetailKey(),
         item_description: "",
         item_quantity: "1",
-        item_unit_subtotal_price: "",
+        item_quantity_unit: "",
+        unit_quantity_subtotal: "",
         item_savings: "",
         tax_rate: "",
       },
@@ -331,12 +336,12 @@ export default function TransactionDetailScreen() {
         (r) =>
           r.item_description.trim() !== "" ||
           r.item_quantity.trim() !== "" ||
-          r.item_unit_subtotal_price.trim() !== ""
+          r.unit_quantity_subtotal.trim() !== ""
       );
       for (const r of rows) {
         for (const [field, label] of [
           ["item_quantity", "Quantity"],
-          ["item_unit_subtotal_price", "Unit price"],
+          ["unit_quantity_subtotal", "Unit price"],
           ["item_savings", "Savings"],
           ["tax_rate", "Tax rate"],
         ] as const) {
@@ -355,7 +360,8 @@ export default function TransactionDetailScreen() {
       detailsPayload = rows.map((r) => ({
         item_description: r.item_description.trim(),
         item_quantity: numOrNull(r.item_quantity),
-        item_unit_subtotal_price: numOrNull(r.item_unit_subtotal_price),
+        item_quantity_unit: r.item_quantity_unit.trim() || null,
+        unit_quantity_subtotal: numOrNull(r.unit_quantity_subtotal),
         item_savings: numOrNull(r.item_savings),
         tax_rate: numOrNull(r.tax_rate) ?? 0,
       }));
@@ -606,9 +612,9 @@ export default function TransactionDetailScreen() {
                       <TextInput
                         mode="outlined"
                         label="Unit $"
-                        value={row.item_unit_subtotal_price}
+                        value={row.unit_quantity_subtotal}
                         onChangeText={(v) =>
-                          setDetailField(row.key, "item_unit_subtotal_price", v)
+                          setDetailField(row.key, "unit_quantity_subtotal", v)
                         }
                         keyboardType="decimal-pad"
                         style={styles.detailNumInput}

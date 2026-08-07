@@ -11,6 +11,41 @@ logger = logging.getLogger("moneyrag.routers.auth")
 router = APIRouter()
 
 
+def normalize_email(email: str | None) -> str | None:
+    """Fold an address to the single form the User table is keyed on.
+
+    Matches the unique index added in migration 019 (`lower(email)`). Without
+    this, "Sam@x.com" logging in after signing up as "sam@x.com" would be the
+    same auth account trying to write a second spelling into the mirror, and
+    the index — not the user — would be the one to notice.
+
+    Lowercasing only: dots and +suffixes are Gmail conventions, not email
+    semantics, and collapsing them would merge addresses that really are
+    different people elsewhere.
+    """
+    return email.strip().lower() if email else email
+
+
+# Both layers can refuse a second account for one address, and they word it
+# differently: the auth service rejects the signup outright, while the unique
+# index on lower(email) (migration 019) raises 23505 if a mirror row somehow
+# gets that far. Either way the user's situation is the same, so both map to one
+# clear answer instead of a stack trace.
+_DUPLICATE_EMAIL_MARKERS = (
+    "already registered",
+    "already been registered",
+    "user_already_exists",
+    "duplicate key value",
+    "user_email_lower_key",
+    "23505",
+)
+
+
+def _is_duplicate_email(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in _DUPLICATE_EMAIL_MARKERS)
+
+
 @router.post("/login")
 async def login(
     body: LoginRequest | None = None,
@@ -38,15 +73,16 @@ async def login(
         from backend.dependencies import get_supabase
         client = get_supabase(user["access_token"])
         
-        logger.debug("Login sync for email=%s", user["email"])
+        email = normalize_email(user["email"])
+        logger.debug("Login sync for email=%s", email)
         client.table("User").upsert({
             "id": user["id"],
-            "email": user["email"],
+            "email": email,
             "hashed_password": "managed_by_supabase_auth",
         }).execute()
-        
+
         return {
-            "user": {"id": user["id"], "email": user["email"]},
+            "user": {"id": user["id"], "email": email},
             "access_token": user.get("access_token"),
         }
     except Exception as e:
@@ -82,18 +118,30 @@ async def register(
         from backend.dependencies import get_supabase
         client = get_supabase(user["access_token"])
         
-        logger.debug("Register sync for email=%s", user["email"])
+        email = normalize_email(user["email"])
+        logger.debug("Register sync for email=%s", email)
         client.table("User").upsert({
             "id": user["id"],
-            "email": user["email"],
+            "email": email,
             "hashed_password": "managed_by_supabase_auth",
         }).execute()
 
         return {
-            "user": {"id": user["id"], "email": user["email"]},
+            "user": {"id": user["id"], "email": email},
             "message": "Account created successfully",
         }
+    except HTTPException:
+        # Already a considered response (including the 409 below) — re-raise it
+        # rather than rewrapping it as a generic 400 with the status code
+        # stringified into the detail.
+        raise
     except Exception as e:
+        if _is_duplicate_email(e):
+            logger.info("Registration refused — address already in use")
+            raise HTTPException(
+                status_code=409,
+                detail="An account with that email already exists. Try signing in instead.",
+            )
         logger.error("Registration sync failed: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail=f"Signup sync failed: {e}")
 

@@ -53,7 +53,7 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
     try:
         logger.debug("Calling rag.setup_session with %d files", len(uploaded_files_info))
         session_start = time.perf_counter()
-        duplicates, receipt_review_file_ids = await rag.setup_session(uploaded_files_info)
+        duplicates, review_items = await rag.setup_session(uploaded_files_info)
         session_ms = (time.perf_counter() - session_start) * 1000
         logger.info(
             "Ingestion worker complete — user_id=%s, %d files processed in %.1fms, %d duplicates",
@@ -63,10 +63,18 @@ async def run(config: dict, user_id: str, access_token: str, uploaded_files_info
         logger.error("Ingestion failed during setup_session: %s", e, exc_info=True)
         raise RuntimeError(f"Ingestion failed: {e}") from e
 
-    # Output result as JSON on stdout for the parent process to parse
+    # Output result as JSON on stdout for the parent process to parse.
+    # review_items carries the kind alongside each file so the app can route to
+    # the receipt review, the price-tag review, or the "which is this?" prompt.
+    review_items = review_items or []
     print(json.dumps({
         "duplicates": duplicates or [],
-        "receipt_review_file_ids": receipt_review_file_ids or [],
+        "review_items": review_items,
+        # Kept so a running client polling the old field keeps working through
+        # a deploy; drop once the app no longer reads it.
+        "receipt_review_file_ids": [
+            item["file_id"] for item in review_items if item.get("kind") == "receipt"
+        ],
     }))
 
 

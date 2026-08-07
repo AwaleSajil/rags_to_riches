@@ -1,0 +1,22 @@
+-- Drop AccountConfig.reference_merchants.
+--
+-- Added in migration 016 for a Phase 6 market-price lookup that has not been
+-- designed yet, and never read by any code. Both existing rows held nothing but
+-- the ARRAY['Walmart'] default, so no information is lost.
+--
+-- The column encoded a guess: that "which retailers to compare against" is a
+-- flat list of merchant names on the account. That may well be wrong — it could
+-- turn out to be per-region, per-category, or derived from where the user
+-- actually shops rather than configured at all. Keeping a NOT NULL column with
+-- an invented default makes that guess look like a settled decision.
+--
+-- Cheap to re-add once Phase 6 specifies what it needs: nothing existing has to
+-- be backfilled, because a merchant list is a preference, not a fact about
+-- history.
+--
+-- home_region and location_capture_enabled are deliberately kept. Those are not
+-- the same case: a region cannot be backfilled onto old rows without guessing
+-- where someone was, and location capture must default to off from the start
+-- rather than being retrofitted as a privacy decision after the fact.
+ALTER TABLE public."AccountConfig"
+    DROP COLUMN IF EXISTS reference_merchants;

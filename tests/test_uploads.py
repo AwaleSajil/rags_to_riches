@@ -93,3 +93,61 @@ def test_valid_file_clears_validation(client):
     assert "unsupported type" not in detail
     assert "larger than" not in detail
     assert "is empty" not in detail
+
+
+# --- an unexamined photo must not claim to be a receipt ----------------------
+
+
+def test_bill_uploads_start_unexamined():
+    """BillFile.kind defaults to 'receipt' in the schema, but only so rows that
+    predate the column backfill correctly. A new upload must say 'unknown'
+    until the vision pass has actually looked at it: if ingestion crashes in
+    between, an inherited 'receipt' leaves a photo nobody examined asserting it
+    is one — and confirming that invents spending that never happened."""
+    captured = {}
+
+    class FakeTable:
+        def insert(self, record):
+            captured.update(record)
+            return self
+
+        def execute(self):
+            return type("R", (), {"data": [{"id": "file-1"}]})()
+
+    class FakeSupabase:
+        def table(self, name):
+            return FakeTable()
+
+    from backend.db_client import DatabaseClient
+
+    client = DatabaseClient.__new__(DatabaseClient)
+    client.supabase = FakeSupabase()
+    client.insert_file_record("BillFile", "user-1", "shelf.jpg", "k")
+
+    assert captured["kind"] == "unknown"
+
+
+def test_csv_uploads_carry_no_kind():
+    """kind is a property of a photo. A CSV has none, and sending the column
+    would be rejected by the table."""
+    captured = {}
+
+    class FakeTable:
+        def insert(self, record):
+            captured.update(record)
+            return self
+
+        def execute(self):
+            return type("R", (), {"data": [{"id": "file-2"}]})()
+
+    class FakeSupabase:
+        def table(self, name):
+            return FakeTable()
+
+    from backend.db_client import DatabaseClient
+
+    client = DatabaseClient.__new__(DatabaseClient)
+    client.supabase = FakeSupabase()
+    client.insert_file_record("CSVFile", "user-1", "statement.csv", "k")
+
+    assert "kind" not in captured

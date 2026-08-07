@@ -195,10 +195,16 @@ class MoneyRAG:
             )
 
     async def setup_session(self, uploaded_files: List[dict]):
-        """Ingest CSVs and extract receipt drafts for the user to review."""
+        """Ingest CSVs and extract photo drafts for the user to review.
+
+        Returns (duplicates, review_items) where review_items is
+        [{"file_id": ..., "kind": "receipt"|"price_tag"|"unknown"}] — the caller
+        routes each photo to the matching review screen, or to the "which is
+        this?" prompt when the model could not tell.
+        """
         # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
         all_duplicates = []
-        receipt_review_file_ids = []
+        review_items = []
         has_committed_transactions = False
         committed_csv_ids = []
         for file_info in uploaded_files:
@@ -207,9 +213,16 @@ class MoneyRAG:
             ext = file_path.lower().split('.')[-1]
             try:
                 if ext in ['png', 'jpg', 'jpeg']:
-                    dups = await self._ingest_bill(file_path, file_info.get("file_id"))
+                    # First value is the draft, not duplicates — a photo cannot
+                    # duplicate anything until it is reviewed, and dedup happens
+                    # at verify time against content_hash.
+                    _, kind = await self._ingest_bill(file_path, file_info.get("file_id"))
+                    dups = []
                     if file_info.get("file_id"):
-                        receipt_review_file_ids.append(file_info["file_id"])
+                        review_items.append({
+                            "file_id": str(file_info["file_id"]),
+                            "kind": kind,
+                        })
                 else:
                     dups = await self._ingest_csv(file_path, file_info.get("file_id"))
                     has_committed_transactions = True
@@ -240,7 +253,7 @@ class MoneyRAG:
                 self._emit_progress("embedding", 1, 1, "Vector rebuild complete")
             except Exception as e:
                 raise RuntimeError(f"Failed to sync to vector store: {e}") from e
-        return all_duplicates, receipt_review_file_ids
+        return all_duplicates, review_items
 
     def _emit_progress(self, stage: str, total: int, done: int, detail: str = ""):
         """Emit a progress update as a JSON line to stderr for the parent process to parse."""
@@ -533,19 +546,126 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             "tax_lines": [{"label": "Sales Tax", "rate": 8.25, "amount": 8.25}],
             "total_amount": 108.25,
             "discounts": [{"label": "Coupon", "amount": 5.00}],
-            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "item_savings": 0.0, "tax_rate": 8.25}]
+            # item_quantity_unit is what item_quantity counts. A bare "2.25" is
+            # ambiguous between 2.25 lb of loose bananas and 2.25 packages, and
+            # the two mean different prices per unit — which is the whole basis
+            # of comparing a shelf price against what was paid before.
+            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_quantity_unit": "each|lb|oz|fl oz|kg|g|ml|l|gal|ct", "size_value": 5, "size_unit": "lb|gal|fl oz|oz|...", "item_unit_price": 10.0, "item_savings": 0.0, "tax_rate": 8.25}]
         }
 
-        # Vision extraction — single LLM call to extract all structured data
-        self._emit_progress("parsing", 1, 0, "Extracting data from receipt...")
+        # A shelf/price tag is a completely different document: one product, the
+        # price it is being offered at, and no purchase. It must never become a
+        # transaction — see PriceObservation in migration 015.
+        # A LIST, because a shelf photo is usually a shelf: a dairy case shot
+        # holds a tag per product. Returning one tag meant silently discarding
+        # the rest, and the user could not tell which one had been kept.
+        price_tag_schema = {
+            "item_description": "Product name as printed on the tag",
+            "brand_name": "Brand if distinguishable, else null",
+            # Deliberately the same shape as a receipt line, because the two are
+            # compared against each other. "$4.29 / 12 OZ" is quantity 12, unit
+            # 'oz', unit_quantity_subtotal 0.3575, item_subtotal_price 4.29.
+            "size_value": 12,
+            "size_unit": "oz|fl oz|lb|g|kg|ml|l|gal|qt|pt|ct|each — the unit the size is printed in",
+            "unit_quantity_subtotal": "The per-unit price PRINTED on the tag ('$0.36/OZ'), as a number. null if the tag prints none — do NOT compute it.",
+            "unit_price_unit": "The unit that PRINTED per-unit price is quoted in ('$0.36/OZ' -> 'oz'). Often NOT the package unit: a one-gallon milk jug is commonly tagged PER QUART. null if the tag does not say.",
+            "item_subtotal_price": "The shelf price the shopper pays for the package, e.g. 4.29",
+            "merchant_name": "Store name if visible anywhere in the photo, else null",
+            "item_qualitative_description": (
+                "Everything the photo shows about this price that is not a number, "
+                "in the tag's own words. Offers ('2 for $5', 'BOGO', 'with card'), "
+                "sale end wording exactly as printed ('Sale ends 8/15'), any use-by "
+                "or best-before on the product, shelf labels like 'CLEARANCE' or "
+                "'MANAGER'S SPECIAL', and visible condition such as a dented or "
+                "opened package. Quote rather than interpret; do not convert dates "
+                "and do not judge whether the price is good. Null if the tag shows "
+                "only a name and a price."
+            ),
+        }
+
+        # Vision extraction — ONE call that both classifies and extracts. A
+        # separate classification pass would double latency and cost on the
+        # critical path, and the user is standing in a shop waiting.
+        self._emit_progress("parsing", 1, 0, "Reading photo...")
         prompt = (
-            "Extract structured data from this receipt/bill. Return strictly valid JSON matching this schema: "
-            f"{json.dumps(schema)}.\n"
+            "You are given ONE photo. First decide what it is, then extract accordingly.\n\n"
+            "KIND — choose exactly one:\n"
+            "- 'receipt': a proof of purchase. Multiple line items, a total paid, usually tax, "
+            "a date/time, often a payment method.\n"
+            "- 'price_tag': a shelf label, price sticker, or product tag showing what ONE item "
+            "costs. Nothing has been bought. Often shows a per-unit price and a size.\n"
+            "- 'unknown': anything else, OR a photo you cannot confidently place in either "
+            "category (e.g. a receipt lying on a shelf, a blurred or partial image).\n"
+            "Do NOT guess between receipt and price_tag. 'unknown' is the correct, expected "
+            "answer when the photo is ambiguous — the user will be asked.\n\n"
+            "Return strictly valid JSON of the form: "
+            '{"kind": "receipt|price_tag|unknown", "receipt": <receipt object or null>, '
+            '"price_tags": <ARRAY of price tag objects, or null>}\n'
+            "Populate only the field matching the chosen kind; set the other to null. "
+            "For 'unknown', set both to null.\n\n"
+            f"PRICE TAG schema — 'price_tags' is an ARRAY of objects shaped like: {json.dumps(price_tag_schema)}\n"
+            "- Return EVERY price tag you can read, ordered as they appear left-to-right, "
+            "top-to-bottom. A photo of a shelf normally shows several, and returning only "
+            "one silently loses the others.\n"
+            "- Only include a tag whose product name AND price you can actually read. Skip "
+            "any that is cut off, blurred, or angled past legibility rather than guessing: "
+            "a misread price is stored as fact and compared against for months, while a "
+            "skipped tag costs one more photo.\n"
+            "- Do not invent a tag for a product that is merely visible on the shelf. A tag "
+            "is a printed label showing a price.\n"
+            "- 'item_subtotal_price' is what the shopper pays right now for the package "
+            "(the large/highlighted figure). If a member/loyalty price and a regular price are "
+            "both shown, use the member price and record the regular one in "
+            "'item_qualitative_description'.\n"
+            "- 'unit_quantity_subtotal': copy the per-unit price the tag PRINTS ('$0.36/OZ') as "
+            "a number. Do NOT compute it — the store already did the pack-size arithmetic for "
+            "the exact package on the shelf, and its figure is authoritative. Null if none is "
+            "printed.\n"
+            "- 'unit_price_unit': what that printed figure is PER, copied from the tag. Stores "
+            "very often quote a unit different from the package — a one-gallon milk jug tagged "
+            "'UNIT PRICE PER QUART 0.87' is 'qt', not 'gal'. Getting this wrong labels $0.87 as "
+            "the price of a whole gallon that costs $3.49. Null if the tag does not say.\n"
+            "- 'size_value' / 'size_unit': the package size AS PRINTED, split into a number and "
+            "its unit ('12 OZ' -> 12 and 'oz'). Do NOT convert: a tag reading 'Gallon' is 1 "
+            "'gal', never 128 'oz'. Converting is done later, exactly, by code — your job is "
+            "to record what the label says and to decide WHICH unit it is.\n"
+            "- That decision is yours alone and code cannot make it: 'oz' is a WEIGHT and "
+            "'fl oz' is a VOLUME, and the two never compare. You can see what the product is, "
+            "so use 'fl oz' for anything poured — milk, juice, soda, oil, sauce — and plain "
+            "'oz' only for something weighed, like cheese or nuts. Getting this wrong files a "
+            "gallon of milk as a weight, and it can then never be compared to another gallon.\n"
+            "- 'item_qualitative_description': quote what the tag says, do not interpret it. Copy sale end "
+            "wording as printed ('Sale ends 8/15', 'Prices good thru Sunday') rather than "
+            "converting to a date — resolving 'Sunday' without a year is guesswork, and a wrong "
+            "end date silently turns a limited offer into what the item normally costs. Include "
+            "any use-by / best-before printed on the PRODUCT: a markdown is often cheap "
+            "precisely because the item expires imminently, and that has to be sayable rather "
+            "than read as a bargain. Also include clearance or manager's-special labelling and "
+            "visible package damage.\n\n"
+            f"RECEIPT schema: {json.dumps(schema)}.\n"
             "- 'total_amount' is the final amount actually charged (the balance/total paid).\n"
             "- 'subtotal' is the pre-tax sum of what was paid, AFTER any item markdowns.\n"
             "- Extract the receipt's purchase time when shown, normalized to 24-hour HH:MM. "
             "Use null when the time is not visible.\n"
             "- Choose category only from the category list in the schema; use Uncategorized if unsure.\n"
+            "- 'size_value' / 'size_unit' describe how much is in ONE unit, and are NOT the same "
+            "as item_quantity: a 5 lb bag of potatoes is item_quantity 1 'each' with size_value 5 "
+            "and size_unit 'lb'. Receipts abbreviate this badly ('+RED POTA 5L US#' is five POUNDS, "
+            "not five litres), so read the size from the product name and use null when it is "
+            "genuinely unclear rather than guessing.\n"
+            "- A NUMBER SITTING NEXT TO A UNIT IS OFTEN A VARIANT, NOT A SIZE. 'GV LF 2 GAL' is "
+            "Great Value LOW FAT 2% milk in a ONE gallon jug — size_value 1, size_unit 'gal' — not "
+            "two gallons; the same receipt lists 'GV FF GAL' with no number at all. '1% MILK', "
+            "'2 PCT', '100 CALORIE' and grades like 'AA' behave the same way. You know what the "
+            "product IS, which is the only way to tell: ask whether the number describes the "
+            "CONTENTS or the CONTAINER, and use null if you cannot tell. Reading a fat percentage "
+            "as a pack size halves the unit price and makes an ordinary shelf price look like a "
+            "rip-off.\n"
+            "- 'item_quantity_unit' is what 'item_quantity' counts. Weighed items show a "
+            "fractional quantity with a per-weight price ('2.25 lb @ $0.50/lb') — use 'lb' "
+            "(or kg/oz/g as printed). Packaged items are counted, so use 'each'. This is not "
+            "the package size: a single 30-count bag of cilantro is quantity 1 'each', not 30 "
+            "'ct'. Use null when the receipt genuinely does not say.\n"
             "- 'tax_lines': one entry per DISTINCT tax rate shown. Receipts may have several "
             "(e.g. 0% for groceries and 8.25% for general goods). Use [] if no tax is shown.\n"
             "- Different item TYPES can carry different tax rates (e.g. groceries are often "
@@ -577,36 +697,123 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         
         extract_chain = self.llm | JsonOutputParser()
         try:
-            extracted = await extract_chain.ainvoke([message])
+            classified = await extract_chain.ainvoke([message])
         except Exception as e:
             print(f"   ❌ Vision extraction failed: {e}")
-            return
-            
-        self._emit_progress("parsing", 1, 1, f"Extracted: {extracted.get('merchant_name')}")
-        
-        # Save the raw OCR JSON back to the BillFile record
+            return {}, "unknown"
+
+        kind, extracted = self._split_classified_photo(classified)
+
+        # The draft stored for review is the branch that matched, so the review
+        # screens keep receiving the same flat shape they always have.
+        if kind == "price_tag":
+            tags = extracted.get("tags") or []
+            first = (tags[0].get("item_description") if tags else None) or "item"
+            label = f"{first} +{len(tags) - 1} more" if len(tags) > 1 else first
+        else:
+            label = extracted.get("merchant_name") or "photo"
+        self._emit_progress("parsing", 1, 1, f"Read {kind.replace('_', ' ')}: {label}")
+
+        # Save the extracted draft and what kind of photo this is.
         if file_id:
             try:
-                import re
-                extension = os.path.splitext(filename)[1] or ".jpg"
-                merchant_slug = re.sub(
-                    r"[^A-Za-z0-9]+", "_", str(extracted.get("merchant_name") or "receipt")
-                ).strip("_") or "receipt"
-                date_slug = str(extracted.get("date") or "nodate").replace("-", "")
-                time_slug = re.sub(r"[^0-9]", "", str(extracted.get("time") or ""))
-                friendly_name = f"{merchant_slug}_{date_slug}{f'_{time_slug}' if time_slug else ''}{extension}"
-                # Only the display name changes; s3_key remains stable for previews.
                 self._db_update("BillFile", {
                     "raw_ocr_string": json.dumps(extracted),
-                    "filename": friendly_name,
+                    "kind": kind,
+                    # Only the display name changes; s3_key remains stable for previews.
+                    "filename": self._photo_filename(filename, kind, extracted),
                 }, {"id": file_id})
             except Exception as e:
-                print(f"   ⚠️ Failed to save OCR receipt data: {e}")
+                print(f"   ⚠️ Failed to save extracted photo data: {e}")
 
-        # Do not create a transaction from OCR automatically. The mobile app
-        # presents this draft to the user, who may correct it before verifying.
-        self._emit_progress("review", 1, 1, "Receipt extracted — waiting for review")
-        return []
+        # Nothing is committed from OCR automatically — for either kind. The app
+        # shows the draft and the user corrects it before anything is written.
+        #
+        # The draft is RETURNED as well as stored, because `file_id` is optional:
+        # a chat capture has no row yet — a shelf price gets one only if the user
+        # confirms it — so the caller needs the draft handed back directly.
+        self._emit_progress("review", 1, 1, f"{kind.replace('_', ' ').title()} read — waiting for review")
+        return extracted, kind
+
+    @staticmethod
+    def _split_classified_photo(classified: dict) -> tuple[str, dict]:
+        """Pull (kind, draft) out of the vision response.
+
+        Tolerates a model that ignores the envelope and returns a bare receipt
+        object, which is what the previous single-purpose prompt always produced
+        — treating that as a receipt keeps older behaviour working.
+        """
+        if not isinstance(classified, dict):
+            return "unknown", {}
+
+        kind = str(classified.get("kind") or "").strip().lower()
+        if kind == "price_tag":
+            # Accepts the array, and a lone object from a model that ignored the
+            # instruction — one tag read is still worth keeping.
+            payload = classified.get("price_tags")
+            if payload is None:
+                payload = classified.get("price_tag")
+            tags = MoneyRAG._as_tag_list(payload)
+            return ("price_tag", {"tags": tags}) if tags else ("unknown", {})
+
+        if kind in ("receipt", "unknown"):
+            payload = classified.get(kind) if kind != "unknown" else None
+            if isinstance(payload, dict) and payload:
+                return kind, payload
+            # A declared kind with an empty body gives the review screen nothing
+            # to show, so it is treated as undecided and the user is asked —
+            # the same rule as an ambiguous photo, rather than opening a blank
+            # form and inviting a confirmed-but-empty record.
+            return "unknown", {}
+
+        # No envelope: infer from the keys present rather than discarding it.
+        if "line_items" in classified or "total_amount" in classified:
+            return "receipt", classified
+        if "price_tags" in classified:
+            tags = MoneyRAG._as_tag_list(classified.get("price_tags"))
+            return ("price_tag", {"tags": tags}) if tags else ("unknown", {})
+        if "item_subtotal_price" in classified or "unit_quantity_subtotal" in classified:
+            return "price_tag", {"tags": [classified]}
+        return "unknown", classified
+
+    @staticmethod
+    def _as_tag_list(payload) -> list:
+        """Normalise a price-tag payload to a list of non-empty tag objects."""
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        return [tag for tag in payload if isinstance(tag, dict) and tag]
+
+    @staticmethod
+    def _photo_filename(original: str, kind: str, extracted: dict) -> str:
+        """A recognisable display name, so a stored photo is findable later."""
+        import re
+
+        extension = os.path.splitext(original)[1] or ".jpg"
+
+        def slug(value, fallback):
+            cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "")).strip("_")
+            return cleaned or fallback
+
+        if kind == "price_tag":
+            # Named after the first tag; a shelf photo holding several is still
+            # one file, and listing them all would blow past any sane filename.
+            tags = extracted.get("tags") or [extracted]
+            first = tags[0] if isinstance(tags[0], dict) else {}
+            item = slug(first.get("item_description"), "item")
+            if len(tags) > 1:
+                item = f"{item}_and_{len(tags) - 1}_more"
+            store = slug(first.get("merchant_name"), "")
+            # A tag carries no date of its own; when it was seen is the date.
+            date_slug = pd.Timestamp.now().strftime("%Y%m%d")
+            parts = [p for p in ("pricetag", item, store, date_slug) if p]
+            return "_".join(parts)[:120] + extension
+
+        merchant = slug(extracted.get("merchant_name"), "receipt")
+        date_slug = str(extracted.get("date") or "nodate").replace("-", "")
+        time_slug = re.sub(r"[^0-9]", "", str(extracted.get("time") or ""))
+        return f"{merchant}_{date_slug}{f'_{time_slug}' if time_slug else ''}{extension}"
 
     def _sync_to_vectordb(self):
         # Fetch only THIS USER'S transactions to sync into VectorDB
@@ -660,7 +867,11 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             vdb = get_vector_client()
             vdb.delete_file_vectors(file_id, file_type)
         except Exception as e:
+            # Raised, not swallowed. Reporting success on a failed delete is
+            # exactly how a "Discarded" card ended up sitting next to a file that
+            # was still there — the caller has to be able to say so.
             print(f"Error purging file data: {e}")
+            raise
 
     async def chat(self, query: str, history: Optional[list] = None):
         """Async generator that yields status events + final response.
@@ -703,7 +914,7 @@ Return ONLY a valid JSON array with one object per description, in the same orde
                 "and perform semantic searches. Spending is POSITIVE (>0). "
                 "IMPORTANT: Whenever possible and relevant (e.g. when discussing trends, comparing categories, or showing breakdowns), "
                 "you MUST proactively use the 'generate_interactive_chart' tool to generate visual plots (bar, pie, or line charts) to accompany your analysis. "
-                "CRITICAL RULE FOR RESPONSES: After calling any chart or data tool, you MUST write a detailed text analysis "
+                "CRITICAL RULE FOR RESPONSES (spending analysis and charts ONLY — NOT price checks, see below): After calling any chart or data tool, you MUST write a detailed text analysis "
                 "that includes: (1) a summary of the key numbers, (2) the top and bottom items, (3) any notable patterns or insights. "
                 "The chart appears below your text automatically — your text analysis is the PRIMARY response the user reads. "
                 "Never respond with just a single sentence when data is available. "
@@ -713,7 +924,45 @@ Return ONLY a valid JSON array with one object per description, in the same orde
                 "Extract the amount, description, date (default today), category, and merchant name from the user's message. "
                 "Do NOT insert transactions directly — always let the user confirm via the UI card. "
                 "CRITICAL: You MUST include the ===CONFIRM_TX=== marker output from the tool in your response EXACTLY as returned. "
-                "Do not remove or modify the marker content."
+                "Do not remove or modify the marker content.\n"
+                "FINDING PRODUCTS: receipt line items are printed abbreviated past recognition "
+                "('GV LF 2 GAL' is Great Value low-fat milk, 'BB GRND TRKY1LB' is ground turkey), "
+                "so a SQL LIKE on a product name finds nothing. Use 'semantic_search' for anything "
+                "about a product, and pass its 'scope' argument deliberately: 'transactions' for "
+                "spending themes, 'line_items' for products actually bought, 'price_observations' "
+                "for shelf prices the user photographed.\n"
+                "SHELF PRICES ARE NOT SPENDING: a price observation is a photo of a price tag. "
+                "Nothing was bought and no money left the user's account, so NEVER add one to a "
+                "spending total, an average spend, or a category breakdown. They live in the "
+                '"PriceObservation" table and are labelled [SHELF PRICE] in search results.\n'
+                "IS THIS A GOOD PRICE: lead with ONE SHORT SENTENCE of verdict, then list the 2-3 most comparable prices you actually have, one per line, in the shortest form that is still clear: date - price per unit - shop. Showing several is the point: one number reads like a rule, three show the range the user is really choosing within and whether this shelf price is an outlier or ordinary. Add a caveat line only if it would change their decision.\n""Keep it to that. No headings, no 'Price Analysis' / 'Insights' sections, no restating the tag back to them, no paragraph of reasoning around each line — someone standing in a shop needs an answer, not a report. The detailed-analysis rule above does NOT apply here. List ONLY prices for the same product: a near-miss with a similar name is worse than a short list.\n""Use the 'check_price' tool. When the user says the sighting is ALREADY RECORDED, pass record=false — the confirm card saved it before asking you, and saving again stores one sighting twice. Otherwise it records the sighting, "
+                "researches the product, RANKS past purchases by similarity without filtering them, "
+                "converts both sides to the same unit and weights recent evidence more heavily. "
+                "Do NOT hand-roll this with SQL — the per-unit conversion and the recency "
+                "weighting are the parts that are easy to get wrong.\n"
+                "NEVER report a per-unit price as a total, and never drop its unit: '$1.00/l' and 'paid $4.99' are different facts. If a unit looks wrong for the product ('5L' on a bag of potatoes is five POUNDS, not litres), say the size is uncertain rather than reasoning from it.\n""FIXING A WRONG VALUE: when the user says something stored is wrong — a misread size, a unit "
+                "that makes no sense for the product, a mangled name, the wrong shop — use 'propose_correction'. "
+                "It only PROPOSES: the user sees a card and confirms, and nothing is written until they do. "
+                "You MUST include the ===CONFIRM_FIX=== marker in your reply EXACTLY as returned. "
+                "It cannot delete anything and it cannot touch money on a receipt — amounts, totals and tax "
+                "are corrected on the receipt review screen because they have to stay consistent with each "
+                "other. A shelf price in PriceObservation IS correctable. Never invent a row id: take it from "
+                "a tool result.\n""SHOWING PROOF: when the user asks to see a receipt behind a price you quoted, pass the 'receipt=<id>' value check_price gave you for THAT line to get_bill_images as bill_file_ids. Never re-find a receipt by searching item text — receipt lines are abbreviated past recognition, so the search matches a different purchase and you attach someone else's receipt as evidence. If a line has no receipt id, say the receipt is not available rather than showing a substitute.\n""PRICES ARE LOCAL: check WHERE each past purchase happened before quoting it. A price from another city or state is not the going rate where the user is shopping now — they may have moved — so say so plainly rather than calling the current price a rip-off, and prefer a nearer purchase even if it scores slightly lower.\n""ALWAYS compare PER UNIT. A $3.49 gallon versus a $3.38 two-gallon jug is $3.49/gal versus "
+                "$1.69/gal, not 'about the same'; the tool normalises both sides for you and marks "
+                "anything it could not normalise. Compare against BOTH what the user PAID and prices "
+                "they have SEEN before, and never describe a sighting as something they paid.\n"
+                "check_price RANKS candidates rather than filtering them: rows marked '~' are the "
+                "closest things found, not confirmed matches. Read each description and decide "
+                "whether it is really the same product before using it - low-fat vs whole milk, "
+                "organic vs conventional, and a 2-gallon vs a 1-gallon jug all rank high on "
+                "wording while costing different amounts.\n"
+                "check_price returns EVIDENCE, never a verdict: the judgement is yours. ALWAYS "
+                "read what the tag said before judging — a price well under the usual one is very "
+                "often a clearance on something expiring within days, a multi-buy needing several, "
+                "or a loyalty-card rate, and you must say what the catch is. Never present a "
+                "purchase marked ON OFFER as what the user normally pays. When there is no "
+                "purchase history for the item, say so plainly instead of guessing. When the size "
+                "is unknown, say you are comparing package to package rather than per unit."
             )
             
             agent = create_agent(

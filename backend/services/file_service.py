@@ -230,21 +230,32 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
 
         if proc.returncode == 0:
             duplicates = []
-            receipt_review_file_ids = []
+            review_items = []
             if stdout:
                 for line in reversed(stdout.decode().strip().split("\n")):
                     try:
                         result = json.loads(line)
                         duplicates = result.get("duplicates", [])
-                        receipt_review_file_ids = result.get("receipt_review_file_ids", [])
+                        review_items = result.get("review_items", [])
+                        if not review_items:
+                            # Older worker output, or a deploy mid-flight.
+                            review_items = [
+                                {"file_id": fid, "kind": "receipt"}
+                                for fid in result.get("receipt_review_file_ids", [])
+                            ]
                         break
                     except (json.JSONDecodeError, ValueError):
                         continue
             ingestion_status[user_id] = {
-                "status": "review" if receipt_review_file_ids else "complete",
+                "status": "review" if review_items else "complete",
                 "error": None,
                 "duplicates": duplicates,
-                "receipt_review_file_ids": receipt_review_file_ids,
+                "review_items": review_items,
+                # Retained for clients that have not picked up review_items yet.
+                "receipt_review_file_ids": [
+                    item["file_id"] for item in review_items
+                    if item.get("kind") == "receipt"
+                ],
             }
             logger.info(
                 "Background ingestion complete for user_id=%s — PID=%d, %.1fms, %d duplicates",

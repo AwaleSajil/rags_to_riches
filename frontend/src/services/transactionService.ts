@@ -49,6 +49,11 @@ export interface ReceiptReviewPayload {
   total_amount?: number;
   discount_total?: number; // order-level coupons subtracted from the basket
   line_items: Required<ReceiptReviewLineItem>[];
+  /**
+   * Same note field the transaction editor writes. Omit to leave an existing
+   * note untouched when re-verifying; send "" to clear it.
+   */
+  note?: string;
 }
 
 export async function verifyReceiptReview(
@@ -98,7 +103,10 @@ export async function deleteTransaction(id: string): Promise<void> {
 export interface TransactionDetailInput {
   item_description?: string | null;
   item_quantity?: number | null;
-  item_unit_subtotal_price?: number | null;
+  // Sent back unchanged by the editor. The server rewrites every line on save,
+  // so a field omitted here is a field erased.
+  item_quantity_unit?: string | null;
+  unit_quantity_subtotal?: number | null;
   item_savings?: number | null;
   tax_rate?: number | null;
 }

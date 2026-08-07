@@ -7,64 +7,22 @@ from typing import Annotated, List
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from backend.dependencies import get_current_user
 from backend.services import file_service
+from backend.services.upload_utils import (
+    ALLOWED_EXTENSIONS,
+    MAX_UPLOAD_BYTES,
+    safe_filename as _safe_filename,
+    save_within_limit as _save_within_limit,
+)
 
 logger = logging.getLogger("moneyrag.routers.files")
 
 router = APIRouter()
 
-# Anything not recognised as an image is handed to the CSV parser, so the
-# allowlist is what keeps a .pdf or an iPhone .heic from being silently parsed
-# as a spreadsheet. Matches the picker's filter in frontend/app/(tabs)/ingest.tsx.
-ALLOWED_EXTENSIONS = frozenset({".csv", ".png", ".jpg", ".jpeg"})
-
-# Receipts and bank exports are small; this is generous for both and keeps a
-# single request from filling the disk.
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
-UPLOAD_CHUNK_BYTES = 1024 * 1024
-
-
-def _safe_filename(raw: str | None) -> str:
-    """Reduce a client-supplied filename to a bare, allowlisted basename.
-
-    The name reaches both `os.path.join(temp_dir, ...)` and the storage key, so
-    a value like `../../etc/passwd` would otherwise escape the temp directory
-    and land somewhere it shouldn't. Strips any directory component (both
-    separators, since the client may be on Windows) plus null bytes, then
-    requires a known extension.
-    """
-    name = (raw or "").replace("\\", "/").split("/")[-1].replace("\x00", "").strip()
-    # Leading dots would make the file hidden, or resolve to "." / ".." outright.
-    name = name.lstrip(".")
-    if not name:
-        raise ValueError("A file was uploaded without a usable filename")
-
-    extension = os.path.splitext(name)[1].lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        raise ValueError(
-            f"'{name}' has an unsupported type. Upload a CSV or a PNG/JPG image."
-        )
-    return name
-
-
-async def _save_within_limit(upload: UploadFile, destination: str) -> int:
-    """Stream one upload to disk, aborting if it exceeds MAX_UPLOAD_BYTES.
-
-    Written in chunks rather than a single `.read()` so a large file is never
-    held in memory in full.
-    """
-    total = 0
-    with open(destination, "wb") as fh:
-        while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
-            total += len(chunk)
-            if total > MAX_UPLOAD_BYTES:
-                raise ValueError(
-                    f"'{upload.filename}' is larger than the "
-                    f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit"
-                )
-            fh.write(chunk)
-    if total == 0:
-        raise ValueError(f"'{upload.filename}' is empty")
-    return total
+# ALLOWED_EXTENSIONS / MAX_UPLOAD_BYTES / the two helpers now live in
+# services/upload_utils so the single-photo /captures route enforces exactly the
+# same rules. Re-exported under their original names because the tests and the
+# rest of this module already refer to them that way.
+__all__ = ["router", "ALLOWED_EXTENSIONS", "MAX_UPLOAD_BYTES"]
 
 
 @router.get("")

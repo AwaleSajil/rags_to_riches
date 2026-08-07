@@ -1,6 +1,5 @@
 import React from "react";
 import {
-  Image,
   Modal,
   ScrollView,
   StyleSheet,
@@ -12,6 +11,8 @@ import { getSupabase } from "../lib/supabase";
 import { colors, spacing, typography } from "../styles/theme";
 import { createLogger } from "../lib/logger";
 import type { FileItem } from "../lib/types";
+
+import { ZoomableImage } from "./ZoomableImage";
 
 const log = createLogger("FilePreviewModal");
 
@@ -130,17 +131,12 @@ export function FilePreviewModal({ file, onClose, onReviewReceipt }: FilePreview
           )}
 
           {!loading && !error && imageUrl && (
-            <ScrollView
-              contentContainerStyle={styles.imageWrap}
-              maximumZoomScale={4}
-              minimumZoomScale={1}
-            >
-              <Image
-                source={{ uri: imageUrl }}
-                style={{ width: width * 0.9, height: height * 0.68 }}
-                resizeMode="contain"
-              />
-            </ScrollView>
+            /* ScrollView's maximumZoomScale is iOS-only, so this did nothing at
+               all on Android or web — the pinch simply had no effect. */
+            <ZoomableImage
+              uri={imageUrl}
+              style={{ width: width * 0.9, height: height * 0.68 }}
+            />
           )}
 
           {!loading && !error && rows && (

@@ -1,0 +1,30 @@
+-- Retire the langchain vector store. Everything it held now lives on the rows.
+--
+--   392 transaction vectors  -> Transaction.embedding        (copied, migration 025)
+--   225 line-item vectors    -> TransactionDetail.embedding  (rebuilt, better text)
+--    49 orphaned line-item vectors -> deleted, not migrated
+--
+-- Those 49 are the reason this move happened. They pointed at TransactionDetail
+-- rows that no longer existed — created because re-verifying a receipt deletes
+-- and re-inserts its line items with new ids, while the vectors keyed by the old
+-- ids stayed behind. They still matched searches, so the agent could quote line
+-- items the user had deleted during review. Vectors on the row make that
+-- impossible: ON DELETE CASCADE removes them with no cleanup code to forget.
+--
+-- Second reason: both tables had RLS ENABLED WITH NO POLICIES, and the store
+-- connected over DATABASE_URL, which bypasses RLS. Tenancy was a
+-- `cmetadata->>'user_id'` filter that every query had to remember. Dropping
+-- these clears the last two rls_enabled_no_policy advisories.
+--
+-- Third: one `document` column had to serve every purpose, so line items
+-- embedded "Line item from Walmart: STRAWBERRIES — nan". The merchant prefix
+-- dominated the vector (STRAWBERRIES scored 0.937 against a BANANAS probe) and
+-- "nan" was pandas' missing-value marker embedded as if it were content.
+--
+-- Verified before dropping: read path (semantic_search returning both levels)
+-- and write path (sync_single_transaction) both exercised against live data.
+-- The write path was genuinely broken until then — SQLAlchemy's :param binding
+-- collides with Postgres's :: cast operator, so `:vec::extensions.vector` left
+-- the vector unbound. It now uses CAST(:vec AS extensions.vector).
+DROP TABLE IF EXISTS public.langchain_pg_embedding;
+DROP TABLE IF EXISTS public.langchain_pg_collection;

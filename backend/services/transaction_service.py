@@ -16,6 +16,53 @@ logger = logging.getLogger("moneyrag.services.transaction")
 # the user's note) — a change to any of them requires re-embedding the vector.
 _VECTOR_TEXT_FIELDS = ("merchant_name", "category", "note")
 
+# Of those, the ones that appear ONLY in the parent transaction's document.
+#
+# A line item's vector is built from the item's own identity plus its
+# enrichment, and its metadata carries the parent's category — so a merchant or
+# category change must re-embed the children too. A note appears in neither,
+# which makes a note-only edit the case where re-embedding line items is pure
+# waste: identical strings sent back to the embedding API, one call per item.
+_PARENT_ONLY_VECTOR_FIELDS = frozenset({"note"})
+
+
+def _vector_fields_changed(
+    changes: Dict[str, Any], old: Dict[str, Any]
+) -> frozenset:
+    """Which document-affecting fields this edit actually alters.
+
+    Compares values rather than trusting presence: re-saving a form without
+    touching the note must not spend an embedding call to rewrite the identical
+    string.
+    """
+    return frozenset(
+        f for f in _VECTOR_TEXT_FIELDS if f in changes and changes[f] != old.get(f)
+    )
+
+
+def _children_need_reembed(changed_fields: frozenset) -> bool:
+    """True when line-item vectors are stale too, not just the parent's."""
+    return bool(changed_fields - _PARENT_ONLY_VECTOR_FIELDS)
+
+
+def _note_change(review: Dict[str, Any]) -> Dict[str, Any]:
+    """The note portion of a verify, as fields to write — possibly none.
+
+    Verifying a receipt writes the same dict on insert and on re-verify, and on
+    re-verify it becomes an UPDATE. So an absent note must not appear in that
+    dict at all: including it as null would erase a note the user added later
+    from the transaction screen, and nothing on the review form suggests it
+    touches anything but the receipt.
+
+      absent/None -> {}                 leave whatever is stored
+      ""          -> {"note": None}     explicit clear
+      "  x  "     -> {"note": "x"}      set, trimmed
+    """
+    note = review.get("note")
+    if note is None:
+        return {}
+    return {"note": note.strip() or None}
+
 # Columns returned for the browser list. `enriched_info` is used only as a
 # lightweight indicator that Deep Enrichment completed for this receipt.
 _LIST_COLUMNS = (
@@ -297,10 +344,30 @@ def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Opt
         subtotal += item_subtotal
         tax_total += tax_amount
         item_savings_total += item_savings
+        description = item.get("item_description", "")
+        # Size is deliberately NOT parsed into columns. It is already in
+        # item_description ("WW SPAG 16OZ"), so storing a parse added nothing but
+        # a place for it to be wrong — measured at ~26% on real rows, including
+        # "5L" on a bag of potatoes read as litres and a product code read as a
+        # 30-count pack. Retrieval is semantic and comparison is the agent's job,
+        # so it reads the size from the text and a parser fix heals history
+        # instead of leaving frozen mistakes behind.
+        #
+        # What item_quantity is measured in, when the model could read it. A
+        # bare "2.25" is ambiguous between 2.25 lb of loose bananas and 2.25
+        # packages, and the two imply different prices per unit.
+        quantity_unit = (item.get("item_quantity_unit") or "").strip().lower() or None
         details.append({
             "user_id": user["id"], "bill_file_id": file_id,
-            "item_description": item.get("item_description", ""),
-            "item_quantity": quantity, "item_unit_subtotal_price": unit_price,
+            "item_description": description,
+            "item_quantity": quantity,
+            "item_quantity_unit": quantity_unit,
+            # How much is in ONE of them. Separate from item_quantity: a 5 lb bag
+            # is quantity 1 "each", size 5 "lb", and squeezing both into one
+            # column is what made a bag of potatoes read as five litres.
+            "size_value": item.get("size_value"),
+            "size_unit": (item.get("size_unit") or "").strip().lower() or None,
+            "unit_quantity_subtotal": unit_price,
             "item_subtotal_price": item_subtotal, "item_savings": item_savings,
             "tax_amount": tax_amount,
             "tax_rate": tax_rate, "taxable": tax_rate > 0,
@@ -348,14 +415,20 @@ def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Opt
         "discount_total": discount_total or None, "savings_total": savings_total or None,
         "content_hash": content_hash, "source": "bill", "source_bill_file_id": file_id,
     }
+    tx.update(_note_change(review))
     if existing_for_bill.data:
         # Re-verification edits the transaction already linked to this receipt.
         tx_id = existing_for_bill.data[0]["id"]
         client.table("Transaction").update(tx).eq("id", tx_id).eq("user_id", user["id"]).execute()
         client.table("TransactionDetail").delete().eq("transaction_id", tx_id).eq("user_id", user["id"]).execute()
     elif existing.data:
-        # A separate re-upload of an identical receipt stays deduplicated.
-        return existing.data[0]
+        # A separate re-upload of an identical receipt stays deduplicated — and
+        # now says so. Returning the existing row bare was indistinguishable
+        # from having saved this upload: the caller got a transaction back and
+        # reasonably concluded the second copy had been recorded, when in fact
+        # nothing was written and the new photo is left with no transaction
+        # pointing at it.
+        return {"id": existing.data[0]["id"], "duplicate_of": existing.data[0]["id"]}
     else:
         inserted = client.table("Transaction").insert(tx).execute().data or []
         if not inserted:
@@ -383,6 +456,14 @@ async def verify_receipt(user: dict, file_id: str, review: Dict[str, Any]) -> Op
     tx = await get_transaction(user, result["id"])
     if not tx:
         return None
+    # Carried to the client so it can say "already recorded" rather than
+    # presenting someone else's earlier transaction as the thing just saved.
+    tx["is_duplicate"] = bool(result.get("duplicate_of"))
+    if tx["is_duplicate"]:
+        logger.info(
+            "Receipt %s matched existing transaction %s — nothing written",
+            file_id, tx["id"],
+        )
     try:
         config = await config_service.get_config(user)
         if config and config.get("deep_enrichment"):
@@ -452,7 +533,8 @@ async def _deep_enrich_verified_receipt(user: dict, transaction_id: str, config:
         tx = await get_transaction(user, transaction_id)
         if not tx:
             return
-        names = [tx.get("merchant_name") or tx.get("description") or "Merchant"] + [
+        merchant = tx.get("merchant_name") or tx.get("description") or "Merchant"
+        names = [merchant] + [
             detail.get("item_description") or "Item" for detail in tx.get("details", [])
         ]
         search_tool = DuckDuckGoSearchRun()
@@ -464,11 +546,19 @@ async def _deep_enrich_verified_receipt(user: dict, transaction_id: str, config:
         search_semaphore = asyncio.Semaphore(4)
 
         async def _search_name(name: str):
+            # The MERCHANT goes in the query with the item. A receipt line is a
+            # private abbreviation of one chain's own catalogue — "GV LF 2 GAL"
+            # searched alone is close to meaningless, while "Walmart GV LF 2 GAL"
+            # resolves GV to Great Value. Enrichment feeds the embedded text, so
+            # a vague answer here weakens every later product match.
+            query = (
+                f"What type of business is '{name}'?"
+                if name == merchant
+                else f"What product is '{name}' sold at {merchant}?"
+            )
             async with search_semaphore:
                 try:
-                    return name, await search_tool.ainvoke(
-                        f"What type of product or business is '{name}'?"
-                    )
+                    return name, await search_tool.ainvoke(query)
                 except Exception:
                     return name, ""
 
@@ -489,6 +579,12 @@ async def _deep_enrich_verified_receipt(user: dict, transaction_id: str, config:
 You are a financial data assistant. Give a concise, helpful one-sentence description
 for the merchant followed by each receipt line item. Use the research context when useful.
 
+Every item below was bought at {merchant}, so read the abbreviations as that
+chain's own: "GV" on a Walmart receipt is Great Value, its store brand. Say what
+the product IS and any variant that affects price (organic, low-fat, brand tier).
+A number beside a unit is often a variant rather than a size — "LF 2" is low-fat
+2% milk, not two of something.
+
 Items: {names_json}
 Research context:
 {search_context}
@@ -500,6 +596,7 @@ Return ONLY a JSON array in the same order:
 """)
         enriched = await (prompt | llm | JsonOutputParser()).ainvoke({
             "names_json": __import__("json").dumps(names),
+            "merchant": merchant,
             "search_context": search_context or "No additional research available.",
         })
         if not isinstance(enriched, list):
@@ -524,7 +621,11 @@ Return ONLY a JSON array in the same order:
 
 
 def _reembed_transaction(tx: Dict[str, Any], details: List[Dict[str, Any]], user_id: str, config: dict) -> None:
-    """Re-embed one transaction's vector(s) so semantic search reflects the edit."""
+    """Re-embed one transaction's vector(s) so semantic search reflects the edit.
+
+    Pass an empty `details` to re-embed only the parent document — correct when
+    the change cannot appear in a line item's text or metadata.
+    """
     from backend.vector_db_client import get_vector_client
 
     embeddings = _build_embeddings(config)
@@ -534,8 +635,9 @@ def _reembed_transaction(tx: Dict[str, Any], details: List[Dict[str, Any]], user
 def _apply_update(user: dict, transaction_id: str, changes: Dict[str, Any]):
     """Blocking: verify ownership, update, and re-read row + details.
 
-    Returns (updated_tx, details, needs_reembed) or None if the row does not
-    exist / is not the user's.
+    Returns (updated_tx, details, changed_vector_fields) or None if the row does
+    not exist / is not the user's. The caller uses the changed-field set to
+    decide how much to re-embed, not merely whether to.
     """
     client = _client(user)
     existing = (
@@ -572,10 +674,8 @@ def _apply_update(user: dict, transaction_id: str, changes: Dict[str, Any]):
         .data
         or []
     )
-    needs_reembed = any(
-        f in changes and changes[f] != old.get(f) for f in _VECTOR_TEXT_FIELDS
-    )
-    return updated, details, needs_reembed
+    changed_vector_fields = _vector_fields_changed(changes, old)
+    return updated, details, changed_vector_fields
 
 
 async def update_transaction(
@@ -591,16 +691,28 @@ async def update_transaction(
     result = await asyncio.to_thread(_apply_update, user, transaction_id, changes)
     if result is None:
         return None
-    updated, details, needs_reembed = result
+    updated, details, changed_vector_fields = result
 
-    if needs_reembed:
+    if changed_vector_fields:
         config = await config_service.get_config(user)
         if config:
+            # Editing a note used to re-embed every line item on the receipt as
+            # well — up to 29 here — each producing a byte-identical string,
+            # synchronously, against the embedding quota. Children are only
+            # re-sent when something they actually contain has changed.
+            reembed_details = (
+                details if _children_need_reembed(changed_vector_fields) else []
+            )
             try:
                 await asyncio.to_thread(
-                    _reembed_transaction, updated, details, user["id"], config
+                    _reembed_transaction, updated, reembed_details, user["id"], config
                 )
-                logger.info("Re-embedded vector for transaction %s", transaction_id)
+                logger.info(
+                    "Re-embedded transaction %s (%d document(s); changed: %s)",
+                    transaction_id,
+                    len(reembed_details) + 1,
+                    ", ".join(sorted(changed_vector_fields)),
+                )
             except Exception as e:
                 logger.warning(
                     "Vector re-embed failed for transaction %s (edit still saved): %s",
@@ -674,7 +786,7 @@ def _prepare_detail_rows(
     rows: List[Dict[str, Any]] = []
     for d in details_input:
         qty = d.get("item_quantity")
-        unit = d.get("item_unit_subtotal_price")
+        unit = d.get("unit_quantity_subtotal")
         rate = d.get("tax_rate")
 
         subtotal = d.get("item_subtotal_price")
@@ -701,7 +813,13 @@ def _prepare_detail_rows(
             "bill_file_id": bill_file_id,
             "item_description": d.get("item_description"),
             "item_quantity": qty,
-            "item_unit_subtotal_price": unit,
+            # Carried through rather than dropped: the rows are rewritten wholesale
+            # on every edit, so omitting this here wiped the unit off every line
+            # the moment a user touched an unrelated field.
+            "item_quantity_unit": (d.get("item_quantity_unit") or "").strip().lower() or None,
+            "size_value": d.get("size_value"),
+            "size_unit": (d.get("size_unit") or "").strip().lower() or None,
+            "unit_quantity_subtotal": unit,
             "item_subtotal_price": subtotal,
             "item_savings": d.get("item_savings"),
             "tax_amount": tax_amount,

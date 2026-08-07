@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from "react";
 import { ScrollView, StyleSheet, View } from "react-native";
-import { Button, Dialog, Divider, IconButton, Portal, Snackbar, Text, TextInput } from "react-native-paper";
+import { Banner, Button, Dialog, Divider, IconButton, Portal, Snackbar, Text, TextInput } from "react-native-paper";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { GlassCard } from "../../src/components/GlassCard";
 import { LoadingSpinner } from "../../src/components/LoadingSpinner";
@@ -51,11 +51,15 @@ export default function ReceiptReviewScreen() {
   const [time, setTime] = useState("");
   const [category, setCategory] = useState("Uncategorized");
   const [location, setLocation] = useState("");
+  const [note, setNote] = useState("");
   const [extractedTotal, setExtractedTotal] = useState("");
   const [orderDiscount, setOrderDiscount] = useState("");
   const [items, setItems] = useState<ItemForm[]>([]);
   const [totalChoiceVisible, setTotalChoiceVisible] = useState(false);
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
+  // Id of the transaction this receipt turned out to duplicate. Set only after
+  // verifying, because the match is on the confirmed contents, not the photo.
+  const [duplicateOf, setDuplicateOf] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!fileId) {
@@ -176,8 +180,25 @@ export default function ReceiptReviewScreen() {
         location: location.trim() || null, total_amount: totalAmount,
         discount_total: discountAmount > 0 ? Number(discountAmount.toFixed(2)) : undefined,
         line_items: lineItems,
+        // Sent only when written. This form does not load an existing note, so
+        // passing a blank one on re-verification would clear a note added later
+        // from the transaction screen. Clearing stays that screen's job.
+        ...(note.trim() ? { note: note.trim() } : {}),
       });
       const queued = remaining.split(",").filter(Boolean);
+      if (transaction.is_duplicate) {
+        // Nothing was written: this receipt matched one already recorded. Say so
+        // and stay put, because silently opening the earlier transaction reads
+        // as "saved" and the same receipt gets re-uploaded again next time.
+        setSnackbar({
+          visible: true,
+          message: "Already recorded — this matches a receipt you've saved before.",
+          // Not an error: dedup working is the correct outcome, not a failure.
+          error: false,
+        });
+        setDuplicateOf(transaction.id);
+        return;
+      }
       if (queued.length) {
         router.replace({ pathname: "/receipt-review/[fileId]", params: { fileId: queued[0], remaining: queued.slice(1).join(",") } });
       } else {
@@ -201,6 +222,19 @@ export default function ReceiptReviewScreen() {
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        {duplicateOf && (
+          <Banner
+            visible
+            icon="content-duplicate"
+            actions={[
+              { label: "View the original", onPress: () => router.replace(`/transaction/${duplicateOf}`) },
+              { label: "Back to files", onPress: () => router.back() },
+            ]}
+          >
+            This receipt is already recorded. Nothing was saved, so your totals
+            haven't been counted twice.
+          </Banner>
+        )}
         <GlassCard style={styles.card}>
           <Text variant="titleLarge" style={styles.title}>Review extracted receipt</Text>
           <Text style={styles.hint}>{filename}. Check the OCR result and correct anything before verifying.</Text>
@@ -209,6 +243,16 @@ export default function ReceiptReviewScreen() {
           <TextInput mode="outlined" label="Time (HH:MM, optional)" value={time} onChangeText={setTime} autoCapitalize="none" style={styles.input} />
           <TextInput mode="outlined" label="Category" value={category} onChangeText={setCategory} style={styles.input} />
           <TextInput mode="outlined" label="Location (optional)" value={location} onChangeText={setLocation} style={styles.input} />
+          <TextInput
+            mode="outlined"
+            label="Note (optional)"
+            placeholder="What was this for?"
+            value={note}
+            onChangeText={setNote}
+            multiline
+            numberOfLines={2}
+            style={styles.input}
+          />
         </GlassCard>
 
         <GlassCard style={styles.card}>

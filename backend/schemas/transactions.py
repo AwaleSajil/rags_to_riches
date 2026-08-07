@@ -79,7 +79,7 @@ class TransactionDetailItem(BaseModel):
     id: str
     item_description: Optional[str] = None
     item_quantity: Optional[float] = None
-    item_unit_subtotal_price: Optional[float] = None
+    unit_quantity_subtotal: Optional[float] = None
     item_subtotal_price: Optional[float] = None
     item_savings: Optional[float] = None
     tax_amount: Optional[float] = None
@@ -96,7 +96,7 @@ class TransactionDetailInput(BaseModel):
 
     item_description: Optional[str] = None
     item_quantity: Optional[float] = None
-    item_unit_subtotal_price: Optional[float] = None
+    unit_quantity_subtotal: Optional[float] = None
     item_subtotal_price: Optional[float] = None
     item_savings: Optional[float] = None
     tax_amount: Optional[float] = None
@@ -115,6 +115,11 @@ class TransactionDetailsReplace(BaseModel):
 class ReceiptReviewLineItem(BaseModel):
     item_description: str = ""
     item_quantity: float = Field(default=1, ge=0)
+    # What item_quantity counts: 'lb' for weighed produce, 'each' for packaged
+    # goods. Distinct from package size — a 30-count bag is quantity 1 'each'.
+    # Null when the receipt does not say; inferring it would feed a guess
+    # straight into per-unit price comparisons.
+    item_quantity_unit: Optional[str] = None
     # Net price actually paid per unit (after any item-level markdown).
     item_unit_price: float = Field(default=0, ge=0)
     # How much this line was marked down (regular price minus what was paid);
@@ -135,6 +140,14 @@ class ReceiptReviewInput(BaseModel):
     # Order-level coupons subtracted from the whole basket (not item markdowns).
     discount_total: Optional[float] = Field(default=None, ge=0)
     line_items: List[ReceiptReviewLineItem] = Field(default_factory=list)
+    # Free text, same field the transaction editor writes. Worth capturing here
+    # because why a purchase happened is clearest while the receipt is in your
+    # hand, not weeks later in the browser.
+    #
+    # None means "leave whatever is there alone" — re-verifying a receipt must
+    # not erase a note added afterwards from the transaction screen. An empty
+    # string is an explicit clear.
+    note: Optional[str] = None
 
     @field_validator("time")
     @classmethod
@@ -155,3 +168,7 @@ class TransactionWithDetails(TransactionListItem):
     source_csv_id: Optional[str] = None
     source_bill_file_id: Optional[str] = None
     details: List[TransactionDetailItem] = Field(default_factory=list)
+    # True when verifying a receipt matched a transaction that already existed,
+    # so this is the earlier record rather than one just created. Defaults false
+    # on every other route that returns this shape.
+    is_duplicate: bool = False

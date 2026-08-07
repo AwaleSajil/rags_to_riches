@@ -116,7 +116,7 @@ def test_empty_receipt():
 def test_derived_fields_filled_in_when_omitted():
     rows = _prepare_detail_rows(
         "user-1", "tx-1", "bill-1",
-        [{"item_description": "Milk", "item_quantity": 2, "item_unit_subtotal_price": 3.00,
+        [{"item_description": "Milk", "item_quantity": 2, "unit_quantity_subtotal": 3.00,
           "tax_rate": 10.0}],
     )
     row = rows[0]
@@ -130,7 +130,7 @@ def test_zero_rate_marks_item_non_taxable():
     rows = _prepare_detail_rows(
         "user-1", "tx-1", None,
         [{"item_description": "Bread", "item_quantity": 1,
-          "item_unit_subtotal_price": 2.50, "tax_rate": 0}],
+          "unit_quantity_subtotal": 2.50, "tax_rate": 0}],
     )
     assert rows[0]["taxable"] is False
     assert rows[0]["tax_amount"] == 0.0
@@ -141,7 +141,7 @@ def test_explicit_values_are_not_recomputed():
     """A receipt's own printed totals win over our arithmetic."""
     rows = _prepare_detail_rows(
         "user-1", "tx-1", None,
-        [{"item_description": "Odd", "item_quantity": 3, "item_unit_subtotal_price": 1.00,
+        [{"item_description": "Odd", "item_quantity": 3, "unit_quantity_subtotal": 1.00,
           "item_subtotal_price": 2.99, "tax_amount": 0.11, "item_total_price": 3.10}],
     )
     assert rows[0]["item_subtotal_price"] == 2.99
@@ -151,7 +151,7 @@ def test_explicit_values_are_not_recomputed():
 def test_missing_quantity_defaults_to_one():
     rows = _prepare_detail_rows(
         "user-1", "tx-1", None,
-        [{"item_description": "Single", "item_unit_subtotal_price": 4.25}],
+        [{"item_description": "Single", "unit_quantity_subtotal": 4.25}],
     )
     assert rows[0]["item_subtotal_price"] == 4.25
 
@@ -179,3 +179,110 @@ def test_rows_carry_ownership_columns():
 ])
 def test_category_normalization(raw, expected):
     assert normalize_category(raw) == expected
+
+
+# --- notes added while verifying --------------------------------------------
+#
+# The same dict is used for the INSERT on first verify and the UPDATE on
+# re-verify, so what the note field does when it is absent decides whether
+# re-verifying a receipt quietly destroys a note added afterwards.
+
+
+def test_absent_note_writes_nothing():
+    """Not "set it to null" — omit the column entirely, so an UPDATE built from
+    this dict leaves a note added later from the transaction screen intact."""
+    from backend.services.transaction_service import _note_change
+
+    assert _note_change({}) == {}
+    assert _note_change({"note": None}) == {}
+
+
+def test_blank_note_is_an_explicit_clear():
+    """Distinct from absent: the user emptied the field on purpose."""
+    from backend.services.transaction_service import _note_change
+
+    assert _note_change({"note": ""}) == {"note": None}
+    assert _note_change({"note": "   "}) == {"note": None}
+
+
+def test_note_is_trimmed():
+    from backend.services.transaction_service import _note_change
+
+    assert _note_change({"note": "  gift for mum  "}) == {"note": "gift for mum"}
+
+
+# --- how much gets re-embedded on an edit ------------------------------------
+#
+# Editing a note used to re-embed every line item on the receipt too — up to 29
+# on the largest one here — each producing a byte-identical string, one
+# embedding call apiece, synchronously, against a quota that is the scarce
+# resource in this app. Line items contain neither the note nor anything derived
+# from it, so all of that work was discarded.
+
+
+def test_unchanged_values_do_not_re_embed():
+    """Re-saving a form without touching anything must cost nothing."""
+    from backend.services.transaction_service import _vector_fields_changed
+
+    old = {"merchant_name": "STOP & SHOP", "category": "Groceries", "note": "Paid by atish"}
+    assert _vector_fields_changed(dict(old), old) == frozenset()
+
+
+def test_non_document_fields_do_not_re_embed():
+    """amount/location never reach the embedded text."""
+    from backend.services.transaction_service import _vector_fields_changed
+
+    old = {"merchant_name": "STOP & SHOP", "amount": 38.12}
+    assert _vector_fields_changed({"amount": 40.0, "location": "Norwalk"}, old) == frozenset()
+
+
+def test_note_edit_spares_the_line_items():
+    """The whole point: a note is in no line-item document, so only the parent
+    is re-embedded — 1 call instead of 1 + N."""
+    from backend.services.transaction_service import (
+        _children_need_reembed,
+        _vector_fields_changed,
+    )
+
+    changed = _vector_fields_changed({"note": "new"}, {"note": "old"})
+    assert changed == frozenset({"note"})
+    assert _children_need_reembed(changed) is False
+
+
+def test_merchant_edit_still_re_embeds_line_items():
+    """Line-item text is "Line item from {merchant}: ...", so renaming the
+    merchant genuinely invalidates every child document."""
+    from backend.services.transaction_service import (
+        _children_need_reembed,
+        _vector_fields_changed,
+    )
+
+    changed = _vector_fields_changed({"merchant_name": "Stop & Shop"}, {"merchant_name": "STOP & SHOP"})
+    assert _children_need_reembed(changed) is True
+
+
+def test_category_edit_still_re_embeds_line_items():
+    """Category is copied into each line item's metadata, so skipping the
+    children would leave them describing the old category."""
+    from backend.services.transaction_service import (
+        _children_need_reembed,
+        _vector_fields_changed,
+    )
+
+    changed = _vector_fields_changed({"category": "Dining"}, {"category": "Groceries"})
+    assert _children_need_reembed(changed) is True
+
+
+def test_note_plus_merchant_re_embeds_everything():
+    """A parent-only field alongside a child-affecting one must not suppress the
+    children."""
+    from backend.services.transaction_service import (
+        _children_need_reembed,
+        _vector_fields_changed,
+    )
+
+    changed = _vector_fields_changed(
+        {"note": "new", "merchant_name": "Stop & Shop"},
+        {"note": "old", "merchant_name": "STOP & SHOP"},
+    )
+    assert _children_need_reembed(changed) is True

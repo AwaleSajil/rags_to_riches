@@ -2,7 +2,8 @@ import { Platform } from "react-native";
 import * as FileSystem from "expo-file-system/legacy";
 import { apiJson, apiFetch, getAccessToken, API_URL } from "./api";
 import { createLogger } from "../lib/logger";
-import type { FileItem } from "../lib/types";
+import { compressImage } from "../lib/compressImage";
+import type { CaptureKind, FileItem } from "../lib/types";
 
 const log = createLogger("FileService");
 
@@ -14,8 +15,12 @@ export async function listFiles(): Promise<FileItem[]> {
 }
 
 export async function uploadFiles(
-  files: { uri: string; name: string; type: string }[]
+  input: { uri: string; name: string; type: string }[]
 ): Promise<{ message: string; file_ids: string[] }> {
+  // Shrunk here rather than at each camera and picker, so no attach path can
+  // skip it. CSVs pass straight through.
+  const files = await Promise.all(input.map(compressImage));
+
   log.info("Upload starting", {
     fileCount: files.length,
     files: files.map((f) => ({ name: f.name, type: f.type })),
@@ -113,6 +118,15 @@ async function uploadOneNative(
   }
 }
 
+// Defined in lib/types (the leaf module this file already imports from) and
+// re-exported here so existing importers keep working.
+export type { CaptureKind } from "../lib/types";
+
+export interface ReviewItem {
+  file_id: string;
+  kind: CaptureKind;
+}
+
 export interface IngestionStatus {
   status: "idle" | "processing" | "review" | "complete" | "failed";
   error?: string | null;
@@ -121,6 +135,9 @@ export interface IngestionStatus {
   total?: number;
   done?: number;
   detail?: string;
+  /** Photos awaiting review, each tagged with what it was recognised as. */
+  review_items?: ReviewItem[];
+  /** @deprecated superseded by review_items; kept so a client mid-deploy still works. */
   receipt_review_file_ids?: string[];
 }
 

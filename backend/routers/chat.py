@@ -77,7 +77,10 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
     # Load prior turns for agent context, then persist this user message.
     prior = await conversation_service.get_messages(user, conversation_id)
     history = conversation_service.to_agent_history(prior)
-    await conversation_service.add_message(user, conversation_id, "user", body.message)
+    await conversation_service.add_message(
+        user, conversation_id, "user", body.message,
+        bill_file_ids=body.bill_file_ids or None,
+    )
     await conversation_service.set_title_from_first_message(user, conversation_id, body.message)
 
     async def _stream_once():
@@ -129,6 +132,20 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
                         content = pre + rest
                         break
 
+                pending_corrections = []
+                while "===CONFIRM_FIX===" in content:
+                    pre, rest = content.split("===CONFIRM_FIX===", 1)
+                    if "===ENDCONFIRM_FIX===" in rest:
+                        fix_json, after = rest.split("===ENDCONFIRM_FIX===", 1)
+                        content = pre + after
+                        try:
+                            pending_corrections.append(json.loads(fix_json.strip()))
+                        except json.JSONDecodeError:
+                            logger.warning("Failed to parse pending correction JSON")
+                    else:
+                        content = pre + rest
+                        break
+
                 final_content = content.strip()
 
                 # Persist the assistant turn so it survives reloads/restarts.
@@ -149,6 +166,7 @@ async def chat(body: ChatRequest, user: dict = Depends(get_current_user)):
                         "charts": charts,
                         "images": images,
                         "pendingTransactions": pending_transactions,
+                        "pendingCorrections": pending_corrections,
                     })
                     + "\n\n"
                 )
