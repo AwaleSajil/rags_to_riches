@@ -7,7 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from backend.routers import auth, config_router, files, chat, transactions, conversations
+from backend.crypto import verify_encryption_key
+from backend.routers import corrections, auth, captures, config_router, files, chat, prices, transactions, conversations
 from backend.services.rag_manager import rag_manager
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,10 @@ logger = logging.getLogger("moneyrag.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("MoneyRAG API starting up")
+    # Refuse to start without it. A deployment that silently fell back to
+    # plaintext would look perfectly healthy while storing every user's API key
+    # in the clear — which is the failure this check exists to make impossible.
+    verify_encryption_key()
     logger.debug("Registered routers: auth, config, files, chat")
     yield
     logger.info("MoneyRAG API shutting down — cleaning up RAG instances")
@@ -105,6 +110,9 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(config_router.router, prefix="/api/v1/config", tags=["config"])
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
+app.include_router(captures.router, prefix="/api/v1/captures", tags=["captures"])
+app.include_router(prices.router, prefix="/api/v1/price-observations", tags=["prices"])
+app.include_router(corrections.router, prefix="/api/v1/corrections", tags=["corrections"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(transactions.router, prefix="/api/v1/transactions", tags=["transactions"])
 app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["conversations"])

@@ -33,13 +33,18 @@ from sqlglot import exp
 logger = logging.getLogger("moneyrag.sql_guard")
 
 # Tables the chat agent may read. Deliberately excludes "AccountConfig" (holds
-# plaintext api_key), "User", and anything in auth.*.
+# the API key — encrypted at rest, but still nothing the agent has any business
+# reading), "User", and anything in auth.*.
 ALLOWED_TABLES = frozenset({
     "transaction",
     "transactiondetail",
     "transactionlink",
     "billfile",
     "csvfile",
+    # Shelf prices the user photographed. Readable because "is this a good
+    # price?" is answered by comparing it against purchase history — but it is
+    # not spending, and the schema given to the agent says so explicitly.
+    "priceobservation",
 })
 
 # Node types that are never part of a read-only query. sqlglot maps anything it

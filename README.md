@@ -47,6 +47,29 @@ Set these as **Repository secrets** in HF Space settings:
 |---|---|
 | `SUPABASE_URL` | Supabase project URL (auth) |
 | `SUPABASE_KEY` | Supabase anon/service key (auth) |
+| `APP_ENCRYPTION_KEY` | Fernet key encrypting stored LLM API keys. **The API refuses to start without it.** |
+
+#### `APP_ENCRYPTION_KEY`
+
+Users' LLM API keys are encrypted before they reach the database, so a dump or
+backup no longer exposes credentials that can spend their money. Generate one:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set it as a repository/Space secret in deployment, or in `.env` locally. **Keep
+it safe** — losing it makes every stored API key unreadable and users must
+re-enter theirs. Startup fails loudly when it's missing rather than silently
+falling back to plaintext.
+
+Keys written before this existed still work and are re-encrypted whenever a user
+saves their config. To convert the backlog in one go:
+
+```bash
+python scripts/encrypt_existing_api_keys.py          # dry run
+python scripts/encrypt_existing_api_keys.py --apply
+```
 
 ### Database
 

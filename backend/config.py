@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_KEY: str
     DATABASE_URL: str
+    # Fernet key for secrets stored in the database (backend/crypto.py).
+    # Declared here so it can live in .env alongside everything else — the app
+    # refuses to start when it is blank, so the default is not a fallback.
+    APP_ENCRYPTION_KEY: str = ""
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")

@@ -37,7 +37,8 @@ export function useConfig() {
 
   const saveConfig = async (data: {
     llm_provider: string;
-    api_key: string;
+    /** Omit to keep the key already stored — see configService.updateConfig. */
+    api_key?: string;
     decode_model: string;
     embedding_model: string;
     deep_enrichment?: boolean;

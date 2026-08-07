@@ -18,6 +18,11 @@ os.environ.setdefault("SUPABASE_KEY", "test-anon-key")
 os.environ.setdefault(
     "DATABASE_URL", "postgresql://postgres:test@localhost:5432/postgres"
 )
+# A throwaway Fernet key. backend.crypto refuses to start without one, so tests
+# need their own — never reuse this anywhere real.
+os.environ.setdefault(
+    "APP_ENCRYPTION_KEY", "0EJ7QNCLNs3v6nPRJXcUCTQtR1z8sSPlB2h_dl1S7XM="
+)
 
 import pytest
 

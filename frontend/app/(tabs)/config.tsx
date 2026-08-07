@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { StyleSheet, View, ScrollView } from "react-native";
 import { Text, TextInput, Button, Snackbar, Switch, Dialog, Portal } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { GlassCard } from "../../src/components/GlassCard";
 import { ProviderModelPicker } from "../../src/components/ProviderModelPicker";
 import { ApiKeyHelp } from "../../src/components/ApiKeyHelp";
@@ -17,7 +18,14 @@ export default function ConfigScreen() {
   const [provider, setProvider] = useState("Google");
   const [decodeModel, setDecodeModel] = useState("gemini-3-flash-preview");
   const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-001");
+  // Only ever holds a key the user just typed. The server does not send stored
+  // keys back, so a blank field means "keep whatever is saved", not "no key".
   const [apiKey, setApiKey] = useState("");
+  const [keyOnServer, setKeyOnServer] = useState<{ set: boolean; hint: string }>({
+    set: false,
+    hint: "",
+  });
+  const [showApiKey, setShowApiKey] = useState(false);
   const [saved, setSaved] = useState(false);
   const [deepEnrichment, setDeepEnrichment] = useState(false);
   const [showWarning, setShowWarning] = useState(false);
@@ -30,18 +38,20 @@ export default function ConfigScreen() {
         provider: config.llm_provider,
         decodeModel: config.decode_model,
         embeddingModel: config.embedding_model,
-        hasApiKey: !!config.api_key,
+        hasApiKey: config.api_key_set,
       });
       setProvider(config.llm_provider || "Google");
       setDecodeModel(config.decode_model || "gemini-3-flash-preview");
       setEmbeddingModel(config.embedding_model || "gemini-embedding-001");
-      setApiKey(config.api_key || "");
+      setKeyOnServer({ set: !!config.api_key_set, hint: config.api_key_hint || "" });
       setDeepEnrichment(config.deep_enrichment || false);
     }
   }, [config]);
 
   const handleSave = async () => {
-    if (!apiKey) {
+    // A blank field is fine once a key is stored — it means "leave it alone",
+    // which is what you want when only the model changed.
+    if (!apiKey.trim() && !keyOnServer.set) {
       log.warn("Save attempted without API key");
       setSnackbar({ visible: true, message: "API Key is required.", error: true });
       return;
@@ -65,13 +75,18 @@ export default function ConfigScreen() {
     });
     const ok = await saveConfig({
       llm_provider: provider,
-      api_key: apiKey,
+      // Sent only when the user typed one, so an untouched field cannot
+      // overwrite the stored key with a blank.
+      ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
       decode_model: decodeModel,
       embedding_model: embeddingModel,
       deep_enrichment: deepEnrichment,
     });
     if (ok) {
       log.info("Config saved successfully from UI");
+      // Clear the field — the key is on the server now, and holding it in
+      // component state serves no purpose beyond leaving it on screen.
+      setApiKey("");
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       setSnackbar({
@@ -118,12 +133,36 @@ export default function ConfigScreen() {
           <Text style={styles.sectionSubtitle}>
             Required to process your financial data
           </Text>
+          {keyOnServer.set && (
+            <View style={styles.keyStatusRow}>
+              <MaterialCommunityIcons
+                name="check-circle"
+                size={16}
+                color={colors.success}
+              />
+              <Text style={styles.keyStatusText}>
+                Key saved{keyOnServer.hint ? ` · ${keyOnServer.hint}` : ""}
+              </Text>
+            </View>
+          )}
           <TextInput
             mode="outlined"
-            placeholder="Enter your API key"
+            placeholder={keyOnServer.set ? "Enter a new key to replace it" : "Enter your API key"}
             value={apiKey}
             onChangeText={setApiKey}
-            secureTextEntry
+            // The stored key is never sent back, so the field cannot show what
+            // is saved — which makes a typo in a freshly pasted key invisible.
+            // The reveal toggle is how you check it.
+            secureTextEntry={!showApiKey}
+            autoCapitalize="none"
+            autoCorrect={false}
+            right={
+              <TextInput.Icon
+                icon={showApiKey ? "eye-off" : "eye"}
+                onPress={() => setShowApiKey((v) => !v)}
+                accessibilityLabel={showApiKey ? "Hide API key" : "Show API key"}
+              />
+            }
             style={styles.input}
             outlineStyle={styles.outline}
             dense
@@ -224,6 +263,16 @@ const styles = StyleSheet.create({
   },
   input: {
     backgroundColor: colors.surface,
+  },
+  keyStatusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  keyStatusText: {
+    ...typography.caption,
+    color: colors.textSecondary,
   },
   outline: {
     borderRadius: 10,

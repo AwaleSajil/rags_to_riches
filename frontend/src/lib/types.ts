@@ -7,11 +7,19 @@ export interface AccountConfig {
   id?: string;
   user_id: string;
   llm_provider: string;
-  api_key: string;
   decode_model: string;
   embedding_model: string;
   deep_enrichment?: boolean;
+  // Deliberately no `api_key`. The key goes to the server and never comes back
+  // — these two are all the client gets, and all it needs to show which key is
+  // configured.
+  api_key_set: boolean;
+  /** Last 4 characters, e.g. "••••••••9fK2". Empty when no key is stored. */
+  api_key_hint: string;
 }
+
+/** What the vision model decided a captured photo is. */
+export type CaptureKind = "receipt" | "price_tag" | "unknown";
 
 export interface FileItem {
   id: string;
@@ -20,6 +28,12 @@ export interface FileItem {
   upload_date: string;
   type: "csv" | "bill";
   is_hidden?: boolean;
+  /**
+   * Photos only. Decides where tapping this file leads: only a receipt belongs
+   * in the receipt review form. Absent on CSVs, and on bill rows written before
+   * migration 014.
+   */
+  kind?: CaptureKind;
 }
 
 export interface PendingTransaction {
@@ -37,7 +51,18 @@ export interface ChatMessage {
   images?: string[];
   toolTraces?: ToolEvent[];
   pendingTransactions?: PendingTransaction[];
+  /** Fixes the agent proposed. Nothing is written until the user confirms one. */
+  pendingCorrections?: import("../services/correctionService").PendingCorrection[];
   isError?: boolean;
+  /**
+   * A photo the user just took, held as a local file URI. Kept separate from
+   * `images` (which are signed remote URLs the agent attached) because these
+   * are not fetched, are not persisted with the conversation, and disappear on
+   * reload — the record of the capture is the BillFile row, not the bubble.
+   */
+  localImages?: string[];
+  /** A captured photo awaiting the user's decision — see CaptureResult. */
+  capture?: import("../services/captureService").CaptureResult;
 }
 
 export interface ToolEvent {
@@ -62,6 +87,9 @@ export interface StoredMessage {
   charts?: string[] | null;
   images?: string[] | null;
   pending_transactions?: PendingTransaction[] | null;
+  /** Photos this turn was about. Resolved to fresh signed URLs server-side and
+   *  merged into `images`, so the client needs nothing extra to render them. */
+  bill_file_ids?: string[] | null;
   created_at: string;
 }
 
@@ -97,7 +125,8 @@ export interface TransactionDetailItem {
   id: string;
   item_description: string | null;
   item_quantity: number | null;
-  item_unit_subtotal_price: number | null; // pre-tax unit price actually paid (net of markdown)
+  item_quantity_unit: string | null; // what item_quantity counts: each|lb|oz|ml|ct…
+  unit_quantity_subtotal: number | null; // pre-tax unit price actually paid (net of markdown)
   item_subtotal_price: number | null; // pre-tax line total (qty x unit)
   item_savings?: number | null; // how much this line was marked down, display only
   tax_amount: number | null; // tax for this item
@@ -113,6 +142,11 @@ export interface TransactionWithDetails extends TransactionListItem {
   source_csv_id?: string | null;
   source_bill_file_id?: string | null;
   details: TransactionDetailItem[];
+  /**
+   * Set when verifying a receipt matched a transaction that already existed.
+   * The returned record is that earlier one — this upload wrote nothing.
+   */
+  is_duplicate?: boolean;
 }
 
 export interface ReceiptReviewLineItem {
