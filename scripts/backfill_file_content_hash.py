@@ -8,11 +8,13 @@ for a second vision extraction and leaves a stray receipt in the Files tab.
 This closes that window, for either table.
 
 It also answers the question the hash makes askable for the first time: are any
-of the files already in the bucket duplicates of each other? Two rows sharing a
-hash means one statement was imported twice, and every total the agent computes
-from those transactions is inflated. They are REPORTED, never deleted — which
-of two copies to keep, and whether the transactions under them have since been
-edited, is not a judgement a script should make.
+of the files already in the bucket duplicates of each other? Two CSV rows
+sharing a hash means one statement was imported twice and every total computed
+from those transactions is inflated; two BillFile rows means a photo was
+uploaded twice, so a vision extraction was paid for and a stray receipt is
+sitting in the Files tab. They are REPORTED, never deleted — which of two
+copies to keep, and whether what sits under them has since been edited, is not
+a judgement a script should make.
 
 The unique index means both rows of a duplicate pair cannot carry the same hash.
 The earliest keeps it; the later ones are left unhashed and listed for you.
@@ -123,11 +125,23 @@ def main() -> int:
                 f"  '{later['filename']}' ({str(later['upload_date'])[:10]})"
                 f"  ==  '{first['filename']}' ({str(first['upload_date'])[:10]})"
             )
+        if args.table == "CSVFile":
+            consequence = (
+                "  One statement imported twice. Its transactions are written\n"
+                "  twice, so any SQL the agent runs over them double-counts."
+            )
+        else:
+            consequence = (
+                "  The same photo uploaded twice. A second vision extraction was\n"
+                "  paid for, and there is a stray receipt in the Files tab. If BOTH\n"
+                "  were verified there may be a duplicate transaction too, though\n"
+                "  receipt_content_hash normally refuses the second."
+            )
         print(
-            "\n  Their transactions are counted twice by any SQL the agent runs.\n"
-            "  Delete the later one from the Files tab if you want them gone —\n"
-            "  this script will not, because the transactions under it may have\n"
-            "  been edited since.\n"
+            "\n" + consequence + "\n"
+            "  Delete the later one from the Files tab if you want it gone — this\n"
+            "  script will not, because what sits under it may have been edited\n"
+            "  since.\n"
         )
 
     if failures:
