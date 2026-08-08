@@ -23,7 +23,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 
 import { colors, spacing, typography } from "../styles/theme";
 import type { SourceVisual } from "../lib/sourceVisual";
-import { PreviewSheet } from "./PreviewSheet";
+import { DownloadAction, PreviewSheet } from "./PreviewSheet";
 import { ZoomableImage } from "./ZoomableImage";
 
 export interface PhotoViewerProps {
@@ -154,14 +154,7 @@ export function PhotoViewer({
             />
           ) : null}
           {onDownload && uri ? (
-            <IconButton
-              icon="tray-arrow-down"
-              size={22}
-              iconColor={colors.textSecondary}
-              onPress={onDownload}
-              disabled={downloading}
-              accessibilityLabel="Download the original photo"
-            />
+            <DownloadAction onPress={onDownload} busy={downloading} />
           ) : null}
         </>
       }

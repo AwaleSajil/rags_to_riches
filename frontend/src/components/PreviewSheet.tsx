@@ -39,6 +39,31 @@ export interface PreviewSheetProps {
   children: React.ReactNode;
 }
 
+/**
+ * Save the original. Lives here rather than in PhotoViewer because a CSV needs
+ * it too — when this button was defined inside the photo viewer, the CSV branch
+ * renders PreviewSheet directly and silently lost the ability to download at all.
+ */
+export function DownloadAction({
+  onPress,
+  busy = false,
+}: {
+  onPress: () => void;
+  busy?: boolean;
+}) {
+  return (
+    <IconButton
+      icon="tray-arrow-down"
+      size={22}
+      iconColor={colors.textSecondary}
+      onPress={onPress}
+      disabled={busy}
+      accessibilityLabel="Download the original file"
+    />
+  );
+}
+
+
 export function PreviewSheet({
   visible,
   onClose,

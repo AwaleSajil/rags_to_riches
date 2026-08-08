@@ -20,7 +20,7 @@ import type { FileItem } from "../lib/types";
 
 import { DeleteConfirmModal } from "./DeleteConfirmModal";
 import { PhotoViewer } from "./PhotoViewer";
-import { PreviewSheet } from "./PreviewSheet";
+import { DownloadAction, PreviewSheet } from "./PreviewSheet";
 
 const log = createLogger("FilePreviewModal");
 
@@ -377,6 +377,11 @@ export function FilePreviewModal({
       title={file?.filename ?? ""}
       subtitle={subtitle}
       icon={visual}
+      actions={
+        file && !loading && !error ? (
+          <DownloadAction onPress={handleDownload} busy={downloading} />
+        ) : null
+      }
       notice={notice}
       footer={footerActions}
       {...paging}
