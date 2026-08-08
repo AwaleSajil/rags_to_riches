@@ -189,3 +189,64 @@ def test_the_hold_outlasts_a_lunch_break():
     """An hour was short enough that coming back to a card later reliably hit
     the expired path."""
     assert cs.PENDING_TTL_SECONDS >= 6 * 60 * 60
+
+
+# --- the same photo, captured twice -------------------------------------------
+#
+# Chat can pick an existing image, not just shoot a new one, so a byte-identical
+# capture is reachable. It has to be caught BEFORE classify_photo runs: the
+# vision call is the expensive part, and a duplicate found afterwards has
+# already been paid for.
+
+def test_the_hash_is_checked_before_the_vision_call(monkeypatch, tmp_path):
+    """The saving only happens if the lookup precedes classification."""
+    import asyncio, json
+    from backend.services import capture_service as cs
+
+    photo = tmp_path / "receipt.jpg"
+    photo.write_bytes(b"\xff\xd8\xff\xe0 same bytes both times")
+
+    spawned = []
+    monkeypatch.setattr(cs.background, "spawn", lambda coro, name: spawned.append(name) or coro.close())
+    monkeypatch.setattr(cs.config_service, "get_config", _async({"llm_provider": "google"}))
+    monkeypatch.setattr(
+        cs, "_billfile_by_hash_sync",
+        lambda user, h: {"id": "existing-1", "filename": "r.jpg", "kind": "receipt",
+                         "raw_ocr_string": json.dumps({"merchant_name": "TESCO"})},
+    )
+
+    result = asyncio.run(cs.capture_photo(
+        {"id": "u1", "access_token": "t"}, str(photo), "receipt.jpg", location=None,
+    ))
+
+    assert result["file_id"] == "existing-1", "should hand back the photo already stored"
+    assert result["already_have"] is True
+    assert result["draft"]["merchant_name"] == "TESCO", "reuses what was already read"
+    assert spawned == [], "no vision call for a photo we already have"
+
+
+def test_a_new_photo_still_goes_through_classification(monkeypatch, tmp_path):
+    import asyncio
+    from backend.services import capture_service as cs
+
+    photo = tmp_path / "new.jpg"
+    photo.write_bytes(b"\xff\xd8\xff\xe0 never seen before")
+
+    spawned = []
+    monkeypatch.setattr(cs.background, "spawn", lambda coro, name: spawned.append(name) or coro.close())
+    monkeypatch.setattr(cs.config_service, "get_config", _async({"llm_provider": "google"}))
+    monkeypatch.setattr(cs, "_billfile_by_hash_sync", lambda user, h: None)
+
+    result = asyncio.run(cs.capture_photo(
+        {"id": "u1", "access_token": "t"}, str(photo), "new.jpg", location=None,
+    ))
+
+    assert result["kind"] == "processing"
+    assert result.get("already_have") is None
+    assert len(spawned) == 1, "the vision call must still run for a new photo"
+
+
+def _async(value):
+    async def _inner(*args, **kwargs):
+        return value
+    return _inner

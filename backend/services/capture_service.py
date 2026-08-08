@@ -32,6 +32,7 @@ from typing import Optional
 
 from backend.dependencies import client_for, get_supabase
 from backend.services import background, config_service
+from backend.services.upload_utils import file_sha256
 
 logger = logging.getLogger("moneyrag.services.capture")
 
@@ -153,6 +154,21 @@ def _write_draft_sync(user: dict, file_id: str, kind: str, draft: dict, filename
     }).eq("id", file_id).eq("user_id", user["id"]).execute()
 
 
+def _billfile_by_hash_sync(user: dict, content_hash: str) -> Optional[dict]:
+    """A photo this user has already uploaded, byte for byte."""
+    if not content_hash:
+        return None
+    rows = (
+        client_for(user).table("BillFile")
+        .select("id,filename,kind,raw_ocr_string")
+        .eq("user_id", user["id"])
+        .eq("content_hash", content_hash)
+        .limit(1)
+        .execute().data or []
+    )
+    return rows[0] if rows else None
+
+
 def _upload_photo_sync(user: dict, local_path: str, filename: str) -> str:
     """Put the photo in storage and create its BillFile row. Returns file_id."""
     client = client_for(user)
@@ -169,6 +185,10 @@ def _upload_photo_sync(user: dict, local_path: str, filename: str) -> str:
         "user_id": user["id"],
         "filename": filename,
         "s3_key": s3_key,
+        # Fingerprint of the bytes, so this photo cannot be uploaded again. The
+        # batch path records it too; without it here, a photo captured in chat
+        # would never be recognised on a second attempt.
+        "content_hash": file_sha256(local_path),
         # Set once the vision model has looked at it; 'unknown' until then so a
         # crash mid-classification leaves a row that prompts rather than one
         # that silently claims to be a receipt.
@@ -333,6 +353,37 @@ async def capture_photo(
         raise ValueError("Account config required. Please add your API key in Settings.")
 
     sweep_pending()
+
+    # Before the vision call, not after: extraction is the expensive part, and
+    # the same image sent twice — picked from the gallery again, or re-sent
+    # because the first attempt looked like it had failed — should cost nothing
+    # the second time. The existing photo is handed back instead, so the chat
+    # shows the record that already exists rather than minting a rival one.
+    #
+    # A RE-PHOTOGRAPHED receipt is different bytes and passes straight through;
+    # that duplicate is caught at verification by receipt_content_hash.
+    content_hash = await asyncio.to_thread(file_sha256, local_path)
+    existing = await asyncio.to_thread(_billfile_by_hash_sync, user, content_hash)
+    if existing:
+        shutil.rmtree(os.path.dirname(local_path), ignore_errors=True)
+        logger.info(
+            "Capture for user_id=%s is byte-identical to BillFile %s — reusing it",
+            user["id"], existing["id"],
+        )
+        try:
+            draft = json.loads(existing.get("raw_ocr_string") or "{}")
+        except (TypeError, ValueError):
+            draft = {}
+        return {
+            "file_id": str(existing["id"]),
+            "kind": existing.get("kind") or "unknown",
+            "draft": draft,
+            "location": location,
+            # So the client can say "you already had this" rather than letting a
+            # familiar-looking card read as a fresh capture.
+            "already_have": True,
+        }
+
     capture_id = str(uuid.uuid4())
     _pending[capture_id] = {
         "user_id": user["id"],
