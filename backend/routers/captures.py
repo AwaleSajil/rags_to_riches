@@ -54,10 +54,6 @@ async def create_capture(
     except ValueError as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.error("Capture failed for user_id=%s: %s", user["id"], e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Could not process that photo: {e}")
     # No cleanup on the success path: reading the photo now happens AFTER this
     # response, and the background task still needs these bytes. It removes the
     # directory itself when it finishes.
@@ -78,9 +74,6 @@ async def get_capture(
         return await capture_service.get_capture(user, file_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error("Reading capture %s failed: %s", file_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Could not load that photo: {e}")
 
 
 @router.delete("/{file_id}")
@@ -103,9 +96,6 @@ async def discard_capture(
         return {"message": f"Deleted {filename}"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error("Discarding capture %s failed: %s", file_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Could not discard that photo: {e}")
 
 
 @router.post("/{file_id}/kind")
@@ -124,6 +114,3 @@ async def set_capture_kind(
         return await capture_service.set_kind(user, file_id, kind)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error("Setting capture kind failed for %s: %s", file_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Could not update that photo: {e}")

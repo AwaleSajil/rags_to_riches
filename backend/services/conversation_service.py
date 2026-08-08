@@ -3,15 +3,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from backend.dependencies import get_supabase
+from backend.dependencies import client_for as _client, get_supabase
 
 logger = logging.getLogger("moneyrag.services.conversation")
 
 MAX_HISTORY = 12  # recent turns passed to the agent for context
-
-
-def _client(user: dict):
-    return get_supabase(user["access_token"])
 
 
 async def list_conversations(user: dict) -> List[Dict[str, Any]]:

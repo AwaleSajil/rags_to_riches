@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from backend.dependencies import get_current_user, get_supabase
+from backend.dependencies import client_for, get_current_user, get_supabase
 from backend.services import background, capture_service, config_service, price_service
 
 logger = logging.getLogger("moneyrag.routers.prices")
@@ -88,7 +88,7 @@ async def create_price_observation(
     # an embedding call hit its quota would lose the photo the user is standing
     # in a shop to take; the row can be embedded later.
     config = await config_service.get_config(user)
-    client = get_supabase(user.get("access_token"))
+    client = client_for(user)
 
     # This is the moment a shelf photo earns its place: until now it was held in
     # memory with its bytes in a temp dir and no row anywhere, so a tag that was
@@ -100,9 +100,6 @@ async def create_price_observation(
             bill_file_id = await capture_service.materialise(user, bill_file_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
-        except Exception as e:
-            logger.error("Could not store the photo for this price: %s", e, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Could not save that photo: {e}")
 
     try:
         # Shared with the agent's check_price tool rather than duplicated. The
@@ -115,9 +112,6 @@ async def create_price_observation(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error("Failed to save price observation: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Could not save that price: {e}")
 
     # Researched, then re-embedded, then compared — all inline. The vector
     # written at insert holds only the tag's own words; the receipt side is

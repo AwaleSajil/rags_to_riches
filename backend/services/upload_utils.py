@@ -75,3 +75,19 @@ async def save_within_limit(upload: UploadFile, destination: str) -> int:
     if total == 0:
         raise ValueError(f"'{upload.filename}' is empty")
     return total
+
+
+def file_sha256(path: str) -> str:
+    """Fingerprint a saved upload by its bytes.
+
+    Streamed in chunks rather than read whole: an upload is already capped at
+    MAX_UPLOAD_BYTES, but there is no reason to hold all of it in memory again
+    just to hash it.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

@@ -26,9 +26,5 @@ async def get_messages(conversation_id: str, user: dict = Depends(get_current_us
 
 @router.delete("/{conversation_id}")
 async def delete_conversation(conversation_id: str, user: dict = Depends(get_current_user)):
-    try:
-        await conversation_service.delete_conversation(user, conversation_id)
-        return {"message": "Conversation deleted"}
-    except Exception as e:
-        logger.error("Delete conversation failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+    await conversation_service.delete_conversation(user, conversation_id)
+    return {"message": "Conversation deleted"}

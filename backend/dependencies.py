@@ -21,6 +21,17 @@ def get_supabase(access_token: str | None = None):
     return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
 
 
+def client_for(user: dict):
+    """A Supabase client acting as this user, so RLS policies apply.
+
+    Every service and router needs this and each had its own line for it — some
+    `user["access_token"]`, some `user.get("access_token")`, which fail
+    differently on a malformed user dict. One spelling, and one place to change
+    if the auth mechanism ever does.
+    """
+    return get_supabase(user.get("access_token"))
+
+
 def _validate_token_sync(token: str, supabase_url: str, supabase_key: str) -> dict:
     """Sync Supabase auth call — runs in thread pool to avoid blocking the event loop."""
     logger.debug("Validating token via Supabase auth.get_user (token=%s...)", token[:20])

@@ -92,6 +92,3 @@ async def update_config(body: ConfigUpdate, user: dict = Depends(get_current_use
         # A deliberate 4xx (e.g. the missing-key check above). Without this the
         # catch-all below would relabel it a 500 and hide the real reason.
         raise
-    except Exception as e:
-        logger.error("Failed to save config for user_id=%s: %s", user["id"], e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to save config: {e}")

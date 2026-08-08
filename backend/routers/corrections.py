@@ -5,7 +5,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from backend.dependencies import get_current_user, get_supabase
+from backend.dependencies import client_for, get_current_user, get_supabase
 from backend.services import config_service, correction_service
 
 logger = logging.getLogger("moneyrag.routers.corrections")
@@ -33,7 +33,7 @@ async def apply_correction(
     user: dict = Depends(get_current_user),
 ):
     """Apply a confirmed correction to one row the caller owns."""
-    client = get_supabase(user.get("access_token"))
+    client = client_for(user)
 
     try:
         updated = await asyncio.to_thread(
@@ -42,9 +42,6 @@ async def apply_correction(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error("Correction failed for %s %s: %s", body.table, body.row_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Could not apply that fix: {e}")
 
     if not updated:
         # Either the row is gone or it is not this user's. Same answer either
@@ -89,7 +86,7 @@ async def _refresh_corrected_row(
         if table == "PriceObservation":
             from backend.services import price_service
 
-            client = get_supabase(user.get("access_token"))
+            client = client_for(user)
             rows = (
                 client.table("PriceObservation").select("*")
                 .eq("id", row_id).eq("user_id", user["id"]).limit(1).execute().data or []
@@ -114,7 +111,7 @@ async def _refresh_corrected_row(
 
         # A line item's vector lives on its parent's re-embed, which rebuilds the
         # transaction and every child together.
-        client = get_supabase(user.get("access_token"))
+        client = client_for(user)
         transaction_id = row_id
         if table == "TransactionDetail":
             rows = (
@@ -139,7 +136,7 @@ def _rewrite_description_sync(user: dict, config: dict, table: str, row_id: str)
     """Regenerate enriched_info so it agrees with the corrected row."""
     from backend.services import price_service
 
-    client = get_supabase(user.get("access_token"))
+    client = client_for(user)
     rows = (
         client.table(table).select("*")
         .eq("id", row_id).eq("user_id", user["id"]).limit(1).execute().data or []

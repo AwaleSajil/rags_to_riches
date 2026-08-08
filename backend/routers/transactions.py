@@ -30,13 +30,9 @@ async def list_transactions(
     user: dict = Depends(get_current_user),
 ):
     """List the current user's transactions, newest first, with optional filters."""
-    try:
-        return await transaction_service.list_transactions(
-            user, category=category, start_date=start_date, end_date=end_date, q=q
-        )
-    except Exception as e:
-        logger.error("Failed to list transactions: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to list transactions: {e}")
+    return await transaction_service.list_transactions(
+        user, category=category, start_date=start_date, end_date=end_date, q=q
+    )
 
 
 @router.get("/{transaction_id}", response_model=TransactionWithDetails)
@@ -45,11 +41,7 @@ async def get_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Fetch one transaction plus its line items (ordered), including tax breakdown."""
-    try:
-        tx = await transaction_service.get_transaction(user, transaction_id)
-    except Exception as e:
-        logger.error("Failed to get transaction %s: %s", transaction_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get transaction: {e}")
+    tx = await transaction_service.get_transaction(user, transaction_id)
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return tx
@@ -92,11 +84,7 @@ async def update_transaction(
         changes["trans_date"] = changes["trans_date"].isoformat()
     if not changes:
         raise HTTPException(status_code=400, detail="No fields to update")
-    try:
-        tx = await transaction_service.update_transaction(user, transaction_id, changes)
-    except Exception as e:
-        logger.error("Failed to update transaction %s: %s", transaction_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to update transaction: {e}")
+    tx = await transaction_service.update_transaction(user, transaction_id, changes)
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return tx
@@ -110,11 +98,7 @@ async def replace_details(
 ):
     """Replace all line items for a transaction (edit/add/delete in one shot)."""
     details = [d.model_dump() for d in body.details]
-    try:
-        tx = await transaction_service.replace_details(user, transaction_id, details)
-    except Exception as e:
-        logger.error("Failed to replace details for %s: %s", transaction_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to replace line items: {e}")
+    tx = await transaction_service.replace_details(user, transaction_id, details)
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return tx
@@ -126,11 +110,7 @@ async def delete_transaction(
     user: dict = Depends(get_current_user),
 ):
     """Delete a transaction (line items cascade) and remove its vector(s)."""
-    try:
-        deleted = await transaction_service.delete_transaction(user, transaction_id)
-    except Exception as e:
-        logger.error("Failed to delete transaction %s: %s", transaction_id, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to delete transaction: {e}")
+    deleted = await transaction_service.delete_transaction(user, transaction_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return {"message": "Transaction deleted"}
@@ -168,46 +148,40 @@ async def create_transaction(
         "content_hash": content_hash,
     }
 
-    try:
-        sb = get_supabase(access_token=user.get("access_token"))
-        # Dedup constraint is UNIQUE(user_id, content_hash) — the conflict target
-        # must name both columns or Postgres raises 42P10.
-        result = sb.table("Transaction").upsert(
-            [record], on_conflict="user_id,content_hash"
-        ).execute()
+    sb = get_supabase(access_token=user.get("access_token"))
+    # Dedup constraint is UNIQUE(user_id, content_hash) — the conflict target
+    # must name both columns or Postgres raises 42P10.
+    result = sb.table("Transaction").upsert(
+        [record], on_conflict="user_id,content_hash"
+    ).execute()
 
-        if result.data:
-            row = result.data[0]
-            return TransactionResponse(
-                id=row["id"],
-                description=row["description"],
-                amount=float(row["amount"]),
-                trans_date=str(row["trans_date"]),
-                category=row.get("category", "Uncategorized"),
-                merchant_name=row.get("merchant_name"),
-            )
-
-        # Fallback: fetch by hash if upsert didn't return data
-        fetch = (
-            sb.table("Transaction")
-            .select("*")
-            .eq("content_hash", content_hash)
-            .eq("user_id", user_id)
-            .execute()
+    if result.data:
+        row = result.data[0]
+        return TransactionResponse(
+            id=row["id"],
+            description=row["description"],
+            amount=float(row["amount"]),
+            trans_date=str(row["trans_date"]),
+            category=row.get("category", "Uncategorized"),
+            merchant_name=row.get("merchant_name"),
         )
-        if fetch.data:
-            row = fetch.data[0]
-            return TransactionResponse(
-                id=row["id"],
-                description=row["description"],
-                amount=float(row["amount"]),
-                trans_date=str(row["trans_date"]),
-                category=row.get("category", "Uncategorized"),
-                merchant_name=row.get("merchant_name"),
-            )
-        raise HTTPException(status_code=500, detail="Transaction insert returned no data")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to create transaction: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to save transaction: {e}")
+
+    # Fallback: fetch by hash if upsert didn't return data
+    fetch = (
+        sb.table("Transaction")
+        .select("*")
+        .eq("content_hash", content_hash)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if fetch.data:
+        row = fetch.data[0]
+        return TransactionResponse(
+            id=row["id"],
+            description=row["description"],
+            amount=float(row["amount"]),
+            trans_date=str(row["trans_date"]),
+            category=row.get("category", "Uncategorized"),
+            merchant_name=row.get("merchant_name"),
+        )
+    raise HTTPException(status_code=500, detail="Transaction insert returned no data")

@@ -151,3 +151,150 @@ def test_csv_uploads_carry_no_kind():
     client.insert_file_record("CSVFile", "user-1", "statement.csv", "k")
 
     assert "kind" not in captured
+
+
+# --- route ordering -----------------------------------------------------------
+#
+# GET /files/{file_id} is a catch-all. FastAPI matches in declaration order, so
+# if it is registered above a literal path, that path stops existing: the
+# request arrives at the by-id handler as a file named "ingestion-status" and
+# 404s. Nothing else fails, the upload screen just polls forever.
+
+def test_ingestion_status_is_not_shadowed_by_the_by_id_route(client):
+    response = client.get("/api/v1/files/ingestion-status")
+    assert response.status_code == 200
+    # The status handler's shape, not the by-id handler's "File not found".
+    assert "status" in response.json()
+
+
+def test_the_by_id_route_still_resolves(client, monkeypatch):
+    from backend.services import file_service
+
+    async def _one(user, file_id):
+        return {"id": file_id, "filename": "r.jpg", "s3_key": "k", "upload_date": "", "type": "bill"}
+
+    monkeypatch.setattr(file_service, "get_file", _one)
+    response = client.get("/api/v1/files/abc-123")
+    assert response.status_code == 200
+    assert response.json()["id"] == "abc-123"
+
+
+def test_a_missing_file_is_a_404(client, monkeypatch):
+    from backend.services import file_service
+
+    async def _none(user, file_id):
+        return None
+
+    monkeypatch.setattr(file_service, "get_file", _none)
+    assert client.get("/api/v1/files/nope").status_code == 404
+
+
+# --- persisted photo orientation ----------------------------------------------
+#
+# Stored as an angle, not by rewriting the image: the photo is the evidence
+# behind a financial record, re-encoding it loses quality on every turn, and an
+# interrupted re-upload can leave a receipt half-replaced with no other copy.
+
+import pytest
+
+
+@pytest.mark.parametrize("degrees", [0, 90, 180, 270])
+@pytest.mark.asyncio
+async def test_quarter_turns_are_accepted(degrees, monkeypatch):
+    from backend.services import file_service
+
+    seen = {}
+
+    def _fake(access_token, file_id, value):
+        seen["value"] = value
+        return value
+
+    monkeypatch.setattr(file_service, "_set_file_rotation_sync", _fake)
+    result = await file_service.set_file_rotation(
+        {"access_token": "t"}, "file-1", degrees
+    )
+    assert result == degrees
+    assert seen["value"] == degrees
+
+
+@pytest.mark.parametrize("degrees", [45, -90, 360, 1, 91])
+@pytest.mark.asyncio
+async def test_anything_but_a_quarter_turn_is_rejected(degrees):
+    """The column has the same CHECK, so this keeps a bad value from surfacing
+    as a raw database error."""
+    from backend.services import file_service
+
+    with pytest.raises(ValueError, match="0, 90, 180 or 270"):
+        await file_service.set_file_rotation({"access_token": "t"}, "file-1", degrees)
+
+
+def test_rotation_defaults_to_upright_on_the_schema():
+    """Rows written before migration 036 have no rotation; they are not sideways."""
+    from backend.schemas.files import FileItem
+
+    item = FileItem(
+        id="f1", filename="r.jpg", s3_key="k", upload_date="2026-08-07", type="bill"
+    )
+    assert item.rotation == 0
+
+
+# --- the same statement, uploaded twice ----------------------------------------
+#
+# Row-level dedup cannot catch this. Each row's content_hash is built from the
+# CSV's own file id, which is new on every upload — deliberately, so two
+# different exports covering one period stay separate. The cost is that
+# re-uploading ONE identical file produces entirely new hashes, matches nothing,
+# and writes every transaction again: doubled rows, a second pass of LLM
+# enrichment, a second set of embeddings, and an agent that sums twice.
+
+def test_identical_bytes_hash_identically(tmp_path):
+    from backend.services.upload_utils import file_sha256
+
+    first = tmp_path / "jan.csv"
+    second = tmp_path / "jan-copy.csv"
+    body = b"date,desc,amount\n2026-01-04,TESCO,12.30\n"
+    first.write_bytes(body)
+    second.write_bytes(body)
+    # The NAME is not part of it — the same statement saved twice by a browser
+    # arrives as "statement.csv" and "statement (1).csv".
+    assert file_sha256(str(first)) == file_sha256(str(second))
+
+
+def test_a_changed_byte_is_a_different_file(tmp_path):
+    """A later export covering more days must still import."""
+    from backend.services.upload_utils import file_sha256
+
+    first = tmp_path / "jan.csv"
+    second = tmp_path / "jan-feb.csv"
+    first.write_bytes(b"date,desc,amount\n2026-01-04,TESCO,12.30\n")
+    second.write_bytes(b"date,desc,amount\n2026-01-04,TESCO,12.30\n2026-02-01,BP,40.00\n")
+    assert file_sha256(str(first)) != file_sha256(str(second))
+
+
+def test_a_hash_never_seen_before_is_not_a_duplicate():
+    """csv_file_by_content_hash returns None rather than raising, and an empty
+    hash short-circuits — rows predating the column have a NULL one."""
+    from backend.db_client import DatabaseClient
+
+    assert DatabaseClient.csv_file_by_content_hash(object(), "user-1", "") is None
+
+
+def test_the_upload_response_reports_skipped_files():
+    """A silent skip is indistinguishable from a silent success."""
+    from backend.schemas.files import UploadResponse
+
+    response = UploadResponse(
+        message="Nothing new to import — you already have these.",
+        file_ids=[],
+        already_imported=[
+            {"filename": "statement (1).csv", "existing_filename": "statement.csv",
+             "uploaded_at": "2026-08-05"}
+        ],
+    )
+    assert response.already_imported[0].uploaded_at == "2026-08-05"
+
+
+def test_an_ordinary_upload_reports_nothing_skipped():
+    from backend.schemas.files import UploadResponse
+
+    assert UploadResponse(message="ok", file_ids=["f1"]).already_imported == []

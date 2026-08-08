@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from backend.schemas.auth import LoginRequest, RegisterRequest, AuthResponse, UserInfo
 from backend.config import get_settings, Settings
-from backend.dependencies import get_current_user, get_optional_user
+from backend.dependencies import client_for, get_current_user, get_optional_user
 from supabase import create_client
 
 logger = logging.getLogger("moneyrag.routers.auth")
@@ -71,7 +71,7 @@ async def login(
 
         # Initialize an authenticated client to bypass RLS policies
         from backend.dependencies import get_supabase
-        client = get_supabase(user["access_token"])
+        client = client_for(user)
         
         email = normalize_email(user["email"])
         logger.debug("Login sync for email=%s", email)
@@ -116,7 +116,7 @@ async def register(
 
         # Initialize an authenticated client to bypass RLS policies
         from backend.dependencies import get_supabase
-        client = get_supabase(user["access_token"])
+        client = client_for(user)
         
         email = normalize_email(user["email"])
         logger.debug("Register sync for email=%s", email)
