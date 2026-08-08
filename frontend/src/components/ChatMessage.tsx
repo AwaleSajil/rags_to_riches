@@ -1,10 +1,12 @@
 import React, { useState } from "react";
-import { Image, Modal, Platform, Pressable, StyleSheet, useWindowDimensions, View } from "react-native";
+import { Image, Platform, Pressable, StyleSheet, useWindowDimensions, View } from "react-native";
 import { IconButton, Text } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import Markdown from "react-native-markdown-display";
 import { PlotlyChart } from "./PlotlyChart";
-import { ZoomableImage } from "./ZoomableImage";
+import { PhotoViewer } from "./PhotoViewer";
+import { asAttachment, photoFilename, saveToDevice } from "../lib/download";
+import { sourceVisual } from "../lib/sourceVisual";
 import { TransactionConfirmCard } from "./TransactionConfirmCard";
 import { CorrectionConfirmCard } from "./CorrectionConfirmCard";
 import { KindPromptCard } from "./KindPromptCard";
@@ -28,6 +30,12 @@ interface ChatMessageProps {
     fileId?: string
   ) => void;
   onReviewReceipt?: (fileId: string) => void;
+  /** Send this prompt again. Offered on your own messages so a failed or
+   *  unsatisfying answer can be retried without retyping. */
+  onRerun?: (text: string) => void;
+  /** Suppresses rerun while a turn is in flight — sendMessage would ignore it
+   *  anyway, so an enabled button that silently does nothing is worse. */
+  rerunDisabled?: boolean;
 }
 
 /** Routes a captured photo to the card that matches what it turned out to be. */
@@ -103,21 +111,64 @@ export function ChatMessage({
   onDiscardCapture,
   onAskAboutPrices,
   onReviewReceipt,
+  onRerun,
+  rerunDisabled,
 }: ChatMessageProps) {
   const isUser = message.role === "user";
-  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  const { width: screenWidth } = useWindowDimensions();
   const hasCharts = message.charts && message.charts.length > 0;
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Scale receipt images based on screen width
   const imageWidth = Math.min(Math.floor(screenWidth * 0.45), 200);
   const imageHeight = Math.round(imageWidth * 1.4);
+
+  // Every photo in this message, in the order they are shown, so the viewer can
+  // page between them. Attached receipts first, then anything just captured.
+  const photos = [...(message.images ?? []), ...(message.localImages ?? [])];
+  const photoIndex = expandedImage ? photos.indexOf(expandedImage) : -1;
+
+  // A photo taken moments ago is already on this device; only a receipt the
+  // agent attached from storage is worth offering to save.
+  const isRemote = expandedImage ? !expandedImage.startsWith("file:") : false;
+
+  const handleDownload = async () => {
+    if (!expandedImage || downloading) return;
+    setDownloading(true);
+    setNotice(null);
+    try {
+      const name = photoFilename(expandedImage);
+      await saveToDevice(asAttachment(expandedImage, name), name);
+      setNotice("Saved to your downloads.");
+    } catch (e: any) {
+      setNotice(e?.message || "Could not download that photo.");
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   return (
     <View style={[styles.container, isUser ? styles.userContainer : styles.assistantContainer]}>
       <Text style={[styles.roleLabel, isUser ? styles.userLabel : styles.assistantLabel]}>
         {isUser ? "You" : "R2R"}
       </Text>
+      {/* The rerun button sits OUTSIDE the bubble, to its left. Inside it would
+          either steal width from the text or sit on the indigo fill where a
+          plain icon has poor contrast. */}
+      <View style={isUser ? styles.userRow : undefined}>
+      {isUser && onRerun && !!message.content?.trim() && (
+        <IconButton
+          icon="refresh"
+          size={16}
+          iconColor={colors.textTertiary}
+          disabled={rerunDisabled}
+          onPress={() => onRerun(message.content)}
+          style={styles.rerunButton}
+          accessibilityLabel="Ask this again"
+        />
+      )}
       <View style={[
         styles.bubble,
         isUser ? styles.userBubble : styles.assistantBubble,
@@ -163,27 +214,32 @@ export function ChatMessage({
             ))}
           </View>
         )}
-        {expandedImage && (
-          <Modal visible transparent animationType="fade" onRequestClose={() => setExpandedImage(null)}>
-            {/* The backdrop no longer swallows the gesture: a Pressable wrapping
-                the image would claim every touch, so a pinch registered as a tap
-                and closed the viewer instead of zooming. Closing is the X, or a
-                tap on the backdrop AROUND the image. */}
-            <View style={styles.modalBackdrop}>
-              <Pressable
-                style={StyleSheet.absoluteFill}
-                onPress={() => setExpandedImage(null)}
-              />
-              <View style={styles.modalHeader}>
-                <IconButton icon="close" iconColor="#fff" size={28} onPress={() => setExpandedImage(null)} />
-              </View>
-              <ZoomableImage
-                uri={expandedImage}
-                style={{ width: screenWidth * 0.95, height: screenHeight * 0.8 }}
-              />
-            </View>
-          </Modal>
-        )}
+        {/* The same viewer the Files tab and the transaction screen use, so a
+            receipt tapped here offers the same things: rotate, download, and
+            paging when a reply attached more than one. */}
+        <PhotoViewer
+          visible={!!expandedImage}
+          uri={expandedImage}
+          onClose={() => {
+            setExpandedImage(null);
+            setNotice(null);
+          }}
+          title={expandedImage ? photoFilename(expandedImage) : ""}
+          subtitle={isRemote ? "Receipt" : "Just captured"}
+          icon={isRemote ? sourceVisual("receipt") : undefined}
+          onDownload={isRemote ? handleDownload : undefined}
+          downloading={downloading}
+          notice={notice}
+          onPrevious={
+            photoIndex > 0 ? () => setExpandedImage(photos[photoIndex - 1]) : undefined
+          }
+          onNext={
+            photoIndex >= 0 && photoIndex < photos.length - 1
+              ? () => setExpandedImage(photos[photoIndex + 1])
+              : undefined
+          }
+          position={photoIndex >= 0 ? { index: photoIndex, total: photos.length } : undefined}
+        />
         {message.localImages && message.localImages.length > 0 && (
           <View style={styles.imageRow}>
             {message.localImages.map((uri, i) => (
@@ -225,6 +281,7 @@ export function ChatMessage({
           <ToolTrace traces={message.toolTraces} />
         )}
       </View>
+      </View>
     </View>
   );
 }
@@ -250,6 +307,18 @@ const styles = StyleSheet.create({
   },
   assistantLabel: {
     color: colors.primary,
+  },
+  userRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    // The bubble's own maxWidth is a percentage of this row, so the row has to
+    // be allowed to shrink or a long prompt pushes the button off-screen.
+    flexShrink: 1,
+  },
+  rerunButton: {
+    margin: 0,
+    marginRight: 2,
   },
   bubble: {
     maxWidth: "85%",
@@ -325,18 +394,6 @@ const styles = StyleSheet.create({
     ...typography.body2,
     color: colors.text,
     flexShrink: 1,
-  },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.92)",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  modalHeader: {
-    position: "absolute",
-    top: 40,
-    right: 8,
-    zIndex: 1,
   },
 });
 

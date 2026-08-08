@@ -14,9 +14,27 @@ export async function listFiles(): Promise<FileItem[]> {
   return res.files;
 }
 
+/** One file by id — enough to sign a URL and preview it. */
+export async function getFile(fileId: string): Promise<FileItem> {
+  return apiJson<FileItem>(`/files/${fileId}`);
+}
+
+/** A CSV the server refused because these exact bytes are already imported. */
+export interface AlreadyImported {
+  filename: string;
+  existing_filename?: string | null;
+  uploaded_at?: string | null;
+}
+
+export interface UploadResult {
+  message: string;
+  file_ids: string[];
+  already_imported?: AlreadyImported[];
+}
+
 export async function uploadFiles(
   input: { uri: string; name: string; type: string }[]
-): Promise<{ message: string; file_ids: string[] }> {
+): Promise<UploadResult> {
   // Shrunk here rather than at each camera and picker, so no attach path can
   // skip it. CSVs pass straight through.
   const files = await Promise.all(input.map(compressImage));
@@ -36,7 +54,7 @@ export async function uploadFiles(
 // Web: multipart via fetch/FormData (works reliably in browsers).
 async function uploadFilesWeb(
   files: { uri: string; name: string; type: string }[]
-): Promise<{ message: string; file_ids: string[] }> {
+): Promise<UploadResult> {
   const formData = new FormData();
   for (const file of files) {
     const response = await fetch(file.uri);
@@ -63,22 +81,28 @@ async function uploadFilesWeb(
 // "Network request failed", so we bypass it entirely.
 async function uploadFilesNative(
   files: { uri: string; name: string; type: string }[]
-): Promise<{ message: string; file_ids: string[] }> {
+): Promise<UploadResult> {
   const fileIds: string[] = [];
+  const alreadyImported: AlreadyImported[] = [];
   let message = "";
   for (const file of files) {
     const result = await uploadOneNative(file);
     if (result.file_ids) fileIds.push(...result.file_ids);
+    if (result.already_imported) alreadyImported.push(...result.already_imported);
     message = result.message || message;
   }
-  log.info("Upload successful (native)", { fileIds });
-  return { message: message || "Upload complete", file_ids: fileIds };
+  log.info("Upload successful (native)", { fileIds, skipped: alreadyImported.length });
+  return {
+    message: message || "Upload complete",
+    file_ids: fileIds,
+    already_imported: alreadyImported,
+  };
 }
 
 async function uploadOneNative(
   file: { uri: string; name: string; type: string },
   isRetry = false
-): Promise<{ message: string; file_ids: string[] }> {
+): Promise<UploadResult> {
   const token = await getAccessToken(isRetry);
 
   // Copy to a cache path whose basename keeps the extension — the backend
@@ -155,6 +179,14 @@ export async function deleteFile(
   });
   log.info("File deleted", { message: result.message });
   return result;
+}
+
+/** Remember how far a photo must be turned. Does not modify the image. */
+export async function setFileRotation(
+  fileId: string,
+  degrees: number
+): Promise<{ rotation: number }> {
+  return apiJson(`/files/${fileId}/rotation?degrees=${degrees}`, { method: "PATCH" });
 }
 
 export async function setFileVisibility(

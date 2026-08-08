@@ -3,6 +3,7 @@ import { StyleSheet, View, Pressable } from "react-native";
 import { Text, Button, TextInput, Checkbox } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { colors, typography, spacing } from "../styles/theme";
+import { money, parseNumber } from "../lib/format";
 import type { PriceTagDraft } from "../services/captureService";
 import type { PriceComparison } from "../services/priceService";
 
@@ -83,8 +84,12 @@ type Status = "editing" | "saving" | "done" | "cancelled";
  * better: the tags are smaller and more angled, so checking matters more.
  */
 export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk, place }: Props) {
+  // A photo the model could not read arrives with no tags at all — and the user
+  // has just told us it IS a price tag. One empty row lets them type it in.
+  // Without this the card rendered a heading, no fields, and a "Pick at least
+  // one price to check" error about a list that did not exist.
   const [rows, setRows] = useState<Row[]>(() =>
-    tags.map((tag, i) => toRow(tag, i, tags.length))
+    (tags.length ? tags : [{}]).map((tag, i) => toRow(tag, i, tags.length))
   );
   const [status, setStatus] = useState<Status>("editing");
   const [error, setError] = useState<string | null>(null);
@@ -129,7 +134,7 @@ export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk,
       if (!row.selected) continue;
       try {
         const draft = {
-          ...tags[index],
+          ...(tags[index] ?? {}),
           tag_index: index,
           item_description: row.item.trim(),
           item_subtotal_price: parseFloat(row.price),
@@ -193,7 +198,7 @@ export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk,
                 />
                 <Text style={styles.title}>
                   {row.item}
-                  {row.price ? ` · $${parseFloat(row.price).toFixed(2)}` : ""}
+                  {row.price ? ` · ${money(parseNumber(row.price))}` : ""}
                 </Text>
               </View>
               {/* Deliberately no comparison here. The agent answers in the very
@@ -308,12 +313,12 @@ export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk,
 
               {/* The tag's own per-unit figure beats anything we compute: the
                   store did the arithmetic for the exact package on the shelf. */}
-              {tags[index].unit_price_display && (
+              {tags[index]?.unit_price_display && (
                 <Text style={styles.unitPrice}>
-                  {tags[index].unit_price_display} (printed on the tag)
+                  {tags[index]?.unit_price_display} (printed on the tag)
                 </Text>
               )}
-              {tags[index].size_unknown && (
+              {tags[index]?.size_unknown && (
                 <Text style={styles.hint}>
                   No size found — I'll compare this against the same item only, not per unit.
                 </Text>
@@ -321,9 +326,9 @@ export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk,
               {/* Shown verbatim rather than as parsed badges. The tag's own
                   wording is what the user can check against the shelf in front
                   of them, and it is what the agent later reasons from. */}
-              {tags[index].item_qualitative_description && (
+              {tags[index]?.item_qualitative_description && (
                 <Text style={styles.observedContext} numberOfLines={3}>
-                  {tags[index].item_qualitative_description}
+                  {tags[index]?.item_qualitative_description}
                 </Text>
               )}
             </>

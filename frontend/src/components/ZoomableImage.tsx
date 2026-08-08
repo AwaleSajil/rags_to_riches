@@ -18,6 +18,15 @@ interface Props {
   resizeMode?: ImageResizeMode;
   /** How far in a pinch or a double-tap may go. */
   maxScale?: number;
+  /**
+   * Quarter turns clockwise, in degrees (0 / 90 / 180 / 270).
+   *
+   * Display only — the stored photo is never rewritten. A receipt photographed
+   * sideways needs turning to be read, not correcting: re-encoding and
+   * re-uploading it would replace the original evidence to fix a viewing
+   * problem, and the OCR has already run against the file as it is.
+   */
+  rotation?: number;
 }
 
 const DOUBLE_TAP_MS = 280;
@@ -75,8 +84,31 @@ function clamp(value: number, min: number, max: number): number {
  * scaling first would put the translation into the scaled coordinate space, so
  * a drag would move the image by its distance times the zoom factor.
  */
-export function ZoomableImage({ uri, style, resizeMode = "contain", maxScale = 4 }: Props) {
+export function ZoomableImage({
+  uri,
+  style,
+  resizeMode = "contain",
+  maxScale = 4,
+  rotation = 0,
+}: Props) {
+  // A quarter turn swaps which way the image is wide, and that changes both how
+  // `contain` fits it and how far it may be panned. Normalised first so a
+  // negative or accumulated angle (-90, 450) is classified the same as 270/90.
+  const turn = (((rotation % 360) + 360) % 360);
+  const quarterTurned = turn % 180 !== 0;
   const scale = useRef(new Animated.Value(1)).current;
+  /**
+   * Rotation is an Animated.Value rather than a plain "90deg" string, and it
+   * has to be.
+   *
+   * The three values above are animated with `useNativeDriver: true`, which
+   * hands the whole `transform` prop to the native side. A static entry sitting
+   * in the same array is captured when that native node is built and never read
+   * again — re-rendering with a new angle updated the JS style and changed
+   * nothing on screen. Making the angle a fourth animated value puts it in the
+   * same node, so it travels by the same route as the others.
+   */
+  const spin = useRef(new Animated.Value(0)).current;
   const translateX = useRef(new Animated.Value(0)).current;
   const translateY = useRef(new Animated.Value(0)).current;
 
@@ -122,6 +154,28 @@ export function ZoomableImage({ uri, style, resizeMode = "contain", maxScale = 4
   }, [uri]);
 
   /**
+   * The image's footprint on screen at scale 1, after any rotation.
+   *
+   * When quarter-turned the image is laid out in a box with the container's
+   * dimensions swapped (see the render below), so `contain` fits it to the
+   * orientation it will be seen in. What ends up on screen is that fitted box
+   * turned on its side, hence the final swap.
+   */
+  const drawnSize = (): { width: number; height: number } => {
+    if (!container) return { width: 0, height: 0 };
+    const boxWidth = quarterTurned ? container.height : container.width;
+    const boxHeight = quarterTurned ? container.width : container.height;
+    let width = boxWidth;
+    let height = boxHeight;
+    if (aspect && resizeMode === "contain") {
+      const fitted = Math.min(boxWidth, boxHeight * aspect);
+      width = fitted;
+      height = fitted / aspect;
+    }
+    return quarterTurned ? { width: height, height: width } : { width, height };
+  };
+
+  /**
    * How far the image may be dragged on each axis: half of whatever overflows
    * the container once scaled. Uses the size the image is actually drawn at,
    * not the container's, or panning would wander into the letterboxing that
@@ -129,16 +183,10 @@ export function ZoomableImage({ uri, style, resizeMode = "contain", maxScale = 4
    */
   const boundsFor = (at: number): Point => {
     if (!container) return { x: 0, y: 0 };
-    let width = container.width;
-    let height = container.height;
-    if (aspect && resizeMode === "contain") {
-      const fitted = Math.min(container.width, container.height * aspect);
-      width = fitted;
-      height = fitted / aspect;
-    }
+    const drawn = drawnSize();
     return {
-      x: Math.max(0, (width * at - container.width) / 2),
-      y: Math.max(0, (height * at - container.height) / 2),
+      x: Math.max(0, (drawn.width * at - container.width) / 2),
+      y: Math.max(0, (drawn.height * at - container.height) / 2),
     };
   };
 
@@ -153,6 +201,18 @@ export function ZoomableImage({ uri, style, resizeMode = "contain", maxScale = 4
     translateX.setValue(live.current.x);
     translateY.setValue(live.current.y);
   };
+
+  // A quarter turn swaps the axes, so wherever the image was panned to no
+  // longer means anything — a receipt zoomed into its bottom-left corner would
+  // turn to show empty space. Reset to centred and unzoomed. Skipped on the
+  // first render so mounting at a non-zero rotation is not treated as a turn.
+  const settledRotation = useRef(turn);
+  useEffect(() => {
+    spin.setValue(turn);
+    if (settledRotation.current === turn) return;
+    settledRotation.current = turn;
+    apply({ scale: 1, x: 0, y: 0 });
+  }, [turn, spin]);
 
   const settle = (to: { scale: number; x: number; y: number }) => {
     const bounds = boundsFor(to.scale);
@@ -322,8 +382,24 @@ export function ZoomableImage({ uri, style, resizeMode = "contain", maxScale = 4
           settle(live.current.scale <= 1.05 ? { scale: 1, x: 0, y: 0 } : live.current);
         },
       }),
-    [maxScale, scale, translateX, translateY, container, aspect, resizeMode]
+    [maxScale, scale, translateX, translateY, container, aspect, resizeMode, quarterTurned]
   );
+
+  // Turned on its side, the image is laid out in a box with the container's
+  // dimensions swapped and re-centred, so that `contain` fits it to the shape
+  // it will actually be seen in. Without this a portrait receipt rotated 90°
+  // is fitted to the portrait container first and then spun, leaving most of
+  // it clipped off both sides.
+  const box =
+    quarterTurned && container
+      ? {
+          position: "absolute" as const,
+          width: container.height,
+          height: container.width,
+          left: (container.width - container.height) / 2,
+          top: (container.height - container.width) / 2,
+        }
+      : StyleSheet.absoluteFill;
 
   return (
     <View ref={view} style={[styles.container, style]} onLayout={onLayout} {...responder.panHandlers}>
@@ -331,8 +407,24 @@ export function ZoomableImage({ uri, style, resizeMode = "contain", maxScale = 4
         source={{ uri }}
         resizeMode={resizeMode}
         style={[
-          StyleSheet.absoluteFill,
-          { transform: [{ translateX }, { translateY }, { scale }] },
+          box,
+          {
+            // Rotate is LAST, so it happens innermost: the image turns about
+            // its own centre and the pan and zoom then act on the turned image
+            // as a unit. Placed first, a drag would move along the original
+            // axes and feel sideways once rotated.
+            transform: [
+              { translateX },
+              { translateY },
+              { scale },
+              {
+                rotate: spin.interpolate({
+                  inputRange: [0, 360],
+                  outputRange: ["0deg", "360deg"],
+                }),
+              },
+            ],
+          },
         ]}
       />
     </View>

@@ -25,9 +25,17 @@ function toChatMessage(m: StoredMessage): ChatMessage {
   };
 }
 
+// Re-rendering per token means re-parsing the whole markdown body per token,
+// which is the expensive part. Batching to ~20fps is indistinguishable from
+// per-token and costs a fraction of the work.
+const TOKEN_FLUSH_MS = 50;
+
 export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  // True once the answer itself starts arriving, so the screen can drop the
+  // "Thinking..." indicator instead of showing it under live text.
+  const [isReceivingText, setIsReceivingText] = useState(false);
   const [currentToolTraces, setCurrentToolTraces] = useState<ToolEvent[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
 
@@ -48,15 +56,51 @@ export function useChat() {
       const userMsg: ChatMessage = { role: "user", content: text };
       setMessages((prev) => [...prev, userMsg]);
       setIsStreaming(true);
+      setIsReceivingText(false);
       setCurrentToolTraces([]);
 
       let toolTraces: ToolEvent[] = [];
+
+      // --- live answer text ---------------------------------------------------
+      // `streamed` is the full answer so far; the placeholder message it feeds is
+      // always the last one, because nothing else can append during a turn.
+      let streamed = "";
+      let placeholderAdded = false;
+      let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const flushStreamed = () => {
+        flushTimer = null;
+        const snapshot = streamed;
+        setMessages((prev) => {
+          if (!prev.length) return prev;
+          const next = [...prev];
+          next[next.length - 1] = { ...next[next.length - 1], content: snapshot };
+          return next;
+        });
+      };
+
+      const cancelFlush = () => {
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+      };
 
       try {
         await streamChat(text, {
           onConversation: (id) => {
             log.info("Conversation id (hook)", { id });
             setConversationId(id);
+          },
+          onToken: (chunk) => {
+            streamed += chunk;
+            if (!placeholderAdded) {
+              placeholderAdded = true;
+              setIsReceivingText(true);
+              setMessages((prev) => [...prev, { role: "assistant", content: streamed }]);
+              return;
+            }
+            if (!flushTimer) flushTimer = setTimeout(flushStreamed, TOKEN_FLUSH_MS);
           },
           onToolStart: (data) => {
             log.info("Tool started (hook)", { name: data.name });
@@ -85,6 +129,7 @@ export function useChat() {
               imageCount: data.images?.length || 0,
               toolTraceCount: toolTraces.length,
             });
+            cancelFlush();
             const assistantMsg: ChatMessage = {
               role: "assistant",
               content: data.content,
@@ -94,15 +139,31 @@ export function useChat() {
               pendingTransactions: data.pendingTransactions?.length ? data.pendingTransactions : undefined,
               pendingCorrections: data.pendingCorrections?.length ? data.pendingCorrections : undefined,
             };
-            setMessages((prev) => [...prev, assistantMsg]);
+            // Replaces the streamed placeholder rather than appending after it.
+            // `data.content` is the authoritative text — fully stripped of the
+            // marker blocks — so whatever streamed is corrected here, and the
+            // saved message and the visible one cannot drift apart.
+            setMessages((prev) =>
+              placeholderAdded && prev.length
+                ? [...prev.slice(0, -1), assistantMsg]
+                : [...prev, assistantMsg]
+            );
+            setIsReceivingText(false);
             setCurrentToolTraces([]);
           },
           onDone: () => {
             log.info("Stream done (hook) - setting isStreaming=false");
+            cancelFlush();
             setIsStreaming(false);
+            setIsReceivingText(false);
           },
           onError: (error) => {
             log.error("Stream error (hook)", { error });
+            cancelFlush();
+            // Keep whatever had already streamed — it is real answer text, and
+            // deleting it in front of the user reads as though more was lost
+            // than actually was. Flush it first so it is not a stale snapshot.
+            if (placeholderAdded) flushStreamed();
             const errorMsg: ChatMessage = {
               role: "assistant",
               content: error || "Something went wrong. Please try again.",
@@ -110,10 +171,13 @@ export function useChat() {
             };
             setMessages((prev) => [...prev, errorMsg]);
             setIsStreaming(false);
+            setIsReceivingText(false);
           },
         }, conversationId, billFileIds);
       } catch (e: any) {
         log.error("sendMessage exception", e);
+        cancelFlush();
+        if (placeholderAdded) flushStreamed();
         const errorMsg: ChatMessage = {
           role: "assistant",
           content: e?.message || "Network error. Please try again.",
@@ -121,6 +185,7 @@ export function useChat() {
         };
         setMessages((prev) => [...prev, errorMsg]);
         setIsStreaming(false);
+        setIsReceivingText(false);
       }
     },
     [isStreaming, conversationId]
@@ -260,6 +325,7 @@ export function useChat() {
   return {
     messages,
     isStreaming,
+    isReceivingText,
     currentToolTraces,
     conversationId,
     sendMessage,

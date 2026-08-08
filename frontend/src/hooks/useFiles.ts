@@ -30,12 +30,21 @@ const MAX_INGESTION_MS = 15 * 60 * 1000;
 export function useFiles() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  // Whether a load has finished, successfully or not. An empty file list means
+  // two very different things before and after that, and screens that only
+  // checked `files.length` showed "no data" for the moment before the first
+  // response arrived. See the same flag on useAsyncResource.
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [visibilityFileId, setVisibilityFileId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
+  // Whole files the server refused as already imported. Distinct from
+  // `duplicates`, which are individual rows merged during ingestion — these
+  // never reached ingestion at all.
+  const [alreadyImported, setAlreadyImported] = useState<fileService.AlreadyImported[]>([]);
   // Photos awaiting review, each tagged receipt | price_tag | unknown so the
   // screen can route to the right form instead of assuming everything is a receipt.
   const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
@@ -163,6 +172,7 @@ export function useFiles() {
       setError(e.message);
     } finally {
       setIsLoading(false);
+      setHasLoaded(true);
     }
   }, []);
 
@@ -183,12 +193,17 @@ export function useFiles() {
     setIsUploading(true);
     setError(null);
     setDuplicates([]);
+    setAlreadyImported([]);
     setReviewItems([]);
     try {
-      await fileService.uploadFiles(pickedFiles);
-      log.info("Upload complete - reloading file list and starting ingestion poll");
+      const result = await fileService.uploadFiles(pickedFiles);
+      const skipped = result.already_imported ?? [];
+      setAlreadyImported(skipped);
+      log.info("Upload complete - reloading file list", { skipped: skipped.length });
       await loadFiles();
-      startIngestionPolling();
+      // Nothing was accepted, so no ingestion will run and polling would spin
+      // against a status that never changes.
+      if (result.file_ids.length > 0) startIngestionPolling();
       return true;
     } catch (e: any) {
       log.error("uploadFiles failed", e);
@@ -217,6 +232,31 @@ export function useFiles() {
     }
   };
 
+  /**
+   * Remember a photo's viewing orientation.
+   *
+   * Patched into the local list rather than refetching: the whole point is a
+   * turn that sticks, and reloading the list to learn one number would blink
+   * the picture the user is looking at.
+   */
+  const setFileRotation = useCallback(async (file: FileItem, degrees: number) => {
+    try {
+      const result = await fileService.setFileRotation(file.id, degrees);
+      setFiles((current) =>
+        current.map((item) =>
+          item.id === file.id ? { ...item, rotation: result.rotation } : item
+        )
+      );
+      return true;
+    } catch (e: any) {
+      // Not surfaced: the turn is applied on screen either way, and an error
+      // banner over a receipt someone just straightened is more disruptive
+      // than the angle being forgotten by tomorrow.
+      log.error("setFileRotation failed", e);
+      return false;
+    }
+  }, []);
+
   // Stable identity: this is a prop on every row in the file list, so a new
   // function each render would defeat FileListItem's memoization and re-render
   // the whole visible list on every keystroke in the search box.
@@ -239,22 +279,26 @@ export function useFiles() {
 
   const clearDuplicates = useCallback(() => {
     setDuplicates([]);
+    setAlreadyImported([]);
   }, []);
 
   return {
     files,
     isLoading,
+    hasLoaded,
     isUploading,
     isIngesting,
     isDeleting,
     visibilityFileId,
     error,
     duplicates,
+    alreadyImported,
     reviewItems,
     ingestionProgress,
     uploadFiles,
     deleteFile,
     toggleFileVisibility,
+    setFileRotation,
     loadFiles,
     clearDuplicates,
   };

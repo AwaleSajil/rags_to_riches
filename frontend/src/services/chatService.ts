@@ -7,6 +7,10 @@ const log = createLogger("ChatService");
 
 export interface ChatEventCallbacks {
   onConversation?: (conversationId: string) => void;
+  /** A piece of the answer as it is generated. Already stripped server-side of
+   *  the ===MARKER=== blocks the UI must never show, so it is safe to render
+   *  straight away. `onFinal` still replaces it with the authoritative text. */
+  onToken?: (text: string) => void;
   onToolStart: (data: { name: string; input: string }) => void;
   onToolEnd: (data: { name: string; snippet: string }) => void;
   onFinal: (data: { content: string; charts: string[]; images: string[]; pendingTransactions?: any[]; pendingCorrections?: any[] }) => void;
@@ -36,6 +40,11 @@ function processSSEBuffer(
           case "conversation":
             log.info("Conversation id received", { id: data.conversation_id });
             callbacks.onConversation?.(data.conversation_id);
+            break;
+          // Deliberately not logged per token — one line per few characters
+          // buries every other event in the stream.
+          case "token":
+            callbacks.onToken?.(data.text || "");
             break;
           case "tool_start":
             log.info("Tool started", { name: data.name, input: data.input?.substring(0, 100) });

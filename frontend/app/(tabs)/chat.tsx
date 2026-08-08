@@ -35,6 +35,7 @@ export default function ChatScreen() {
   const {
     messages,
     isStreaming,
+    isReceivingText,
     currentToolTraces,
     sendMessage,
     sendPhoto,
@@ -44,7 +45,7 @@ export default function ChatScreen() {
     loadConversation,
     newConversation,
   } = useChat();
-  const { files, loadFiles, uploadFiles } = useFiles();
+  const { files, hasLoaded: filesLoaded, loadFiles, uploadFiles } = useFiles();
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [snack, setSnack] = useState<string | null>(null);
@@ -114,6 +115,18 @@ export default function ChatScreen() {
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), delay);
     }
   }, [messages.length, isStreaming]);
+
+  // A streaming answer grows without changing the message COUNT, so the effect
+  // above never fires for it and the text runs off the bottom of the screen.
+  // Unanimated on purpose: this lands every ~50ms, and animating each one
+  // fights the next.
+  const streamingLength = isReceivingText
+    ? messages[messages.length - 1]?.content?.length ?? 0
+    : 0;
+  useEffect(() => {
+    if (!streamingLength) return;
+    flatListRef.current?.scrollToEnd({ animated: false });
+  }, [streamingLength]);
 
   // --- capture entry points -------------------------------------------------
 
@@ -278,18 +291,27 @@ export default function ChatScreen() {
   // un-reviewed receipt.
   const handleKindResolved = useCallback(
     (fileId: string, result: CaptureResult) => {
+      // Matched on the OLD id, because that is what the message on screen holds.
       updateCapture(fileId, result);
       if (result.kind === "receipt") {
-        openReview(router, [{ file_id: fileId, kind: result.kind }]);
+        // Opened with the NEW one. Answering "receipt" stores the photo, which
+        // mints a BillFile id and returns it — `fileId` here is still the
+        // capture handle, and it names no row, so routing with it landed on
+        // "Receipt review is not available".
+        openReview(router, [{ file_id: result.file_id, kind: result.kind }]);
       }
     },
     [updateCapture, router]
   );
 
+  const handleRerun = useCallback((text: string) => void sendMessage(text), [sendMessage]);
+
   const renderItem = useCallback(
     ({ item }: { item: ChatMessageType }) => (
       <MemoizedChatMessage
         message={item}
+        onRerun={handleRerun}
+        rerunDisabled={isStreaming}
         onKindResolved={handleKindResolved}
         onConfirmPriceTag={handleConfirmPriceTag}
         onDiscardCapture={handleDiscardCapture}
@@ -301,7 +323,7 @@ export default function ChatScreen() {
         }
       />
     ),
-    [handleKindResolved, handleConfirmPriceTag, handleDiscardCapture, handleAskAboutPrices, router]
+    [handleKindResolved, handleConfirmPriceTag, handleDiscardCapture, handleAskAboutPrices, router, handleRerun, isStreaming]
   );
 
   const keyExtractor = useCallback((_: ChatMessageType, i: number) => String(i), []);
@@ -330,8 +352,10 @@ export default function ChatScreen() {
         }}
       />
 
-      {/* File status banner */}
-      {fileCount === 0 && (
+      {/* File status banner. Waits for the first load to finish: `files` is
+          empty before the response arrives too, so checking only the count
+          flashed "no data loaded yet" on every launch and then withdrew it. */}
+      {filesLoaded && fileCount === 0 && (
         <Banner
           visible
           style={styles.warningBanner}
@@ -367,8 +391,10 @@ export default function ChatScreen() {
         }
       />
 
-      {/* Streaming indicator with live tool status */}
-      {isStreaming && (
+      {/* Streaming indicator with live tool status. Hidden once the answer
+          itself starts arriving — "Thinking..." underneath text that is
+          visibly being written is just noise. */}
+      {isStreaming && !isReceivingText && (
         <View style={[styles.streamingIndicator, responsiveStyle]}>
           {currentToolTraces.length > 0 ? (
             <View style={styles.toolStatus}>
