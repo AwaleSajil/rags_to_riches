@@ -85,9 +85,9 @@ async def get_file(user: dict, file_id: str) -> dict | None:
 def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, list, list]:
     """Uploads files to Supabase storage + creates DB records.
 
-    Returns (uploaded_files_info, file_ids, already_imported). The third is CSVs
-    skipped because this user has imported those exact bytes before — see
-    `csv_file_by_content_hash`.
+    Returns (uploaded_files_info, file_ids, already_imported). The third is
+    files skipped because this user has uploaded those exact bytes before — see
+    `file_by_content_hash`.
     """
     logger.debug("_upload_to_storage_sync — %d files for user_id=%s", len(saved_files), user["id"])
     client = client_for(user)
@@ -103,26 +103,32 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
             folder = "bills" if is_image else "csvs"
             s3_key = f"{user['id']}/{folder}/{filename}"
 
-            # CSVs only. Two photos of one receipt are different bytes, and that
-            # duplicate is caught later by receipt_content_hash instead.
-            content_hash = None
-            if not is_image:
-                content_hash = file_sha256(local_path)
-                seen = db.csv_file_by_content_hash(user["id"], content_hash)
-                if seen:
-                    # Nothing is uploaded, no row is written, and ingestion never
-                    # runs — so no duplicate transactions, no second pass of LLM
-                    # enrichment, and no second set of embeddings.
-                    logger.info(
-                        "Skipping '%s' for user_id=%s — identical to %s uploaded %s",
-                        filename, user["id"], seen.get("filename"), seen.get("upload_date"),
-                    )
-                    already_imported.append({
-                        "filename": filename,
-                        "existing_filename": seen.get("filename"),
-                        "uploaded_at": str(seen.get("upload_date") or "")[:10],
-                    })
-                    continue
+            # Both kinds. A duplicate CSV writes every transaction a second
+            # time; a duplicate photo pays for a second vision extraction and
+            # leaves a stray receipt in the Files tab.
+            #
+            # Byte-identical only. A RE-PHOTOGRAPHED receipt is different pixels
+            # and passes straight through here — that duplicate is caught at
+            # verification by receipt_content_hash, which compares what was read
+            # rather than the bytes.
+            table = "BillFile" if is_image else "CSVFile"
+            content_hash = file_sha256(local_path)
+            seen = db.file_by_content_hash(table, user["id"], content_hash)
+            if seen:
+                # Nothing is uploaded, no row is written, and neither ingestion
+                # nor the vision pass runs — so no duplicate transactions, no
+                # second pass of LLM enrichment, no second set of embeddings,
+                # and no second extraction to pay for.
+                logger.info(
+                    "Skipping '%s' for user_id=%s — identical to %s uploaded %s",
+                    filename, user["id"], seen.get("filename"), seen.get("upload_date"),
+                )
+                already_imported.append({
+                    "filename": filename,
+                    "existing_filename": seen.get("filename"),
+                    "uploaded_at": str(seen.get("upload_date") or "")[:10],
+                })
+                continue
 
             content_type = "text/csv"
             if filename.lower().endswith(".png"):
@@ -159,7 +165,6 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
             upload_ms = (time.perf_counter() - start) * 1000
             logger.debug("Storage upload complete for '%s' in %.1fms", filename, upload_ms)
 
-            table = "BillFile" if is_image else "CSVFile"
             logger.debug("Inserting DB record into %s for '%s'", table, filename)
             
             file_id = db.insert_file_record(

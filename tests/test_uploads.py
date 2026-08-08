@@ -272,11 +272,11 @@ def test_a_changed_byte_is_a_different_file(tmp_path):
 
 
 def test_a_hash_never_seen_before_is_not_a_duplicate():
-    """csv_file_by_content_hash returns None rather than raising, and an empty
-    hash short-circuits — rows predating the column have a NULL one."""
+    """file_by_content_hash returns None rather than raising, and an empty hash
+    short-circuits — rows predating the column have a NULL one."""
     from backend.db_client import DatabaseClient
 
-    assert DatabaseClient.csv_file_by_content_hash(object(), "user-1", "") is None
+    assert DatabaseClient.file_by_content_hash(object(), "CSVFile", "user-1", "") is None
 
 
 def test_the_upload_response_reports_skipped_files():
@@ -298,3 +298,30 @@ def test_an_ordinary_upload_reports_nothing_skipped():
     from backend.schemas.files import UploadResponse
 
     assert UploadResponse(message="ok", file_ids=["f1"]).already_imported == []
+
+
+def test_a_re_uploaded_photo_is_refused_too(tmp_path):
+    """The same IMAGE FILE sent twice — picked from the gallery again, or
+    re-sent because the first attempt looked like it failed.
+
+    Distinct from a re-photographed receipt, which is different pixels and is
+    caught later by receipt_content_hash. This one costs a whole vision
+    extraction before anything notices.
+    """
+    from backend.services.upload_utils import file_sha256
+
+    first = tmp_path / "receipt.jpg"
+    second = tmp_path / "receipt (1).jpg"
+    body = b"\xff\xd8\xff\xe0 not really a jpeg, but the same bytes twice"
+    first.write_bytes(body)
+    second.write_bytes(body)
+    assert file_sha256(str(first)) == file_sha256(str(second))
+
+
+def test_the_lookup_is_scoped_to_the_right_table():
+    """A photo and a CSV could in principle hash the same; they must not match
+    each other, and each table has its own unique index."""
+    from backend.db_client import DatabaseClient
+
+    assert DatabaseClient.file_by_content_hash(object(), "BillFile", "u", "") is None
+    assert DatabaseClient.file_by_content_hash(object(), "CSVFile", "u", "") is None

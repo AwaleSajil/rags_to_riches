@@ -127,17 +127,23 @@ class DatabaseClient:
             if r.get("source_bill_file_id") and str(r["id"]) in linked_transaction_ids
         }
 
-    def csv_file_by_content_hash(self, user_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
-        """A CSV this user has already imported, byte for byte.
+    def file_by_content_hash(
+        self, table: str, user_id: str, content_hash: str
+    ) -> Optional[Dict[str, Any]]:
+        """A file this user has already uploaded, byte for byte.
 
         Cheap and exact, unlike the row-level matching — two identical files
         need no fuzzy comparison. Returns None for anything not seen before,
         and for rows uploaded before the column existed (their hash is NULL).
+
+        Works for both tables: a duplicate CSV writes every transaction again,
+        and a duplicate photo pays for a second vision extraction. Neither is
+        worth accepting.
         """
         if not content_hash:
             return None
         res = (
-            self.supabase.table("CSVFile")
+            self.supabase.table(table)
             .select("id,filename,upload_date")
             .eq("user_id", user_id)
             .eq("content_hash", content_hash)
@@ -161,7 +167,7 @@ class DatabaseClient:
             "filename": filename,
             "s3_key": s3_key,
         }
-        if table == "CSVFile" and content_hash:
+        if content_hash:
             record["content_hash"] = content_hash
         if table == "BillFile":
             # Explicitly unexamined until the vision pass says otherwise. The

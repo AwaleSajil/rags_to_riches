@@ -1,9 +1,11 @@
-"""Fingerprint CSVs that were uploaded before `CSVFile.content_hash` existed.
+"""Fingerprint files uploaded before `content_hash` existed.
 
 New uploads are hashed on arrival and a byte-identical re-upload is refused
 (see backend/services/file_service.py). The backlog has no hash, so the FIRST
-re-upload of an old file still slips through — it matches nothing, gets
-accepted, and doubles every transaction in it. This closes that window.
+re-upload of an old file still slips through — it matches nothing and gets
+accepted. For a CSV that doubles every transaction in it; for a photo it pays
+for a second vision extraction and leaves a stray receipt in the Files tab.
+This closes that window, for either table.
 
 It also answers the question the hash makes askable for the first time: are any
 of the files already in the bucket duplicates of each other? Two rows sharing a
@@ -21,8 +23,9 @@ can therefore never reach anyone else's files, which is why it wants a password
 rather than a service-role key.
 
 Usage:
-    PYTHONPATH=. .venv/bin/python scripts/backfill_csv_content_hash.py --email you@example.com
-    PYTHONPATH=. .venv/bin/python scripts/backfill_csv_content_hash.py --email you@example.com --apply
+    PYTHONPATH=. .venv/bin/python scripts/backfill_file_content_hash.py --email you@example.com
+    PYTHONPATH=. .venv/bin/python scripts/backfill_file_content_hash.py --email you@example.com --apply
+    PYTHONPATH=. .venv/bin/python scripts/backfill_file_content_hash.py --email you@example.com --table BillFile --apply
 """
 
 import argparse
@@ -44,7 +47,13 @@ BUCKET = "money-rag-files"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--email", required=True, help="the account whose CSVs to hash")
+    parser.add_argument("--email", required=True, help="the account whose files to hash")
+    parser.add_argument(
+        "--table",
+        choices=("CSVFile", "BillFile"),
+        default="CSVFile",
+        help="which backlog to fingerprint (default: CSVFile)",
+    )
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -65,7 +74,7 @@ def main() -> int:
     user_id = session.user.id
 
     rows = (
-        client.table("CSVFile")
+        client.table(args.table)
         .select("id,filename,s3_key,upload_date,content_hash")
         .eq("user_id", user_id)
         .order("upload_date")
@@ -75,7 +84,7 @@ def main() -> int:
     )
     pending = [r for r in rows if not r.get("content_hash")]
 
-    print(f"\n{len(rows)} CSV file(s); {len(pending)} without a hash.\n")
+    print(f"\n{len(rows)} {args.table} row(s); {len(pending)} without a hash.\n")
     if not pending:
         print("Nothing to do.")
         return 0
@@ -130,7 +139,7 @@ def main() -> int:
 
     written = 0
     for row, digest in to_write:
-        client.table("CSVFile").update({"content_hash": digest}).eq("id", row["id"]).execute()
+        client.table(args.table).update({"content_hash": digest}).eq("id", row["id"]).execute()
         written += 1
     print(f"Wrote {written} hash(es). Re-uploading any of these files is now refused.")
     if duplicates:
