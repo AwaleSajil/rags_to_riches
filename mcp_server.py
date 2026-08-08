@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Optional
 
 import pandas as pd
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 from textwrap import dedent
 
 from backend.sql_guard import SqlGuardError, readonly_cursor, validate_select
+from backend.services import stream_gate as markers
 
 # Load environment variables (API keys, etc.)
 load_dotenv()
@@ -39,6 +41,19 @@ def get_current_user_id() -> str:
     if not user_id:
         raise ValueError("CURRENT_USER_ID not injected into MCP environment!")
     return user_id
+
+# The names as they are actually spelled in the database. sql_guard's allowlist
+# is lowercased for comparison, which loses the casing needed to tell the agent
+# what to write. test_schema_doc holds the two in step.
+TABLE_NAMES = (
+    "Transaction",
+    "TransactionDetail",
+    "TransactionLink",
+    "BillFile",
+    "CSVFile",
+    "PriceObservation",
+)
+
 
 def _quote_table(name: str) -> str:
     """Quote a table name appropriately for Postgres."""
@@ -210,7 +225,34 @@ def query_database(query: str) -> str:
     except SqlGuardError as e:
         return f"Query rejected: {e}"
     except Exception as e:
-        return f"Database Error: {str(e)}"
+        return _explain_db_error(e)
+
+
+# Postgres folds an unquoted identifier to lowercase, so `FROM Transaction`
+# looks for a table named `transaction` and reports it missing. The schema
+# already says to quote table names, and the agent still forgets — it costs two
+# steps of a 25-step budget on almost every run, because the raw Postgres text
+# never says what to do about it. This does.
+_MISSING_RELATION = re.compile(r'relation "([a-z_]+)" does not exist', re.IGNORECASE)
+
+
+def _explain_db_error(exc: Exception) -> str:
+    message = str(exc)
+    match = _MISSING_RELATION.search(message)
+    if match:
+        lowercased = match.group(1)
+        correct = next(
+            (t for t in TABLE_NAMES if t.lower() == lowercased.lower()), None
+        )
+        if correct:
+            return (
+                f'Database Error: relation "{lowercased}" does not exist.\n'
+                f'The table is named {_quote_table(correct)} — Postgres lowercases '
+                f'unquoted names, so you must write it with double quotes. '
+                f'Re-run the SAME query with {_quote_table(correct)} instead of '
+                f'{correct}.'
+            )
+    return f"Database Error: {message}"
 
 
 # Registered by hand rather than with @mcp.tool() so the schema can be injected:
@@ -590,7 +632,7 @@ def propose_transaction(
     result = json.dumps(proposal)
 
     return (
-        f"===CONFIRM_TX==={result}===ENDCONFIRM_TX===\n\n"
+        f"{markers.wrap(markers.CONFIRM_TX, result)}\n\n"
         "I've prepared this transaction for your review. "
         "Please check the details in the confirmation card and tap Confirm to save it."
     )
@@ -902,7 +944,7 @@ def propose_correction(table: str, row_id: str, changes: dict, reason: str = "")
         "reason": reason or "",
     })
     return (
-        f"===CONFIRM_FIX==={proposal}===ENDCONFIRM_FIX===\n\n"
+        f"{markers.wrap(markers.CONFIRM_FIX, proposal)}\n\n"
         "I've prepared that fix. Check the card and tap Confirm to apply it."
     )
 

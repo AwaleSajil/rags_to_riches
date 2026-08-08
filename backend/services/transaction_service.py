@@ -6,7 +6,7 @@ import re
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from backend.dependencies import get_supabase
+from backend.dependencies import client_for as _client, get_supabase
 from backend.services import background, config_service
 from backend.services.categories import normalize_category
 
@@ -71,10 +71,6 @@ _LIST_COLUMNS = (
     "source,source_csv_id,source_bill_file_id,"
     "note,enriched_info,created_at"
 )
-
-
-def _client(user: dict):
-    return get_supabase(user["access_token"])
 
 
 def _merchant_match_key(transaction: Dict[str, Any]) -> str:
@@ -264,9 +260,91 @@ async def get_transaction(user: dict, transaction_id: str) -> Optional[Dict[str,
             .execute()
         )
         tx["details"] = details_res.data or []
+        tx["linked_transactions"] = _linked_transactions_sync(client, user, transaction_id)
         return tx
 
     return await asyncio.to_thread(_run)
+
+
+def _linked_transactions_sync(client, user: dict, transaction_id: str) -> List[Dict[str, Any]]:
+    """The other records of this same real-world purchase.
+
+    A purchase can arrive twice — once off a bank statement and once as a
+    photographed receipt — and the two are matched on merchant, date and amount
+    rather than merged, because neither is safe to throw away: the statement is
+    what the bank says, the receipt is what was actually bought.
+
+    The list screen already collapses a linked pair to one row, silently. Here
+    it is said out loud, with enough of the other record to be recognised —
+    otherwise a user sees one transaction where they know there were two, and
+    has no way to tell whether the other was absorbed or lost.
+    """
+    links = (
+        client.table("TransactionLink")
+        .select("transaction_id,linked_transaction_id,match_type")
+        .eq("user_id", user["id"])
+        .or_(
+            f"transaction_id.eq.{transaction_id},"
+            f"linked_transaction_id.eq.{transaction_id}"
+        )
+        .execute().data or []
+    )
+    # The link is undirected — this row may be on either side of it.
+    other_ids = {
+        str(link["linked_transaction_id"])
+        if str(link["transaction_id"]) == str(transaction_id)
+        else str(link["transaction_id"])
+        for link in links
+    }
+    other_ids.discard(str(transaction_id))
+    if not other_ids:
+        return []
+
+    match_types = {
+        (
+            str(link["linked_transaction_id"])
+            if str(link["transaction_id"]) == str(transaction_id)
+            else str(link["transaction_id"])
+        ): link.get("match_type")
+        for link in links
+    }
+
+    rows = (
+        client.table("Transaction")
+        .select("id,trans_date,amount,merchant_name,description,source,source_csv_id")
+        .eq("user_id", user["id"])
+        .in_("id", list(other_ids))
+        .execute().data or []
+    )
+    if not rows:
+        return []
+
+    # Whether the other side has line items decides which of the two is worth
+    # reading, and the UI says so rather than making the user go and find out.
+    counts = (
+        client.table("TransactionDetail")
+        .select("transaction_id")
+        .eq("user_id", user["id"])
+        .in_("transaction_id", [str(r["id"]) for r in rows])
+        .execute().data or []
+    )
+    detail_counts: Dict[str, int] = {}
+    for row in counts:
+        key = str(row["transaction_id"])
+        detail_counts[key] = detail_counts.get(key, 0) + 1
+
+    return [
+        {
+            "id": str(row["id"]),
+            "trans_date": row.get("trans_date"),
+            "amount": row.get("amount"),
+            "merchant_name": row.get("merchant_name") or row.get("description"),
+            "source": row.get("source"),
+            "match_type": match_types.get(str(row["id"])),
+            "detail_count": detail_counts.get(str(row["id"]), 0),
+        }
+        for row in rows
+    ]
 
 
 async def get_receipt_review(user: dict, file_id: str) -> Optional[Dict[str, Any]]:
@@ -292,6 +370,40 @@ async def get_receipt_review(user: dict, file_id: str) -> Optional[Dict[str, Any
         return {"file_id": file_id, "filename": res.data[0]["filename"], "extracted": extracted}
 
     return await asyncio.to_thread(_run)
+
+
+def merchant_key(merchant: Optional[str]) -> str:
+    """A merchant name reduced to what OCR cannot vary.
+
+    Every non-alphanumeric character goes, over the WHOLE name. This used to
+    take `split()[0]` — the first word only — so the same shop read once as
+    "STOP & SHOP" and once as "STOP&SHOP" produced 'stop' and 'stopshop', and a
+    receipt uploaded twice was not recognised as the same receipt. Whitespace is
+    exactly the sort of thing a vision model varies between runs, and it must
+    not be load-bearing.
+    """
+    return "".join(c for c in (merchant or "").lower() if c.isalnum())
+
+
+def receipt_content_hash(
+    date_value: Any, receipt_time: str, total: float, merchant: Optional[str]
+) -> str:
+    """Identify a receipt by the things printed clearly enough to read twice.
+
+    Date, time, total and merchant. All four came back identical across two OCR
+    passes of the same receipt; the line-item descriptions did not, and used to
+    be part of this. Abbreviations are where the vision model wanders —
+    "SL LGHT FLUID32Z" one run, "SL LIGHT FLUID" the next — so a single
+    character across fourteen lines was enough to defeat the match and write a
+    second transaction for a purchase that happened once.
+
+    Dropping them costs almost no discrimination: two different purchases at the
+    same shop, in the same MINUTE, for the same total is not a case worth
+    protecting against, and the time is what makes that true.
+    """
+    return hashlib.sha256(
+        f"{date_value}{receipt_time}{total}{merchant_key(merchant)}".encode()
+    ).hexdigest()
 
 
 def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -386,13 +498,7 @@ def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Opt
     # Total the shopper saved: per-item markdowns plus any order coupon. Display
     # only — never re-derives the total.
     savings_total = round(item_savings_total + discount_total, 2)
-    merchant_hash = "".join(c for c in merchant.lower().split()[0] if c.isalnum()) if merchant else ""
-    item_signature = "|".join(sorted(d["item_description"].strip().lower() for d in details))
-    # The receipt time distinguishes same-merchant, same-total purchases made
-    # on the same day. Old receipts without a visible time remain compatible.
-    content_hash = hashlib.sha256(
-        f"{date_value}{receipt_time}{total}{merchant_hash}{item_signature}".encode()
-    ).hexdigest()
+    content_hash = receipt_content_hash(date_value, receipt_time, total, merchant)
 
     existing_for_bill = (
         client.table("Transaction").select("id").eq("user_id", user["id"])
@@ -832,12 +938,28 @@ def _prepare_detail_rows(
 
 
 def _header_totals_from_details(
-    details: List[Dict[str, Any]], existing_breakdown, discount_total: float = 0.0
+    details: List[Dict[str, Any]],
+    existing_breakdown,
+    discount_total: float = 0.0,
+    previous: Optional[Dict[str, Any]] = None,
 ):
     """Roll line items up into header subtotal / tax_total / amount / breakdown /
     savings_total, so the transaction stays consistent with its items. An
     order-level discount (unchanged by item edits) is subtracted from amount and
-    folded into the savings shown to the user."""
+    folded into the savings shown to the user.
+
+    `previous` is the transaction as it stands before the edit. When given, the
+    part of its amount the line items never explained — a bag fee, a deposit,
+    a rounding adjustment, anything printed on the receipt but not itemised —
+    is carried across.
+
+    Verification deliberately trusts the receipt's own printed total over the
+    computed one, so that gap is normal and meaningful. This function did not
+    know about it, and re-derived the amount from scratch: editing one item's
+    spelling silently moved a verified transaction off the figure the receipt
+    actually shows. The edit's own effect still applies in full; only the
+    unexplained remainder survives it.
+    """
     def _f(v):
         try:
             return float(v)
@@ -848,6 +970,24 @@ def _header_totals_from_details(
     subtotal = round(sum(_f(d.get("item_subtotal_price")) for d in details), 2)
     tax_total = round(sum(_f(d.get("tax_amount")) for d in details), 2)
     amount = round(subtotal + tax_total - discount_total, 2)
+
+    if previous:
+        # What the old items added up to, versus what the transaction actually
+        # said. Zero for a transaction whose items already explained it, which
+        # is the common case and leaves the behaviour exactly as it was.
+        previously_computed = round(
+            _f(previous.get("subtotal"))
+            + _f(previous.get("tax_total"))
+            - _f(previous.get("discount_total")),
+            2,
+        )
+        remainder = round(_f(previous.get("amount")) - previously_computed, 2)
+        if remainder:
+            logger.info(
+                "Carrying %.2f of unitemised total across a line-item edit", remainder
+            )
+            amount = round(amount + remainder, 2)
+
     savings_total = round(
         sum(_f(d.get("item_savings")) for d in details) + discount_total, 2
     )
@@ -912,7 +1052,12 @@ def _replace_details_rows(
     # amount back past the balance).
     if details:
         subtotal, tax_total, amount, breakdown, savings_total = _header_totals_from_details(
-            details, tx_row.get("tax_breakdown"), tx_row.get("discount_total")
+            details,
+            tx_row.get("tax_breakdown"),
+            tx_row.get("discount_total"),
+            # So a fee or rounding the items never covered is not lost to an
+            # unrelated edit — see the note on _header_totals_from_details.
+            previous=tx_row,
         )
         header_update = {
             "subtotal": subtotal,

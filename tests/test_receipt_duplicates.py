@@ -11,7 +11,38 @@ error, no duplicate data, just a person re-uploading the same receipt forever
 because the app keeps appearing to accept it.
 """
 
-from backend.schemas.transactions import TransactionWithDetails
+import json
+
+from backend.schemas.transactions import ReceiptReviewInput, TransactionWithDetails
+
+
+# --- re-reviewing a receipt that is already a transaction ---------------------
+#
+# Verifying writes the REVIEW back over the OCR draft (_verify_receipt_row
+# updates raw_ocr_string), so opening a verified receipt again reads the app's
+# own previous output rather than the original scan. The two shapes differ, and
+# the difference is silent: raw OCR carries `discounts: [{label, amount}]` while
+# a saved review carries the single `discount_total` below. A reader that knows
+# only the OCR shape sees no coupon, and re-saving drops it from the total.
+
+def test_a_saved_review_stores_the_coupon_as_discount_total():
+    review = ReceiptReviewInput(
+        date="2026-07-29",
+        merchant_name="STOP & SHOP",
+        total_amount=38.12,
+        discount_total=5.00,
+    )
+    stored = json.loads(review.model_dump_json())
+    assert stored["discount_total"] == 5.00
+    # Not the OCR key. Anything restoring this draft has to read discount_total.
+    assert "discounts" not in stored
+
+
+def test_an_absent_coupon_round_trips_as_null_not_a_list():
+    review = ReceiptReviewInput(
+        date="2026-07-29", merchant_name="STOP & SHOP", total_amount=38.12
+    )
+    assert json.loads(review.model_dump_json())["discount_total"] is None
 
 
 def test_verify_result_marks_a_matched_receipt_as_duplicate():
@@ -49,3 +80,111 @@ def test_schema_carries_the_flag_when_set():
         is_duplicate=True,
     )
     assert tx.is_duplicate is True
+
+
+# --- the same receipt, read twice ---------------------------------------------
+#
+# These are the two REAL extractions of one Stop & Shop receipt uploaded twice.
+# Everything printed clearly matched; the abbreviations and the spacing in the
+# merchant name did not, and both fed the hash. The result was a second
+# transaction for a purchase that happened once, inflating the total by $56.83.
+
+from backend.services.transaction_service import merchant_key, receipt_content_hash
+
+FIRST_PASS = dict(date_value="2026-08-06", receipt_time="20:17", total=56.83,
+                  merchant="STOP & SHOP")
+SECOND_PASS = dict(date_value="2026-08-06", receipt_time="20:17", total=56.83,
+                   merchant="STOP&SHOP")
+
+
+def test_the_two_real_readings_of_one_receipt_now_match():
+    assert receipt_content_hash(**FIRST_PASS) == receipt_content_hash(**SECOND_PASS)
+
+
+def test_merchant_spacing_is_not_load_bearing():
+    """`split()[0]` gave 'stop' and 'stopshop' — the original bug."""
+    assert merchant_key("STOP & SHOP") == merchant_key("STOP&SHOP") == "stopshop"
+
+
+def test_merchant_punctuation_and_case_are_ignored():
+    assert merchant_key("Stew Leonard's") == merchant_key("STEW LEONARDS") == "stewleonards"
+
+
+def test_a_missing_merchant_does_not_explode():
+    """`split()[0]` raised IndexError on a whitespace-only name."""
+    assert merchant_key("") == ""
+    assert merchant_key(None) == ""
+    assert merchant_key("   ") == ""
+
+
+# --- but genuinely different receipts must stay distinct ----------------------
+
+def test_a_different_total_is_a_different_receipt():
+    other = {**FIRST_PASS, "total": 56.84}
+    assert receipt_content_hash(**FIRST_PASS) != receipt_content_hash(**other)
+
+
+def test_a_different_time_is_a_different_receipt():
+    """Two trips to the same shop on one day is ordinary; this is what keeps
+    them apart now that the line items are gone from the hash."""
+    other = {**FIRST_PASS, "receipt_time": "09:04"}
+    assert receipt_content_hash(**FIRST_PASS) != receipt_content_hash(**other)
+
+
+def test_a_different_date_is_a_different_receipt():
+    other = {**FIRST_PASS, "date_value": "2026-08-07"}
+    assert receipt_content_hash(**FIRST_PASS) != receipt_content_hash(**other)
+
+
+def test_a_different_shop_is_a_different_receipt():
+    other = {**FIRST_PASS, "merchant": "Stew Leonard's"}
+    assert receipt_content_hash(**FIRST_PASS) != receipt_content_hash(**other)
+
+
+def test_two_shops_are_not_merged_by_normalisation():
+    """Stripping punctuation must not collapse distinct names into one."""
+    assert merchant_key("Stop & Shop") != merchant_key("Stop N Save")
+
+
+# --- telling the user a purchase is recorded twice -----------------------------
+#
+# A statement line and its photographed receipt are LINKED, never merged: the
+# statement is what the bank says, the receipt is what was actually bought. The
+# list then collapses the pair to one row. Silently, until now — a user who
+# imported a statement and later photographed the receipt saw one entry where
+# they knew there were two, with no way to tell which had survived.
+
+from backend.schemas.transactions import LinkedTransaction
+
+
+def test_a_linked_record_carries_enough_to_recognise_it():
+    other = LinkedTransaction(
+        id="tx-csv",
+        trans_date="2026-07-29",
+        amount=38.12,
+        merchant_name="STOP & SHOP",
+        source="csv",
+        match_type="csv_receipt",
+        detail_count=0,
+    )
+    # Everything the card needs to describe the other side without a second fetch.
+    assert other.source == "csv"
+    assert other.detail_count == 0
+    assert other.match_type == "csv_receipt"
+
+
+def test_detail_count_is_what_distinguishes_the_two_records():
+    """The useful difference is that one itemises the shopping and one does not;
+    it is why the list prefers the receipt."""
+    statement = LinkedTransaction(id="a", source="csv", detail_count=0)
+    receipt = LinkedTransaction(id="b", source="bill", detail_count=17)
+    assert statement.detail_count == 0
+    assert receipt.detail_count > statement.detail_count
+
+
+def test_an_unlinked_transaction_reports_no_others():
+    """The overwhelming majority. The card must not render for these."""
+    tx = TransactionWithDetails(
+        id="tx-1", trans_date="2026-07-29", amount=38.12, description="STOP & SHOP"
+    )
+    assert tx.linked_transactions == []

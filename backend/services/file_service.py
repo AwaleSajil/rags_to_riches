@@ -5,9 +5,10 @@ import os
 import sys
 import time
 from typing import List
-from backend.dependencies import get_supabase
+from backend.dependencies import client_for, get_supabase
 from backend.db_client import get_db_client
 from backend.services.rag_manager import rag_manager
+from backend.services.upload_utils import file_sha256
 from backend.services import background, config_service
 
 logger = logging.getLogger("moneyrag.services.file_service")
@@ -24,6 +25,17 @@ def _list_files_sync(access_token: str, user_id: str) -> List[dict]:
     logger.debug("Querying CSVFile and BillFile tables for user_id=%s", user_id)
     with get_db_client(access_token) as db:
         res_csv, res_bill = db.list_files(user_id)
+        verified = db.verified_bill_file_ids(user_id)
+        # Receipts whose purchase the bank statement also records. Without this
+        # the Files tab shows no sign of it, and a receipt sitting beside a
+        # statement covering the same shop looks like a duplicate to delete.
+        try:
+            linked = db.linked_bill_file_ids(user_id)
+        except Exception as e:  # noqa: BLE001
+            # Supplementary. A missing TransactionLink table must not take the
+            # whole file list down with it.
+            logger.warning("Could not load transaction links for the file list: %s", e)
+            linked = set()
 
     csv_count = len(res_csv)
     bill_count = len(res_bill)
@@ -39,6 +51,12 @@ def _list_files_sync(access_token: str, user_id: str) -> List[dict]:
         d["type"] = "bill"
         if d.get("id") is not None:
             d["id"] = str(d["id"])
+        # Receipts only. A price tag is never meant to become a transaction, so
+        # calling one "not verified" would invite the user to fix something that
+        # is not broken.
+        if (d.get("kind") or "receipt") == "receipt":
+            d["is_verified"] = d.get("id") in verified
+            d["is_linked"] = d.get("id") in linked
         files.append(d)
     return files
 
@@ -50,14 +68,32 @@ async def list_files(user: dict) -> List[dict]:
     return result
 
 
+async def get_file(user: dict, file_id: str) -> dict | None:
+    """One file, in the same shape as the list.
+
+    A transaction knows only its `source_bill_file_id`, and showing the receipt
+    photo needs the `s3_key` to sign a URL with. Built on the same query as the
+    list rather than a new one so `kind`, `is_verified` and the id-stringifying
+    cannot drift between the two.
+    """
+    files = await list_files(user)
+    return next((f for f in files if str(f.get("id")) == str(file_id)), None)
+
+
 # ── Upload + ingest ─────────────────────────────────────────────────────────
 
-def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, list]:
-    """Uploads files to Supabase storage + creates DB records."""
+def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, list, list]:
+    """Uploads files to Supabase storage + creates DB records.
+
+    Returns (uploaded_files_info, file_ids, already_imported). The third is CSVs
+    skipped because this user has imported those exact bytes before — see
+    `csv_file_by_content_hash`.
+    """
     logger.debug("_upload_to_storage_sync — %d files for user_id=%s", len(saved_files), user["id"])
-    client = get_supabase(user["access_token"])
+    client = client_for(user)
     uploaded_files_info = []
     file_ids = []
+    already_imported: List[dict] = []
 
     with get_db_client(user["access_token"]) as db:
         for file_info in saved_files:
@@ -66,6 +102,27 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
             is_image = filename.lower().endswith((".png", ".jpg", ".jpeg"))
             folder = "bills" if is_image else "csvs"
             s3_key = f"{user['id']}/{folder}/{filename}"
+
+            # CSVs only. Two photos of one receipt are different bytes, and that
+            # duplicate is caught later by receipt_content_hash instead.
+            content_hash = None
+            if not is_image:
+                content_hash = file_sha256(local_path)
+                seen = db.csv_file_by_content_hash(user["id"], content_hash)
+                if seen:
+                    # Nothing is uploaded, no row is written, and ingestion never
+                    # runs — so no duplicate transactions, no second pass of LLM
+                    # enrichment, and no second set of embeddings.
+                    logger.info(
+                        "Skipping '%s' for user_id=%s — identical to %s uploaded %s",
+                        filename, user["id"], seen.get("filename"), seen.get("upload_date"),
+                    )
+                    already_imported.append({
+                        "filename": filename,
+                        "existing_filename": seen.get("filename"),
+                        "uploaded_at": str(seen.get("upload_date") or "")[:10],
+                    })
+                    continue
 
             content_type = "text/csv"
             if filename.lower().endswith(".png"):
@@ -96,7 +153,7 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
                         )
                         time.sleep(wait)
                         # Re-create client to get a fresh connection
-                        client = get_supabase(user["access_token"])
+                        client = client_for(user)
                     else:
                         raise RuntimeError(f"Storage upload failed for '{filename}' after 3 attempts: {upload_err}") from upload_err
             upload_ms = (time.perf_counter() - start) * 1000
@@ -105,7 +162,9 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
             table = "BillFile" if is_image else "CSVFile"
             logger.debug("Inserting DB record into %s for '%s'", table, filename)
             
-            file_id = db.insert_file_record(table, user["id"], filename, s3_key)
+            file_id = db.insert_file_record(
+                table, user["id"], filename, s3_key, content_hash=content_hash
+            )
 
             file_ids.append(file_id)
             uploaded_files_info.append({"path": local_path, "file_id": file_id})
@@ -115,13 +174,18 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
         "All %d files uploaded — file_ids=%s",
         len(file_ids), file_ids,
     )
-    return uploaded_files_info, file_ids
+    return uploaded_files_info, file_ids, already_imported
 
 
-async def upload_and_ingest(user: dict, saved_files: List[dict]) -> List[str]:
+async def upload_and_ingest(user: dict, saved_files: List[dict]) -> tuple[List[str], List[dict]]:
     """
     Uploads to storage + creates DB records (in thread), then kicks off
-    RAG ingestion in a subprocess. Returns file_ids immediately.
+    RAG ingestion in a subprocess.
+
+    Returns (file_ids, already_imported) immediately. `already_imported` lists
+    CSVs skipped as byte-identical to one this user already has — the caller
+    must say so, because a silent skip is indistinguishable from a silent
+    success and the user would never learn either happened.
     """
     logger.debug("upload_and_ingest called — %d files for user_id=%s", len(saved_files), user["id"])
 
@@ -132,7 +196,7 @@ async def upload_and_ingest(user: dict, saved_files: List[dict]) -> List[str]:
         raise ValueError("Account config required before uploading files")
 
     logger.debug("Starting storage upload in thread for user_id=%s", user["id"])
-    uploaded_files_info, file_ids = await asyncio.to_thread(
+    uploaded_files_info, file_ids, already_imported = await asyncio.to_thread(
         _upload_to_storage_sync, user, saved_files
     )
     logger.debug("Storage upload thread complete — %d files uploaded", len(file_ids))
@@ -151,7 +215,7 @@ async def upload_and_ingest(user: dict, saved_files: List[dict]) -> List[str]:
     else:
         logger.debug("No files to ingest for user_id=%s", user["id"])
 
-    return file_ids
+    return file_ids, already_imported
 
 
 async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_info: List[dict]):
@@ -346,6 +410,29 @@ async def set_file_visibility(user: dict, file_id: str, file_type: str, hidden: 
         raise ValueError("Invalid file type")
     return await asyncio.to_thread(
         _set_file_visibility_sync, user["access_token"], file_id, file_type, hidden
+    )
+
+
+def _set_file_rotation_sync(access_token: str, file_id: str, degrees: int) -> int:
+    client = get_supabase(access_token)
+    result = (
+        client.table("BillFile").update({"rotation": degrees}).eq("id", file_id).execute()
+    )
+    if not result.data:
+        raise ValueError("Photo not found")
+    return int(result.data[0].get("rotation") or 0)
+
+
+async def set_file_rotation(user: dict, file_id: str, degrees: int) -> int:
+    """Remember how far this photo has to be turned to read it.
+
+    Only the four quarter turns are accepted; the column has the same check, so
+    a bad value is rejected here rather than surfacing as a database error.
+    """
+    if degrees not in (0, 90, 180, 270):
+        raise ValueError("Rotation must be 0, 90, 180 or 270 degrees")
+    return await asyncio.to_thread(
+        _set_file_rotation_sync, user["access_token"], file_id, degrees
     )
 
 

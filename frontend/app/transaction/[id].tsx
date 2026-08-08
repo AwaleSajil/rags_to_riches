@@ -5,6 +5,7 @@ import {
   ScrollView,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
 } from "react-native";
 import {
   Text,
@@ -12,45 +13,43 @@ import {
   Divider,
   Button,
   TextInput,
-  IconButton,
   Dialog,
   Portal,
   Snackbar,
+  Checkbox,
 } from "react-native-paper";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useLocalSearchParams, useFocusEffect, useRouter } from "expo-router";
 import { GlassCard } from "../../src/components/GlassCard";
 import { LoadingSpinner } from "../../src/components/LoadingSpinner";
+import { FilePreviewModal } from "../../src/components/FilePreviewModal";
+import { LinkedRecordsCard } from "../../src/components/LinkedRecordsCard";
 import * as transactionService from "../../src/services/transactionService";
+import * as fileService from "../../src/services/fileService";
 import type {
   TransactionUpdatePayload,
   TransactionDetailInput,
 } from "../../src/services/transactionService";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
-import type { TransactionWithDetails, TransactionDetailItem } from "../../src/lib/types";
+import { formatDateLong, money, numberText, parseNumber } from "../../src/lib/format";
+import {
+  amountsOf,
+  emptyLineItem,
+  rollUp,
+  validateLineItems,
+  type LineItemField,
+  type LineItemForm,
+} from "../../src/lib/receiptMath";
+import { LineItemEditor } from "../../src/components/LineItemEditor";
+import { transactionVisual } from "../../src/lib/sourceVisual";
+import type { FileItem, TransactionWithDetails, TransactionDetailItem } from "../../src/lib/types";
 
 const log = createLogger("TransactionDetail");
 
 // Deep enrichment can take up to ~a minute (a sequential web search per line
 // item + an LLM pass), so poll well past that before giving up.
 const MAX_ENRICHMENT_POLLS = 12;
-
-function money(n: number | null | undefined): string {
-  return `$${(n ?? 0).toFixed(2)}`;
-}
-
-function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "—";
-  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? `${dateStr}T00:00:00` : dateStr);
-  if (isNaN(d.getTime())) return dateStr;
-  return d.toLocaleDateString(undefined, {
-    weekday: "short",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-  });
-}
 
 interface FormState {
   merchant_name: string;
@@ -64,66 +63,39 @@ interface FormState {
 }
 
 function toForm(tx: TransactionWithDetails): FormState {
-  const numStr = (n: number | null | undefined) => (n == null ? "" : String(n));
   return {
     merchant_name: tx.merchant_name ?? "",
     description: tx.description ?? "",
     trans_date: tx.trans_date ?? "",
-    amount: numStr(tx.amount),
+    amount: numberText(tx.amount),
     category: tx.category ?? "",
     location: tx.location ?? "",
-    subtotal: numStr(tx.subtotal),
-    tax_total: numStr(tx.tax_total),
+    subtotal: numberText(tx.subtotal),
+    tax_total: numberText(tx.tax_total),
   };
 }
 
-interface DetailFormState {
-  key: string;
-  item_description: string;
-  item_quantity: string;
-  // Not edited here, but held so it survives a save — the server replaces every
-  // line item wholesale, so anything the form drops is deleted from the row.
-  item_quantity_unit: string;
-  unit_quantity_subtotal: string;
-  item_savings: string;
-  tax_rate: string;
-}
-
-const numStr = (n: number | null | undefined) => (n == null ? "" : String(n));
-let detailKeySeq = 0;
-const newDetailKey = () => `new-${Date.now()}-${detailKeySeq++}`;
-
-function toDetailForm(d: TransactionDetailItem): DetailFormState {
+function toDetailForm(d: TransactionDetailItem): LineItemForm {
   return {
     key: d.id,
-    item_description: d.item_description ?? "",
-    item_quantity: numStr(d.item_quantity),
-    item_quantity_unit: d.item_quantity_unit ?? "",
-    unit_quantity_subtotal: numStr(d.unit_quantity_subtotal),
-    item_savings: numStr(d.item_savings),
-    tax_rate: numStr(d.tax_rate),
+    description: d.item_description ?? "",
+    quantity: numberText(d.item_quantity),
+    unitPrice: numberText(d.unit_quantity_subtotal),
+    savings: numberText(d.item_savings),
+    taxRate: numberText(d.tax_rate),
+    // Not shown in the form, carried so a save does not wipe it.
+    quantityUnit: d.item_quantity_unit ?? "",
   };
 }
 
 // Canonical string of the editable detail fields, for change detection.
-function detailSnapshot(rows: DetailFormState[]): string {
+function detailSnapshot(rows: LineItemForm[]): string {
   return rows
     .map(
       (r) =>
-        `${r.item_description.trim()}|${r.item_quantity.trim()}|${r.unit_quantity_subtotal.trim()}|${r.item_savings.trim()}|${r.tax_rate.trim()}`
+        `${r.description.trim()}|${r.quantity.trim()}|${r.unitPrice.trim()}|${r.savings.trim()}|${r.taxRate.trim()}`
     )
     .join("~");
-}
-
-// Live per-row totals so the editor shows what will be saved.
-function computeRowTotals(r: DetailFormState) {
-  const qty = parseFloat(r.item_quantity);
-  const unit = parseFloat(r.unit_quantity_subtotal);
-  const rate = parseFloat(r.tax_rate);
-  const subtotal =
-    (isNaN(qty) ? 1 : qty) * (isNaN(unit) ? 0 : unit);
-  const tax = !isNaN(rate) && rate > 0 ? (subtotal * rate) / 100 : 0;
-  return { subtotal, tax, total: subtotal + tax };
 }
 
 function LineItem({ item }: { item: TransactionDetailItem }) {
@@ -178,16 +150,23 @@ export default function TransactionDetailScreen() {
 
   const [isEditing, setIsEditing] = useState(false);
   const [form, setForm] = useState<FormState | null>(null);
-  const [detailForms, setDetailForms] = useState<DetailFormState[]>([]);
+  const [detailForms, setDetailForms] = useState<LineItemForm[]>([]);
   const [origDetailSnapshot, setOrigDetailSnapshot] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Off by default: keeping the photo is the safer of the two, and the receipt
+  // is often the only remaining copy once the paper is in the bin.
+  const [alsoDeleteReceipt, setAlsoDeleteReceipt] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
   const [enrichmentRefreshes, setEnrichmentRefreshes] = useState(0);
   const [editingNote, setEditingNote] = useState(false);
   const [noteDraft, setNoteDraft] = useState("");
   const [savingNote, setSavingNote] = useState(false);
+  // The BillFile row behind this transaction, fetched on demand. Non-null while
+  // the photo preview is open.
+  const [receiptFile, setReceiptFile] = useState<FileItem | null>(null);
+  const [receiptLoading, setReceiptLoading] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) {
@@ -257,24 +236,12 @@ export default function TransactionDetailScreen() {
   const setField = (key: keyof FormState, value: string) =>
     setForm((prev) => (prev ? { ...prev, [key]: value } : prev));
 
-  const setDetailField = (key: string, field: keyof DetailFormState, value: string) =>
+  const setDetailField = (key: string, field: LineItemField, value: string) =>
     setDetailForms((prev) =>
       prev.map((r) => (r.key === key ? { ...r, [field]: value } : r))
     );
 
-  const addDetailRow = () =>
-    setDetailForms((prev) => [
-      ...prev,
-      {
-        key: newDetailKey(),
-        item_description: "",
-        item_quantity: "1",
-        item_quantity_unit: "",
-        unit_quantity_subtotal: "",
-        item_savings: "",
-        tax_rate: "",
-      },
-    ]);
+  const addDetailRow = () => setDetailForms((prev) => [...prev, emptyLineItem()]);
 
   const removeDetailRow = (key: string) =>
     setDetailForms((prev) => prev.filter((r) => r.key !== key));
@@ -306,8 +273,8 @@ export default function TransactionDetailScreen() {
     if (!hasLineItems) {
       // Amount (required, > 0)
       if (form.amount !== orig.amount) {
-        const n = parseFloat(form.amount);
-        if (isNaN(n) || n <= 0) {
+        const n = parseNumber(form.amount);
+        if (!Number.isFinite(n) || n <= 0) {
           setSnackbar({ visible: true, message: "Amount must be a positive number", error: true });
           return;
         }
@@ -317,8 +284,8 @@ export default function TransactionDetailScreen() {
       // Optional numerics — only send when non-empty
       for (const key of ["subtotal", "tax_total"] as const) {
         if (form[key] !== orig[key] && form[key].trim() !== "") {
-          const n = parseFloat(form[key]);
-          if (isNaN(n) || n < 0) {
+          const n = parseNumber(form[key]);
+          if (!Number.isFinite(n) || n < 0) {
             setSnackbar({ visible: true, message: `${key} must be a number`, error: true });
             return;
           }
@@ -331,39 +298,21 @@ export default function TransactionDetailScreen() {
     const detailsChanged = detailSnapshot(detailForms) !== origDetailSnapshot;
     let detailsPayload: TransactionDetailInput[] = [];
     if (detailsChanged) {
-      // Drop fully-empty rows; validate the rest.
-      const rows = detailForms.filter(
-        (r) =>
-          r.item_description.trim() !== "" ||
-          r.item_quantity.trim() !== "" ||
-          r.unit_quantity_subtotal.trim() !== ""
-      );
-      for (const r of rows) {
-        for (const [field, label] of [
-          ["item_quantity", "Quantity"],
-          ["unit_quantity_subtotal", "Unit price"],
-          ["item_savings", "Savings"],
-          ["tax_rate", "Tax rate"],
-        ] as const) {
-          const raw = r[field].trim();
-          if (raw !== "" && isNaN(parseFloat(raw))) {
-            setSnackbar({
-              visible: true,
-              message: `${label} must be a number (line "${r.item_description || "?"}")`,
-              error: true,
-            });
-            return;
-          }
-        }
+      // Same rules as the receipt review screen — see validateLineItems. This
+      // screen used to accept a negative quantity and a blank description that
+      // the other one rejected, for the same row in the same table.
+      const validated = validateLineItems(detailForms);
+      if (!validated.ok) {
+        setSnackbar({ visible: true, message: validated.message, error: true });
+        return;
       }
-      const numOrNull = (s: string) => (s.trim() === "" ? null : parseFloat(s));
-      detailsPayload = rows.map((r) => ({
-        item_description: r.item_description.trim(),
-        item_quantity: numOrNull(r.item_quantity),
-        item_quantity_unit: r.item_quantity_unit.trim() || null,
-        unit_quantity_subtotal: numOrNull(r.unit_quantity_subtotal),
-        item_savings: numOrNull(r.item_savings),
-        tax_rate: numOrNull(r.tax_rate) ?? 0,
+      detailsPayload = validated.rows.map((r) => ({
+        item_description: r.description,
+        item_quantity: r.quantity,
+        item_quantity_unit: r.quantityUnit,
+        unit_quantity_subtotal: r.unitPrice,
+        item_savings: r.savings,
+        tax_rate: r.taxRate,
       }));
     }
 
@@ -391,6 +340,25 @@ export default function TransactionDetailScreen() {
       setSnackbar({ visible: true, message: e.message || "Update failed", error: true });
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  /** Fetch the BillFile row so the preview can sign a URL for its s3_key. */
+  const openReceipt = async () => {
+    const fileId = transaction?.source_bill_file_id;
+    if (!fileId || receiptLoading) return;
+    setReceiptLoading(true);
+    try {
+      setReceiptFile(await fileService.getFile(fileId));
+    } catch (e: any) {
+      log.error("Failed to load the receipt photo", e);
+      setSnackbar({
+        visible: true,
+        message: e.message || "Could not open the receipt photo",
+        error: true,
+      });
+    } finally {
+      setReceiptLoading(false);
     }
   };
 
@@ -427,7 +395,16 @@ export default function TransactionDetailScreen() {
     setConfirmDelete(false);
     setIsDeleting(true);
     try {
-      await transactionService.deleteTransaction(id);
+      const billFileId = alsoDeleteReceipt ? transaction?.source_bill_file_id : null;
+      if (billFileId) {
+        // Deleting the RECEIPT, not the transaction: the cascade runs from
+        // BillFile down, so this takes the transaction and its line items with
+        // it, and removes the stored photo too. Deleting the transaction first
+        // would leave nothing for this call to find.
+        await fileService.deleteFile(billFileId, "bill");
+      } else {
+        await transactionService.deleteTransaction(id);
+      }
       // Pop back to the list, which refreshes on focus.
       router.back();
     } catch (e: any) {
@@ -454,6 +431,7 @@ export default function TransactionDetailScreen() {
   }
 
   const tx = transaction;
+  const sourceLook = transactionVisual(tx.source);
   const hasTax =
     tx.subtotal != null ||
     tx.tax_total != null ||
@@ -469,16 +447,7 @@ export default function TransactionDetailScreen() {
     // server will store (subtotal + tax - discount).
     const orderDiscount = tx.discount_total ?? 0;
     // Header totals are derived from the line items when they exist.
-    const liveTotals = detailForms.reduce(
-      (acc, r) => {
-        const t = computeRowTotals(r);
-        acc.subtotal += t.subtotal;
-        acc.tax += t.tax;
-        return acc;
-      },
-      { subtotal: 0, tax: 0 }
-    );
-    const liveTotal = liveTotals.subtotal + liveTotals.tax - orderDiscount;
+    const liveTotals = rollUp(detailForms.map(amountsOf), orderDiscount);
     return (
       <KeyboardAvoidingView
         style={styles.container}
@@ -558,96 +527,13 @@ export default function TransactionDetailScreen() {
 
           {/* Line-item editor */}
           <GlassCard style={styles.card}>
-            <View style={styles.lineItemsHeader}>
-              <Text style={styles.sectionTitle}>Line items</Text>
-              <Button
-                mode="text"
-                icon="plus"
-                compact
-                onPress={addDetailRow}
-                disabled={isSaving}
-              >
-                Add
-              </Button>
-            </View>
-
-            {detailForms.length === 0 ? (
-              <Text style={styles.emptyDetailText}>
-                No line items. Tap “Add” to create one.
-              </Text>
-            ) : (
-              detailForms.map((row, i) => {
-                const totals = computeRowTotals(row);
-                return (
-                  <View key={row.key} style={styles.detailEditRow}>
-                    {i > 0 && <Divider style={styles.itemDivider} />}
-                    <View style={styles.detailEditTop}>
-                      <TextInput
-                        mode="outlined"
-                        label="Description"
-                        value={row.item_description}
-                        onChangeText={(v) => setDetailField(row.key, "item_description", v)}
-                        style={styles.detailDescInput}
-                        dense
-                      />
-                      <IconButton
-                        icon="trash-can-outline"
-                        iconColor={colors.error}
-                        size={20}
-                        onPress={() => removeDetailRow(row.key)}
-                        disabled={isSaving}
-                        style={styles.detailDeleteBtn}
-                      />
-                    </View>
-                    <View style={styles.detailEditNums}>
-                      <TextInput
-                        mode="outlined"
-                        label="Qty"
-                        value={row.item_quantity}
-                        onChangeText={(v) => setDetailField(row.key, "item_quantity", v)}
-                        keyboardType="decimal-pad"
-                        style={styles.detailNumInput}
-                        dense
-                      />
-                      <TextInput
-                        mode="outlined"
-                        label="Unit $"
-                        value={row.unit_quantity_subtotal}
-                        onChangeText={(v) =>
-                          setDetailField(row.key, "unit_quantity_subtotal", v)
-                        }
-                        keyboardType="decimal-pad"
-                        style={styles.detailNumInput}
-                        dense
-                      />
-                      <TextInput
-                        mode="outlined"
-                        label="Tax %"
-                        value={row.tax_rate}
-                        onChangeText={(v) => setDetailField(row.key, "tax_rate", v)}
-                        keyboardType="decimal-pad"
-                        style={styles.detailNumInput}
-                        dense
-                      />
-                      <TextInput
-                        mode="outlined"
-                        label="Saved $"
-                        value={row.item_savings}
-                        onChangeText={(v) => setDetailField(row.key, "item_savings", v)}
-                        keyboardType="decimal-pad"
-                        style={styles.detailNumInput}
-                        dense
-                      />
-                    </View>
-                    <Text style={styles.detailComputed}>
-                      {money(totals.subtotal)}
-                      {totals.tax > 0 ? ` + ${money(totals.tax)} tax` : ""} ={" "}
-                      {money(totals.total)}
-                    </Text>
-                  </View>
-                );
-              })
-            )}
+            <LineItemEditor
+              rows={detailForms}
+              onChange={setDetailField}
+              onAdd={addDetailRow}
+              onRemove={removeDetailRow}
+              disabled={isSaving}
+            />
 
             {hasLineItems && (
               <>
@@ -668,7 +554,7 @@ export default function TransactionDetailScreen() {
                 )}
                 <View style={styles.totalsRow}>
                   <Text style={styles.totalsLabelBold}>Total</Text>
-                  <Text style={styles.totalsValueBold}>{money(liveTotal)}</Text>
+                  <Text style={styles.totalsValueBold}>{money(liveTotals.total)}</Text>
                 </View>
                 <Text style={styles.derivedNote}>
                   {orderDiscount > 0
@@ -722,7 +608,7 @@ export default function TransactionDetailScreen() {
           <Text style={styles.merchant}>
             {tx.merchant_name || tx.description || "Unknown"}
           </Text>
-          <Text style={styles.date}>{formatDate(tx.trans_date)}</Text>
+          <Text style={styles.date}>{formatDateLong(tx.trans_date)}</Text>
           <Text style={styles.amount}>{money(tx.amount)}</Text>
           <View style={styles.headerMetaRow}>
             {tx.category && (
@@ -740,9 +626,9 @@ export default function TransactionDetailScreen() {
                 compact
                 style={styles.sourceChip}
                 textStyle={styles.sourceChipText}
-                icon={tx.source === "bill" ? "receipt-text-outline" : "bank-outline"}
+                icon={sourceLook.icon}
               >
-                {tx.source === "bill" ? "Receipt" : "CSV"}
+                {sourceLook.label}
               </Chip>
             )}
           </View>
@@ -783,6 +669,58 @@ export default function TransactionDetailScreen() {
             Delete
           </Button>
         </View>
+
+        {/* Both records of one purchase, when a statement line and a receipt
+            were matched to each other. The list collapses them into a single
+            row, so this is the only place that says the other one exists. */}
+        {tx.linked_transactions && tx.linked_transactions.length > 0 ? (
+          <GlassCard style={styles.card}>
+            <LinkedRecordsCard
+              viewingSource={tx.source}
+              viewingDetailCount={tx.details.length}
+              linked={tx.linked_transactions}
+              // replace, not push: paging back and forth between two records of
+              // the same purchase should not build a stack you have to unwind.
+              onOpen={(id) => router.replace(`/transaction/${id}`)}
+            />
+          </GlassCard>
+        ) : null}
+
+        {/* Source receipt. Tapping shows the PHOTO — that is what someone
+            coming back to a transaction wants to see, and what the label
+            promises. Correcting the scan is a deliberate second step from
+            inside the preview, because it rewrites the transaction's line
+            items rather than just looking at it. */}
+        {tx.source_bill_file_id ? (
+          <Pressable
+            onPress={openReceipt}
+            disabled={receiptLoading}
+            style={({ pressed }) => pressed && styles.receiptCardPressed}
+          >
+            <GlassCard style={styles.card}>
+              <View style={styles.receiptRow}>
+                <View style={[styles.receiptIcon, { backgroundColor: sourceLook.background }]}>
+                  <MaterialCommunityIcons
+                    name={sourceLook.icon}
+                    size={22}
+                    color={sourceLook.color}
+                  />
+                </View>
+                <View style={styles.receiptText}>
+                  <Text style={styles.receiptTitle}>Receipt photo</Text>
+                  <Text style={styles.receiptSubtitle}>
+                    {receiptLoading ? "Opening…" : "Tap to view the original"}
+                  </Text>
+                </View>
+                <MaterialCommunityIcons
+                  name="chevron-right"
+                  size={22}
+                  color={colors.textTertiary}
+                />
+              </View>
+            </GlassCard>
+          </Pressable>
+        ) : null}
 
         {/* Notes card — add/edit while viewing; the note is also indexed for search */}
         <GlassCard style={styles.card}>
@@ -899,6 +837,21 @@ export default function TransactionDetailScreen() {
         )}
       </ScrollView>
 
+      {/* The photo itself, zoomable. Its "Review receipt" action is the way to
+          the correction form — a deliberate second tap, since saving there
+          rewrites this transaction's line items. */}
+      <FilePreviewModal
+        file={receiptFile}
+        onClose={() => setReceiptFile(null)}
+        onReviewReceipt={(file) => {
+          setReceiptFile(null);
+          router.push({
+            pathname: "/receipt-review/[fileId]",
+            params: { fileId: file.id, fromTransaction: "1" },
+          });
+        }}
+      />
+
       {/* Delete confirmation */}
       <Portal>
         <Dialog
@@ -915,6 +868,26 @@ export default function TransactionDetailScreen() {
               </Text>
               ? This removes it and its line items from the database and the search index.
             </Text>
+            {/* Deleting a transaction leaves the receipt it came from behind —
+                the cascade runs the other way. Said out loud, because the photo
+                then sits in Files counting towards nothing, which is a confusing
+                state to arrive at silently. */}
+            {!!tx.source_bill_file_id && (
+              <>
+                <Text style={styles.deleteHint}>
+                  The receipt photo is kept in Files so you can review it again.
+                  It won't count towards your spending until you do.
+                </Text>
+                <Checkbox.Item
+                  label="Also delete the receipt photo"
+                  position="leading"
+                  status={alsoDeleteReceipt ? "checked" : "unchecked"}
+                  onPress={() => setAlsoDeleteReceipt((v) => !v)}
+                  labelStyle={styles.deleteCheckboxLabel}
+                  style={styles.deleteCheckbox}
+                />
+              </>
+            )}
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={() => setConfirmDelete(false)} textColor={colors.textSecondary}>
@@ -1036,6 +1009,34 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
+  receiptCardPressed: {
+    opacity: 0.7,
+  },
+  receiptRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+  receiptIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  receiptText: {
+    flex: 1,
+  },
+  receiptTitle: {
+    ...typography.body1,
+    color: colors.text,
+    fontWeight: "600",
+  },
+  receiptSubtitle: {
+    ...typography.caption,
+    color: colors.textSecondary,
+    marginTop: 2,
+  },
   noteText: {
     ...typography.body2,
     color: colors.text,
@@ -1057,6 +1058,22 @@ const styles = StyleSheet.create({
   actionButton: {
     flex: 1,
     borderRadius: 10,
+  },
+  deleteHint: {
+    ...typography.body2,
+    color: colors.textSecondary,
+    marginTop: spacing.md,
+    lineHeight: 20,
+  },
+  deleteCheckbox: {
+    paddingHorizontal: 0,
+    marginTop: spacing.xs,
+    marginLeft: -spacing.sm,
+  },
+  deleteCheckboxLabel: {
+    ...typography.body2,
+    color: colors.text,
+    textAlign: "left",
   },
   deleteButton: {
     borderColor: colors.error,
@@ -1182,47 +1199,6 @@ const styles = StyleSheet.create({
   editActionsCard: {
     marginBottom: spacing.lg,
     paddingVertical: spacing.md,
-  },
-  lineItemsHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: spacing.sm,
-  },
-  emptyDetailText: {
-    ...typography.body2,
-    color: colors.textSecondary,
-    paddingVertical: spacing.sm,
-  },
-  detailEditRow: {
-    paddingTop: spacing.sm,
-  },
-  detailEditTop: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.xs,
-  },
-  detailDescInput: {
-    flex: 1,
-    backgroundColor: colors.surface,
-  },
-  detailDeleteBtn: {
-    margin: 0,
-  },
-  detailEditNums: {
-    flexDirection: "row",
-    gap: spacing.sm,
-    marginTop: spacing.xs,
-  },
-  detailNumInput: {
-    flex: 1,
-    backgroundColor: colors.surface,
-  },
-  detailComputed: {
-    ...typography.caption,
-    color: colors.textSecondary,
-    marginTop: spacing.xs,
-    textAlign: "right",
   },
   derivedNote: {
     ...typography.caption,

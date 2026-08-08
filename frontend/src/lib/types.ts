@@ -34,6 +34,23 @@ export interface FileItem {
    * migration 014.
    */
   kind?: CaptureKind;
+  /**
+   * Receipts only (absent on CSVs and price tags): whether this photo has been
+   * reviewed into a transaction. Until it has, none of its spending is in any
+   * total — a distinction the file list otherwise cannot show.
+   */
+  is_verified?: boolean;
+  /**
+   * Quarter turns clockwise needed to view this photo upright, remembered
+   * across sessions. The stored image is untouched — see migration 038.
+   */
+  rotation?: number;
+  /**
+   * Receipts only: the same purchase is also on a bank statement you imported.
+   * Said here because the transactions list collapses the pair into one row,
+   * so from Files a linked receipt otherwise looks like a duplicate.
+   */
+  is_linked?: boolean;
 }
 
 export interface PendingTransaction {
@@ -136,12 +153,31 @@ export interface TransactionDetailItem {
   enriched_info: string | null;
 }
 
+/** Another record of the same real-world purchase — see LinkedTransaction. */
+export interface LinkedTransaction {
+  id: string;
+  trans_date: string | null;
+  amount: number | null;
+  merchant_name: string | null;
+  source: string | null;
+  /** csv_receipt — a statement line and its receipt. csv_csv — two statements. */
+  match_type: string | null;
+  /** How many line items the other record has; 0 for a bank statement line. */
+  detail_count: number;
+}
+
 export interface TransactionWithDetails extends TransactionListItem {
   enriched_info: string | null;
   content_hash?: string | null;
   source_csv_id?: string | null;
   source_bill_file_id?: string | null;
   details: TransactionDetailItem[];
+  /**
+   * Other records of the same purchase. The transactions list collapses a
+   * linked pair to one row, so without this the user sees one entry where they
+   * know there were two and cannot tell whether the other was absorbed or lost.
+   */
+  linked_transactions?: LinkedTransaction[];
   /**
    * Set when verifying a receipt matched a transaction that already existed.
    * The returned record is that earlier one — this upload wrote nothing.
@@ -172,7 +208,15 @@ export interface ReceiptReviewDraft {
     category?: string;
     location?: string | null;
     total_amount?: number | string | null;
-    discounts?: ReceiptDiscount[]; // order-level coupons subtracted from the basket
+    discounts?: ReceiptDiscount[]; // order-level coupons, as raw OCR returns them
+    /**
+     * The single coupon figure this form submits. Present instead of
+     * `discounts` when the receipt has already been verified once — verifying
+     * writes the review back over the OCR draft, so a re-review reads its own
+     * previous output rather than the original scan.
+     */
+    discount_total?: number | string | null;
+    note?: string | null;
     line_items?: ReceiptReviewLineItem[];
   };
 }

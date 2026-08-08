@@ -160,6 +160,25 @@ class ReceiptReviewInput(BaseModel):
         return normalized
 
 
+class LinkedTransaction(BaseModel):
+    """Another record of the same real-world purchase.
+
+    Two sources can describe one purchase — a bank statement line and a
+    photographed receipt — and both are kept: the statement is what the bank
+    says, the receipt is what was actually bought. `detail_count` is how the UI
+    knows which of the two is worth reading.
+    """
+
+    id: str
+    trans_date: Optional[str] = None
+    amount: Optional[float] = None
+    merchant_name: Optional[str] = None
+    source: Optional[str] = None
+    # csv_receipt | csv_csv
+    match_type: Optional[str] = None
+    detail_count: int = 0
+
+
 class TransactionWithDetails(TransactionListItem):
     """Full transaction for the detail screen: header fields + ordered line items."""
 
@@ -168,6 +187,8 @@ class TransactionWithDetails(TransactionListItem):
     source_csv_id: Optional[str] = None
     source_bill_file_id: Optional[str] = None
     details: List[TransactionDetailItem] = Field(default_factory=list)
+    # Other records of this same purchase. Empty for the overwhelming majority.
+    linked_transactions: List[LinkedTransaction] = Field(default_factory=list)
     # True when verifying a receipt matched a transaction that already existed,
     # so this is the earlier record rather than one just created. Defaults false
     # on every other route that returns this shape.

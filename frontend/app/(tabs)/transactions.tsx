@@ -8,6 +8,7 @@ import { LoadingSpinner } from "../../src/components/LoadingSpinner";
 import { useTransactions } from "../../src/hooks/useTransactions";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import type { TransactionListItem } from "../../src/lib/types";
+import { money } from "../../src/lib/format";
 
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
@@ -34,7 +35,7 @@ function monthLabel(dateStr: string | null): string {
 }
 
 export default function TransactionsScreen() {
-  const { transactions, isLoading, refresh } = useTransactions();
+  const { transactions, isLoading, hasLoaded, refresh } = useTransactions();
   const router = useRouter();
 
   const [search, setSearch] = useState("");
@@ -169,7 +170,7 @@ export default function TransactionsScreen() {
           color={colors.textSecondary}
         />
         <Text style={styles.monthTitle}>{section.title}</Text>
-        <Text style={styles.monthTotal}>${section.total.toFixed(2)}</Text>
+        <Text style={styles.monthTotal}>{money(section.total)}</Text>
         <Badge style={styles.monthBadge}>{section.count}</Badge>
       </Pressable>
     ),
@@ -197,11 +198,13 @@ export default function TransactionsScreen() {
         </View>
       </View>
 
-      {transactions.length === 0 ? (
+      {/* Only once a load has finished — before that the list is empty because
+          nothing has come back yet, not because there is nothing. */}
+      {hasLoaded && transactions.length === 0 ? (
         <Text style={styles.emptyText}>
           No transactions yet. Upload a CSV or receipt in the Files tab to get started.
         </Text>
-      ) : (
+      ) : transactions.length === 0 ? null : (
         <>
           <Searchbar
             placeholder="Search merchant or description"

@@ -72,7 +72,88 @@ class DatabaseClient:
         res_bill = self.supabase.table("BillFile").select("*").eq("user_id", user_id).execute()
         return res_csv.data or [], res_bill.data or []
 
-    def insert_file_record(self, table: str, user_id: str, filename: str, s3_key: str) -> str:
+    def verified_bill_file_ids(self, user_id: str) -> set:
+        """Bill files that have become a transaction.
+
+        A receipt is stored the moment it is read but only counts towards
+        spending once it has been reviewed and verified, and the two states look
+        identical in the file list. One query for the whole list rather than one
+        per row.
+        """
+        res = (
+            self.supabase.table("Transaction")
+            .select("source_bill_file_id")
+            .eq("user_id", user_id)
+            .not_.is_("source_bill_file_id", "null")
+            .execute()
+        )
+        return {str(r["source_bill_file_id"]) for r in (res.data or []) if r.get("source_bill_file_id")}
+
+    def linked_bill_file_ids(self, user_id: str) -> set:
+        """Bill files whose transaction is also recorded from another source.
+
+        A photographed receipt and a bank statement line describing the same
+        purchase get linked rather than merged. The transactions list collapses
+        the pair to one row, so from the Files tab a receipt can look like the
+        only record of a purchase the bank also knows about — or, worse, like a
+        duplicate someone is about to delete.
+
+        Two queries for the whole list rather than one per row, matching how
+        verified_bill_file_ids works.
+        """
+        links = (
+            self.supabase.table("TransactionLink")
+            .select("transaction_id,linked_transaction_id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        linked_transaction_ids = set()
+        for row in (links.data or []):
+            linked_transaction_ids.add(str(row["transaction_id"]))
+            linked_transaction_ids.add(str(row["linked_transaction_id"]))
+        if not linked_transaction_ids:
+            return set()
+
+        res = (
+            self.supabase.table("Transaction")
+            .select("id,source_bill_file_id")
+            .eq("user_id", user_id)
+            .not_.is_("source_bill_file_id", "null")
+            .execute()
+        )
+        return {
+            str(r["source_bill_file_id"])
+            for r in (res.data or [])
+            if r.get("source_bill_file_id") and str(r["id"]) in linked_transaction_ids
+        }
+
+    def csv_file_by_content_hash(self, user_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
+        """A CSV this user has already imported, byte for byte.
+
+        Cheap and exact, unlike the row-level matching — two identical files
+        need no fuzzy comparison. Returns None for anything not seen before,
+        and for rows uploaded before the column existed (their hash is NULL).
+        """
+        if not content_hash:
+            return None
+        res = (
+            self.supabase.table("CSVFile")
+            .select("id,filename,upload_date")
+            .eq("user_id", user_id)
+            .eq("content_hash", content_hash)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+
+    def insert_file_record(
+        self,
+        table: str,
+        user_id: str,
+        filename: str,
+        s3_key: str,
+        content_hash: Optional[str] = None,
+    ) -> str:
         """Inserts a file record and returns its ID."""
         logger.debug("DatabaseClient.insert_file_record in %s for '%s'", table, filename)
         record = {
@@ -80,6 +161,8 @@ class DatabaseClient:
             "filename": filename,
             "s3_key": s3_key,
         }
+        if table == "CSVFile" and content_hash:
+            record["content_hash"] = content_hash
         if table == "BillFile":
             # Explicitly unexamined until the vision pass says otherwise. The
             # column defaults to 'receipt' to backfill rows that predate it, but

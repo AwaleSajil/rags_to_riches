@@ -30,7 +30,7 @@ import time
 import uuid
 from typing import Optional
 
-from backend.dependencies import get_supabase
+from backend.dependencies import client_for, get_supabase
 from backend.services import background, config_service
 
 logger = logging.getLogger("moneyrag.services.capture")
@@ -52,8 +52,13 @@ _pending: dict[str, dict] = {}
 PENDING_TTL_SECONDS = 6 * 60 * 60
 
 
-def _sweep_pending(now: Optional[float] = None) -> int:
-    """Drop captures nobody came back for, and their temp files."""
+def sweep_pending(now: Optional[float] = None) -> int:
+    """Drop captures nobody came back for, and their temp files.
+
+    Called both when a new capture arrives and on the janitor's timer (see
+    rag_manager.run_janitor) — sweeping only on upload meant an idle server kept
+    every abandoned photo's bytes until someone happened to take another one.
+    """
     now = now if now is not None else time.time()
     stale = [
         key for key, entry in _pending.items()
@@ -131,7 +136,7 @@ def _billfile_exists_sync(user: dict, file_id: str) -> bool:
     """Is this a photo that was already stored, rather than a stale capture id?"""
     try:
         rows = (
-            get_supabase(user["access_token"]).table("BillFile").select("id")
+            client_for(user).table("BillFile").select("id")
             .eq("id", file_id).eq("user_id", user["id"]).limit(1).execute().data or []
         )
     except Exception:  # noqa: BLE001 - a malformed id is simply not one of ours
@@ -141,7 +146,7 @@ def _billfile_exists_sync(user: dict, file_id: str) -> bool:
 
 def _write_draft_sync(user: dict, file_id: str, kind: str, draft: dict, filename: str) -> None:
     """Store what the vision pass read, now that the row exists."""
-    get_supabase(user["access_token"]).table("BillFile").update({
+    client_for(user).table("BillFile").update({
         "kind": kind or "unknown",
         "raw_ocr_string": json.dumps(draft or {}),
         "filename": filename,
@@ -150,7 +155,7 @@ def _write_draft_sync(user: dict, file_id: str, kind: str, draft: dict, filename
 
 def _upload_photo_sync(user: dict, local_path: str, filename: str) -> str:
     """Put the photo in storage and create its BillFile row. Returns file_id."""
-    client = get_supabase(user["access_token"])
+    client = client_for(user)
     s3_key = f"{user['id']}/bills/{filename}"
 
     content_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
@@ -287,6 +292,12 @@ async def classify_photo(user: dict, config: dict, capture_id: str) -> None:
             await materialise(user, capture_id)
         except Exception as e:  # noqa: BLE001
             logger.error("Could not store receipt capture %s: %s", capture_id, e, exc_info=True)
+            # Settle it, or the client polls for a file_id that will never
+            # arrive — a full minute of spinner before it gives up. 'unknown'
+            # puts the "which is this?" card up instead, and answering it runs
+            # set_kind, which tries the store again.
+            entry["error"] = str(e)
+            entry["kind"] = "unknown"
 
 
 def _photo_display_name(original: str, kind: str, draft: Optional[dict]) -> str:
@@ -321,7 +332,7 @@ async def capture_photo(
     if not config:
         raise ValueError("Account config required. Please add your API key in Settings.")
 
-    _sweep_pending()
+    sweep_pending()
     capture_id = str(uuid.uuid4())
     _pending[capture_id] = {
         "user_id": user["id"],
@@ -360,7 +371,7 @@ async def capture_photo(
 
 def _read_draft_sync(user: dict, file_id: str) -> dict:
     """Read back what the vision pass stored, scoped to the owner."""
-    client = get_supabase(user["access_token"])
+    client = client_for(user)
     rows = (
         client.table("BillFile")
         .select("raw_ocr_string")
@@ -381,7 +392,7 @@ def _read_draft_sync(user: dict, file_id: str) -> dict:
 
 def _read_capture_sync(user: dict, file_id: str) -> Optional[dict]:
     """Read back a stored photo's kind, scoped to the owner."""
-    client = get_supabase(user["access_token"])
+    client = client_for(user)
     rows = (
         client.table("BillFile")
         .select("id,kind,raw_ocr_string")
@@ -395,10 +406,42 @@ def _read_capture_sync(user: dict, file_id: str) -> Optional[dict]:
     return rows[0] if rows else None
 
 
+def _reportable_kind(entry: dict) -> str:
+    """What the client may act on, which is not always what we know.
+
+    'kind' leaving 'processing' is the client's signal that the capture is
+    ready, and for a receipt "ready" means STORED — chat opens the review screen
+    the moment it hears 'receipt', and that screen needs a real BillFile id.
+
+    classify_photo sets kind before materialise() has uploaded the photo and
+    written the row, and the client polls every 1.5s, so it reliably won the
+    race: it saw 'receipt', routed with the capture handle, and got "Receipt
+    review is not available". Holding 'processing' for the extra beat closes it.
+
+    Only receipts. A price tag is deliberately never stored until the user
+    confirms it, so waiting for a file_id would hang it forever.
+    """
+    kind = entry["kind"]
+    if kind == "receipt" and not entry.get("file_id"):
+        return "processing"
+    return kind
+
+
 def _pending_result(capture_id: str, entry: dict) -> dict:
     return {
-        "file_id": capture_id,
-        "kind": entry["kind"],
+        # The STORED id once there is one, not the capture handle.
+        #
+        # A receipt is materialised during classification, which mints a BillFile
+        # id and records it on the entry — but the entry stays behind as the
+        # capture-id -> file-id mapping, so the next poll still found it here and
+        # handed back the capture id. That id names no row, so opening the
+        # review screen with it answered "Receipt review is not available", and
+        # discarding it took neither the row nor the photo.
+        #
+        # A price tag is not materialised until the user confirms it, so it has
+        # no file_id yet and correctly keeps reporting its capture handle.
+        "file_id": entry.get("file_id") or capture_id,
+        "kind": _reportable_kind(entry),
         "draft": entry["draft"],
         "location": entry.get("location"),
         **({"error": entry["error"]} if entry.get("error") else {}),
@@ -442,7 +485,7 @@ async def get_capture(user: dict, file_id: str) -> dict:
 
 
 def _set_kind_sync(user: dict, file_id: str, kind: str) -> dict:
-    client = get_supabase(user["access_token"])
+    client = client_for(user)
     updated = (
         client.table("BillFile")
         .update({"kind": kind})

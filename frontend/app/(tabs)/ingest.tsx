@@ -15,6 +15,7 @@ import { LoadingSpinner } from "../../src/components/LoadingSpinner";
 import { useFiles } from "../../src/hooks/useFiles";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
+import { money } from "../../src/lib/format";
 import { openReview } from "../../src/lib/reviewRouting";
 import type { FileItem } from "../../src/lib/types";
 import { useFocusEffect, useRouter } from "expo-router";
@@ -51,17 +52,20 @@ export default function IngestScreen() {
   const {
     files,
     isLoading,
+    hasLoaded,
     isUploading,
     isIngesting,
     isDeleting,
     visibilityFileId,
     error,
     duplicates,
+    alreadyImported,
     reviewItems,
     ingestionProgress,
     uploadFiles,
     deleteFile,
     toggleFileVisibility,
+    setFileRotation,
     loadFiles,
     clearDuplicates,
   } = useFiles();
@@ -114,6 +118,16 @@ export default function IngestScreen() {
     }
     return groups;
   }, [files, typeFilter, search]);
+
+  // The same files as one ordered run, for paging through the preview. Built
+  // from groupedFiles so it follows what is on screen — the current filter and
+  // sort — rather than the unfiltered list, which would jump to a file the user
+  // cannot see. Collapsed months are included on purpose: a collapsed section
+  // is tidied away, not excluded.
+  const previewOrder = useMemo(
+    () => groupedFiles.flatMap((group) => group.items),
+    [groupedFiles]
+  );
 
   // Collapsing swaps a section's rows for an empty array rather than rebuilding
   // the groups, so toggling a month never re-runs the filtering above.
@@ -207,6 +221,38 @@ export default function IngestScreen() {
     setPickedFiles((prev) => prev.filter((_, i) => i !== index));
   };
 
+  /**
+   * Hide or unhide from inside the preview.
+   *
+   * `previewTarget` is a snapshot taken when the sheet opened, not a live view
+   * of `files` — so toggling updated the list underneath while the open sheet
+   * carried on saying "Hide". Patch the snapshot too.
+   */
+  const handlePreviewVisibility = useCallback(
+    async (target: FileItem) => {
+      const ok = await toggleFileVisibility(target);
+      if (!ok) return;
+      setPreviewTarget((current) =>
+        current && current.id === target.id
+          ? { ...current, is_hidden: !target.is_hidden }
+          : current
+      );
+    },
+    [toggleFileVisibility]
+  );
+
+  /** Same snapshot problem as visibility: patch the open sheet's copy too. */
+  const handlePreviewRotate = useCallback(
+    async (target: FileItem, degrees: number) => {
+      const ok = await setFileRotation(target, degrees);
+      if (!ok) return;
+      setPreviewTarget((current) =>
+        current && current.id === target.id ? { ...current, rotation: degrees } : current
+      );
+    },
+    [setFileRotation]
+  );
+
   const handleReviewReceipt = (file: FileItem) => {
     setPreviewTarget(null);
     // Route on what the photo actually is. This used to open the receipt form
@@ -239,30 +285,46 @@ export default function IngestScreen() {
     }
   };
 
-  const handleDeleteConfirm = async () => {
-    if (!deleteTarget || deleteInFlight.current) return;
-    deleteInFlight.current = true;
-    const target = deleteTarget;
-    // Close immediately so a double tap cannot issue a second DELETE request.
-    setDeleteTarget(null);
-    log.info("Delete confirmed", {
-      fileId: target.id,
-      filename: target.filename,
-      type: target.type,
-    });
-    try {
-      const ok = await deleteFile(target.id, target.type);
-      if (ok) {
-        log.info("File deleted successfully", { filename: target.filename });
-        setSnackbar({
-          visible: true,
-          message: `Deleted ${target.filename}`,
-          error: false,
-        });
+  /**
+   * The deletion itself, once someone has confirmed it.
+   *
+   * Shared by both entry points — the trash on a row, and the trash inside the
+   * preview — so there is one place that issues the DELETE and one message
+   * afterwards, whichever way you got here.
+   */
+  const performDelete = useCallback(
+    async (target: FileItem) => {
+      // Guards a double tap from issuing a second DELETE for the same file.
+      if (deleteInFlight.current) return;
+      deleteInFlight.current = true;
+      log.info("Delete confirmed", {
+        fileId: target.id,
+        filename: target.filename,
+        type: target.type,
+      });
+      try {
+        const ok = await deleteFile(target.id, target.type);
+        if (ok) {
+          log.info("File deleted successfully", { filename: target.filename });
+          setSnackbar({
+            visible: true,
+            message: `Deleted ${target.filename}`,
+            error: false,
+          });
+        }
+      } finally {
+        deleteInFlight.current = false;
       }
-    } finally {
-      deleteInFlight.current = false;
-    }
+    },
+    [deleteFile]
+  );
+
+  const handleDeleteConfirm = () => {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    // Close immediately so a double tap cannot re-enter this.
+    setDeleteTarget(null);
+    performDelete(target);
   };
 
   const keyExtractor = useCallback(
@@ -380,6 +442,36 @@ export default function IngestScreen() {
         </GlassCard>
       )}
 
+      {/* A whole file we refused because its bytes are already imported.
+          Separate from the duplicate-ROW warning below: nothing was written,
+          nothing was even read, and the useful fact is which earlier upload it
+          matched. Silence here is what let the same statement be imported
+          twice and double every total the agent reported. */}
+      {alreadyImported.length > 0 && (
+        <GlassCard variant="flat" style={styles.duplicateCard}>
+          <Text style={styles.duplicateTitle}>
+            {alreadyImported.length} file{alreadyImported.length > 1 ? "s" : ""} already imported
+          </Text>
+          <Text style={styles.duplicateSubtitle}>
+            Skipped — nothing was added, so your totals are unchanged:
+          </Text>
+          {alreadyImported.map((f, i) => (
+            <Text key={i} style={styles.duplicateItem}>
+              {f.filename}
+              {f.uploaded_at ? ` — same as the file you uploaded on ${f.uploaded_at}` : ""}
+            </Text>
+          ))}
+          <Button
+            mode="text"
+            onPress={clearDuplicates}
+            compact
+            style={styles.dismissButton}
+          >
+            Dismiss
+          </Button>
+        </GlassCard>
+      )}
+
       {/* Section 4: Duplicate Warnings */}
       {duplicates.length > 0 && (
         <GlassCard variant="flat" style={styles.duplicateCard}>
@@ -391,7 +483,7 @@ export default function IngestScreen() {
           </Text>
           {duplicates.slice(0, 10).map((d, i) => (
             <Text key={i} style={styles.duplicateItem}>
-              {d.date} - {d.merchant} - ${Number(d.amount).toFixed(2)}
+              {d.date} - {d.merchant} - {money(Number(d.amount))}
             </Text>
           ))}
           {duplicates.length > 10 && (
@@ -425,9 +517,11 @@ export default function IngestScreen() {
         )}
       </View>
 
-      {files.length === 0 ? (
+      {/* See the transactions tab: an empty list before the first response is
+          not an empty account. */}
+      {hasLoaded && files.length === 0 ? (
         <Text style={styles.emptyText}>No files uploaded yet.</Text>
-      ) : (
+      ) : files.length === 0 ? null : (
         <>
           {/* Search */}
           <Searchbar
@@ -496,8 +590,28 @@ export default function IngestScreen() {
       {/* File Preview (receipt image or CSV table) */}
       <FilePreviewModal
         file={previewTarget}
+        siblings={previewOrder}
+        onNavigate={setPreviewTarget}
         onClose={() => setPreviewTarget(null)}
         onReviewReceipt={handleReviewReceipt}
+        // Already confirmed by the sheet, over the picture itself.
+        //
+        // Moves to a NEIGHBOUR rather than closing. Deleting one of a dozen
+        // receipts is usually part of a tidy-up, and dropping back to the list
+        // each time means re-opening and paging back to where you were. The
+        // next one along, or the previous when this was the last; only the
+        // final remaining file closes the sheet.
+        //
+        // Chosen before the delete lands, while the list still contains the
+        // file being removed.
+        onDelete={(target) => {
+          const at = previewOrder.findIndex((f) => f.id === target.id);
+          setPreviewTarget(previewOrder[at + 1] ?? previewOrder[at - 1] ?? null);
+          performDelete(target);
+        }}
+        onToggleVisibility={handlePreviewVisibility}
+        onRotate={handlePreviewRotate}
+        togglingVisibility={visibilityFileId === previewTarget?.id}
       />
 
       {/* Delete Confirmation */}

@@ -61,14 +61,14 @@ def test_abandoned_captures_are_swept():
     fresh, fresh_dir = _hold(age=0)
     stale, stale_dir = _hold(age=cs.PENDING_TTL_SECONDS + 1)
 
-    assert cs._sweep_pending() == 1
+    assert cs.sweep_pending() == 1
     assert fresh in cs._pending and os.path.exists(fresh_dir)
     assert stale not in cs._pending and not os.path.exists(stale_dir)
 
 
 def test_sweeping_is_safe_when_nothing_is_stale():
     _hold()
-    assert cs._sweep_pending() == 0
+    assert cs.sweep_pending() == 0
     assert len(cs._pending) == 1
 
 
