@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -7,9 +8,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from backend.config import allowed_origins, verify_public_key_is_not_privileged
 from backend.crypto import verify_encryption_key
 from backend.routers import corrections, auth, captures, config_router, files, chat, prices, transactions, conversations
-from backend.services.rag_manager import rag_manager
+from backend.services.rag_manager import rag_manager, run_janitor
 
 # ---------------------------------------------------------------------------
 # Monkey-patch google-genai bug: HttpResponse.json crashes when response_stream
@@ -33,8 +35,14 @@ try:
         return ""
 
     _GenaiHttpResponse.json = _safe_json  # type: ignore[assignment]
-except Exception:
-    pass
+except Exception as _patch_error:
+    # Said out loud. If google-genai moves this class the patch silently stops
+    # applying, and the crash it exists to prevent comes back looking like a
+    # brand-new bug in error handling.
+    logging.getLogger("moneyrag.main").warning(
+        "Could not apply google-genai HttpResponse.json patch (%s) — "
+        "streaming error handling may crash on that provider", _patch_error,
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,9 +58,22 @@ async def lifespan(app: FastAPI):
     # plaintext would look perfectly healthy while storing every user's API key
     # in the clear — which is the failure this check exists to make impossible.
     verify_encryption_key()
+    # And refuse to start if the key the frontend is handed can bypass RLS.
+    verify_public_key_is_not_privileged()
     logger.debug("Registered routers: auth, config, files, chat")
+
+    # Releases idle RAG instances and abandoned photo captures. Without it both
+    # grow until the container is restarted for memory.
+    janitor = asyncio.create_task(run_janitor(), name="janitor")
+
     yield
+
     logger.info("MoneyRAG API shutting down — cleaning up RAG instances")
+    janitor.cancel()
+    try:
+        await janitor
+    except asyncio.CancelledError:
+        pass
     await rag_manager.cleanup_all()
     logger.info("Shutdown complete")
 
@@ -60,13 +81,53 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MoneyRAG API", version="1.0.0", lifespan=lifespan, redirect_slashes=False)
 
 
+# Headers that carry credentials. Logged as a placeholder rather than dropped,
+# so "was a token even sent?" is still answerable while debugging.
+_REDACTED_HEADERS = frozenset({"authorization", "cookie", "set-cookie", "x-api-key"})
+
+
+def _safe_headers(headers) -> dict:
+    return {
+        k: ("<redacted>" if k.lower() in _REDACTED_HEADERS else v)
+        for k, v in headers.items()
+    }
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception):
+    """The one place an unexpected failure becomes a response.
+
+    Every route used to wrap itself in `except Exception` and build its own 500,
+    which meant nineteen slightly different messages, and any route that forgot
+    the wrapper behaved differently from its neighbours.
+
+    The exception text is deliberately NOT returned. It was being interpolated
+    into `detail`, so a database error handed the caller table names, column
+    names and sometimes a connection string. It goes to the log, which is where
+    whoever can fix it is looking.
+    """
+    from starlette.responses import JSONResponse
+
+    logger.error(
+        "Unhandled error on %s %s: %s",
+        request.method, request.url.path, exc, exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again."},
+    )
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    # Every header used to be logged verbatim. At DEBUG level in production that
+    # writes each user's JWT to the log, where it is a working credential for
+    # anyone who can read logs.
     logger.debug(
         ">>> %s %s | headers: %s",
         request.method,
         request.url.path,
-        dict(request.headers),
+        _safe_headers(request.headers),
     )
     start = time.perf_counter()
     response = await call_next(request)
@@ -99,10 +160,14 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
+# allow_credentials is deliberately False: authentication is a Bearer token in
+# the Authorization header, never a cookie. With credentials enabled, Starlette
+# echoes the caller's own origin back for allow_origins=["*"], which made every
+# website on the internet an allowed credentialed origin.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -120,8 +185,39 @@ app.include_router(conversations.router, prefix="/api/v1/conversations", tags=["
 
 @app.get("/api/v1/health")
 async def health():
+    """Liveness only — is this process up and serving?
+
+    Deliberately does not touch the database, so an orchestrator does not
+    restart a perfectly good container during a brief Supabase blip.
+    """
     logger.debug("Health check hit")
     return {"status": "ok"}
+
+
+@app.get("/api/v1/ready")
+async def ready():
+    """Readiness — can this process actually do its job?
+
+    A container that cannot reach the database answered the old health check
+    happily and kept receiving traffic, turning an outage into a stream of 500s
+    instead of a failed deploy. This is the check a load balancer should use.
+    """
+    from starlette.responses import JSONResponse
+    from backend.vector_db_client import _get_engine
+    from sqlalchemy import text
+
+    try:
+        engine = await asyncio.to_thread(_get_engine)
+
+        def _ping():
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+
+        await asyncio.to_thread(_ping)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Readiness check failed: %s", e, exc_info=True)
+        return JSONResponse(status_code=503, content={"status": "unavailable", "database": "unreachable"})
+    return {"status": "ready", "database": "ok"}
 
 
 @app.get("/api/v1/public-config")
