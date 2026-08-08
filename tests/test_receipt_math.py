@@ -286,3 +286,70 @@ def test_note_plus_merchant_re_embeds_everything():
         {"note": "old", "merchant_name": "STOP & SHOP"},
     )
     assert _children_need_reembed(changed) is True
+
+
+# --- editing line items must not move a verified total -------------------------
+#
+# Verification trusts the receipt's OWN printed total over the computed one,
+# because a receipt can carry a bag fee, a bottle deposit or a rounding
+# adjustment that the itemised lines never mention. The rollup used on every
+# later edit did not know that, and re-derived the amount from scratch — so
+# correcting a typo in one item's description quietly moved the transaction off
+# the figure the receipt actually shows.
+
+from backend.services.transaction_service import _header_totals_from_details
+
+
+def _items(*pairs):
+    """(subtotal, tax) pairs as detail rows."""
+    return [
+        {"item_subtotal_price": s, "tax_amount": t, "tax_rate": 0, "item_savings": 0}
+        for s, t in pairs
+    ]
+
+
+def test_a_fee_the_items_never_explained_survives_an_edit():
+    # Verified at the receipt's printed 49.50, while its items add to 49.13 —
+    # the missing 0.37 is a bag fee printed on the receipt but not itemised.
+    previous = {"subtotal": 45.0, "tax_total": 4.13, "discount_total": 0.0, "amount": 49.50}
+    # An edit that leaves the arithmetic alone (a description fix).
+    _, _, amount, _, _ = _header_totals_from_details(
+        _items((45.0, 4.13)), None, 0.0, previous=previous
+    )
+    assert amount == 49.50, "the receipt's own total must not drift on an unrelated edit"
+
+
+def test_the_edit_itself_still_applies_in_full():
+    """Carrying the remainder must not freeze the total: a real price change
+    still moves it, by exactly the change."""
+    previous = {"subtotal": 45.0, "tax_total": 4.13, "discount_total": 0.0, "amount": 49.50}
+    # One item corrected upward by 10.00, tax unchanged for simplicity.
+    _, _, amount, _, _ = _header_totals_from_details(
+        _items((55.0, 4.13)), None, 0.0, previous=previous
+    )
+    assert amount == 59.50
+
+
+def test_a_transaction_its_items_already_explain_is_unchanged():
+    """The common case: no remainder, so this behaves exactly as it always did."""
+    previous = {"subtotal": 45.0, "tax_total": 4.13, "discount_total": 0.0, "amount": 49.13}
+    _, _, amount, _, _ = _header_totals_from_details(
+        _items((45.0, 4.13)), None, 0.0, previous=previous
+    )
+    assert amount == 49.13
+
+
+def test_without_a_previous_transaction_it_derives_from_scratch():
+    """Verification and any first computation pass no `previous`."""
+    _, _, amount, _, _ = _header_totals_from_details(_items((45.0, 4.13)), None, 0.0)
+    assert amount == 49.13
+
+
+def test_the_order_discount_is_still_subtracted_once():
+    previous = {"subtotal": 45.0, "tax_total": 4.13, "discount_total": 5.0, "amount": 44.13}
+    subtotal, tax_total, amount, _, savings = _header_totals_from_details(
+        _items((45.0, 4.13)), None, 5.0, previous=previous
+    )
+    assert (subtotal, tax_total, amount) == (45.0, 4.13, 44.13)
+    # Savings is the coupon plus any item markdowns — display only.
+    assert savings == 5.0
