@@ -188,3 +188,45 @@ def test_an_unlinked_transaction_reports_no_others():
         id="tx-1", trans_date="2026-07-29", amount=38.12, description="STOP & SHOP"
     )
     assert tx.linked_transactions == []
+
+
+# --- one hash column, three formulas -----------------------------------------
+#
+# Transaction.content_hash is written by three paths that do not agree:
+#
+#   csv     sha256("{date}|{amount:.2f}|{description}#{n}")
+#   bill    sha256("{date}{time}{total}{merchant}")
+#   manual  sha256("{date}{amount}{merchant_first_word}")
+#
+# The last two are both bare concatenations, so they coincide exactly when the
+# receipt has no printed time and the merchant is a single word — "Walmart",
+# "Target", "Costco". Verifying then found the MANUAL row, called the receipt a
+# duplicate of it, and wrote nothing: no line items, no tax breakdown, no
+# source_bill_file_id, and the user told their receipt was already recorded.
+
+def test_a_timeless_receipt_collides_with_a_manual_entry():
+    """The collision is real; the fix is scoping the lookup, not the formula."""
+    import hashlib
+
+    from backend.services.transaction_service import receipt_content_hash
+
+    receipt = receipt_content_hash("2026-07-29", "", 38.12, "Walmart")
+
+    # routers/transactions.py builds the manual hash this way.
+    words = "Walmart".lower().strip().split()
+    merchant = "".join(c for c in (words[0] if words else "") if c.isalnum())
+    manual = hashlib.sha256(f"2026-07-29{round(38.12, 2)}{merchant}".encode()).hexdigest()
+
+    assert receipt == manual, "the two formulas no longer collide; drop this test"
+
+
+def test_a_printed_time_is_enough_to_separate_them():
+    """Why the collision needs a source filter and not just a better formula:
+    whether it happens at all depends on what OCR could read off the paper."""
+    import hashlib
+
+    from backend.services.transaction_service import receipt_content_hash
+
+    timed = receipt_content_hash("2026-07-29", "14:32", 38.12, "Walmart")
+    manual = hashlib.sha256(f"2026-07-29{round(38.12, 2)}walmart".encode()).hexdigest()
+    assert timed != manual

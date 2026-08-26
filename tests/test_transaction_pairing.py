@@ -13,7 +13,7 @@ month's total.
 
 import pytest
 
-from money_rag import pair_same_purchase
+from money_rag import MoneyRAG, pair_same_purchase
 
 NEW = "csv-new"
 OLD = "csv-old"
@@ -108,18 +108,20 @@ def test_a_receipt_is_matched_to_its_statement_line():
     assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "receipt")}
 
 
-def test_a_spelled_out_word_defeats_the_match():
-    """A known limitation, pinned rather than papered over.
+def test_a_spelled_out_word_no_longer_defeats_the_match():
+    """The limitation this file used to pin, now closed.
 
-    Containment is substring-based, so "STOP & SHOP" (stopshop) does not match
-    "STOP AND SHOP" (stopandshop). Failing to link is the SAFE direction — both
-    records survive and the purchase is shown twice — where a wrong link would
-    quietly delete money from the month's total. Worth revisiting only with a
-    token-based comparison, not by loosening containment.
+    Substring containment could not bridge "STOP & SHOP" (stopshop) and "STOP
+    AND SHOP" (stopandshop), and the note here said it was worth revisiting only
+    with a token-based comparison rather than by loosening containment. That is
+    what merchant_match now does: it splits on punctuation BEFORE discarding it,
+    so both sides yield {stop, shop} and the filler word drops out as a
+    stopword. Containment is unchanged and still runs, for the opposite case
+    ("TJ Maxx" against "TJMAXX") where there are no boundaries to split on.
     """
     old = [row("receipt", "2026-08-04", 38.12, "STOP & SHOP", csv_id=None, source="bill")]
     new = [row("n1", "2026-08-04", 38.12, "STOP AND SHOP", csv_id=NEW)]
-    assert pair_same_purchase(old + new, NEW) == []
+    assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "receipt")}
 
 
 def test_a_posting_delay_of_one_day_still_matches():
@@ -168,6 +170,83 @@ def test_unparseable_rows_are_skipped_rather_than_raising():
     assert pair_same_purchase(old + new, NEW) == []
 
 
+# --- the LLM disagreeing with itself ------------------------------------------
+#
+# `merchant_name` is generated per upload by the enrichment model, so the same
+# statement line comes back named differently in two exports. Real pair, from
+# two overlapping exports of one account:
+#
+#   "INTERNET PAYMENT - THANK YOU" -> "Credit Card Payment" / "Online Payment"
+#   "CASHBACK BONUS REDEMPTION..." -> "Discover Financial Services" / "Discover Card"
+#
+# Neither name contains the other, so matching on the name alone lost both
+# links. The bank's own description was byte-identical in both files.
+
+def bank_row(rid, date, amount, description, merchant, csv_id=OLD):
+    """A row whose clean name differs from the raw statement text."""
+    return {
+        "id": rid,
+        "trans_date": date,
+        "amount": amount,
+        "merchant_name": merchant,
+        "description": description,
+        "source": "csv",
+        "source_csv_id": csv_id,
+        "enriched_info": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "description,old_name,new_name",
+    [
+        ("INTERNET PAYMENT - THANK YOU", "Credit Card Payment", "Online Payment"),
+        ("CASHBACK BONUS REDEMPTION PYMT/STMT CRDT", "Discover Financial Services", "Discover Card"),
+        ("SPI*EVERSOURCE BERLIN CT", "Eversource Energy", "Eversource"),
+    ],
+)
+def test_same_statement_line_links_however_the_model_named_it(description, old_name, new_name):
+    old = [bank_row("o1", "2026-07-05", -45.73, description, old_name)]
+    new = [bank_row("n1", "2026-07-05", -45.73, description, new_name, csv_id=NEW)]
+    assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "o1")}
+
+
+def test_matching_descriptions_do_not_override_the_amount_and_date_windows():
+    """A stable key is not a licence to link two genuinely separate purchases."""
+    description = "INTERNET PAYMENT - THANK YOU"
+    old = [
+        bank_row("o-far", "2026-07-01", -45.73, description, "Credit Card Payment"),
+        bank_row("o-costly", "2026-07-05", -900.00, description, "Credit Card Payment"),
+    ]
+    new = [bank_row("n1", "2026-07-05", -45.73, description, "Online Payment", csv_id=NEW)]
+    assert pair_same_purchase(old + new, NEW) == []
+
+
+def test_identical_descriptions_win_over_a_merely_contained_name():
+    """Two candidates, both allowable — the exact statement text is the surer one."""
+    old = [
+        bank_row("o-contained", "2026-07-05", 10.43, "SQ *EVERSOURCE PMT", "Eversource"),
+        bank_row("o-exact", "2026-07-05", 10.43, "SPI*EVERSOURCE BERLIN CT", "Eversource Energy"),
+    ]
+    new = [bank_row("n1", "2026-07-05", 10.43, "SPI*EVERSOURCE BERLIN CT", "Eversource", csv_id=NEW)]
+    assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "o-exact")}
+
+
+def test_a_receipt_with_no_bank_description_still_matches_on_its_name():
+    """The description key must not become a requirement — receipts have none."""
+    old = [{
+        "id": "receipt",
+        "trans_date": "2026-07-01",
+        "amount": 46.21,
+        "merchant_name": "Walmart",
+        "description": None,
+        "source": "bill",
+        "source_csv_id": None,
+        "enriched_info": None,
+    }]
+    new = [bank_row("n1", "2026-07-01", 46.21, "WALMART.COM 800-925-6278 AR", "Walmart", csv_id=NEW)]
+    assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "receipt")}
+
+
 def test_pairing_is_deterministic():
     """Same input, same links — otherwise re-running ingestion churns the table."""
     old = [row(f"o{i}", "2026-08-04", 5.00, "COSTA") for i in range(3)]
@@ -175,3 +254,261 @@ def test_pairing_is_deterministic():
     first = ids(pair_same_purchase(old + new, NEW))
     second = ids(pair_same_purchase(old + new, NEW))
     assert first == second
+
+
+# --- what the upload screen is told about the links ---------------------------
+#
+# The links themselves are invisible: the transactions list collapses each
+# linked pair into one row, so a statement overlapping the previous one looks
+# like it imported fewer rows than it held. `_link_new_csv_transactions` reports
+# what it linked so the upload can say so.
+
+def linker(rows):
+    """A MoneyRAG with only the database calls linking uses stubbed out."""
+    rag = object.__new__(MoneyRAG)
+    rag.user_id = "user-1"
+    rag.upserted = []
+    rag._db_select = lambda *a, **kw: rows
+    rag._db_upsert = lambda table, records, **kw: rag.upserted.append((table, records))
+    rag._db_update = lambda *a, **kw: None
+    return rag
+
+
+def test_links_are_reported_with_the_new_row_and_its_match_type():
+    """One summary per link, describing the row the user just uploaded."""
+    old = [
+        row("o1", "2026-08-04", 38.12, "TESCO"),
+        row("o2", "2026-08-05", 12.00, "BOOTS", source="bill", csv_id=None),
+    ]
+    new = [
+        row("n1", "2026-08-04", 38.12, "TESCO", csv_id=NEW),
+        row("n2", "2026-08-05", 12.00, "BOOTS", csv_id=NEW),
+    ]
+    rag = linker(old + new)
+
+    summaries = rag._link_new_csv_transactions(NEW)
+
+    assert len(summaries) == 2
+    by_merchant = {s["merchant"]: s for s in summaries}
+    assert by_merchant["TESCO"] == {
+        "date": "2026-08-04",
+        "merchant": "TESCO",
+        "amount": 38.12,
+        "match_type": "csv_csv",
+    }
+    # A photographed receipt is a different story to tell than an overlapping
+    # export, so the two must not arrive indistinguishable.
+    assert by_merchant["BOOTS"]["match_type"] == "csv_receipt"
+
+
+def test_nothing_matched_reports_nothing():
+    """No links, no notification — an ordinary import stays quiet."""
+    old = [row("o1", "2026-07-01", 38.12, "TESCO")]
+    new = [row("n1", "2026-08-04", 4.50, "STARBUCKS", csv_id=NEW)]
+    rag = linker(old + new)
+
+    assert rag._link_new_csv_transactions(NEW) == []
+    assert rag.upserted == []
+
+
+def test_summary_count_matches_the_rows_written():
+    """The number shown to the user is the number of links actually recorded."""
+    old = [row(f"o{i}", "2026-08-04", 5.00 + i, "COSTA") for i in range(3)]
+    new = [row(f"n{i}", "2026-08-04", 5.00 + i, "COSTA", csv_id=NEW) for i in range(3)]
+    rag = linker(old + new)
+
+    summaries = rag._link_new_csv_transactions(NEW)
+
+    assert len(summaries) == 3
+    assert len(rag.upserted[0][1]) == len(summaries)
+
+
+# --- keeping the model from renaming the same line twice -----------------------
+#
+# The links above only had to be repaired because `merchant_name` drifted. The
+# drift is fixed at the source: a description this user has uploaded before
+# keeps the name it already has, and never reaches the model a second time.
+
+def namer(rows):
+    """A MoneyRAG with only the lookup `_known_merchant_names` makes stubbed."""
+    rag = object.__new__(MoneyRAG)
+    rag.user_id = "user-1"
+    rag.queried = []
+    def _select_in(table, columns, field, values_list, filters=None):
+        rag.queried.append((field, list(values_list), filters))
+        return [r for r in rows if r["description"] in values_list]
+    rag._db_select_in = _select_in
+    return rag
+
+
+def named(description, merchant, info=""):
+    return {"description": description, "merchant_name": merchant, "enriched_info": info}
+
+
+def test_a_description_keeps_the_name_it_already_has():
+    rag = namer([named("INTERNET PAYMENT - THANK YOU", "Credit Card Payment", "A payment.")])
+
+    known = rag._known_merchant_names(["INTERNET PAYMENT - THANK YOU", "NEW MERCHANT LLC"])
+
+    assert known == {
+        "INTERNET PAYMENT - THANK YOU": {
+            "merchant_name": "Credit Card Payment",
+            "enriched_info": "A payment.",
+        }
+    }
+    # The unseen description is left out, so it still reaches the model.
+    assert "NEW MERCHANT LLC" not in known
+    # Scoped to the user: merchant names are not shared between accounts.
+    assert rag.queried[0][2] == {"user_id": "user-1"}
+
+
+def test_the_name_already_used_most_wins():
+    """Rows predating this lookup carry both names. One of them has to win."""
+    rag = namer([
+        named("SPI*EVERSOURCE BERLIN CT", "Eversource"),
+        named("SPI*EVERSOURCE BERLIN CT", "Eversource Energy"),
+        named("SPI*EVERSOURCE BERLIN CT", "Eversource"),
+    ])
+
+    known = rag._known_merchant_names(["SPI*EVERSOURCE BERLIN CT"])
+
+    assert known["SPI*EVERSOURCE BERLIN CT"]["merchant_name"] == "Eversource"
+
+
+def test_an_even_split_still_resolves_the_same_way_every_run():
+    """A tie must not be settled by database row order, or the drift comes back."""
+    pair = [
+        named("CASHBACK BONUS REDEMPTION", "Discover Card"),
+        named("CASHBACK BONUS REDEMPTION", "Discover Financial Services"),
+    ]
+    forwards = namer(pair)._known_merchant_names(["CASHBACK BONUS REDEMPTION"])
+    backwards = namer(list(reversed(pair)))._known_merchant_names(["CASHBACK BONUS REDEMPTION"])
+
+    assert forwards == backwards
+
+
+def test_a_failed_lookup_falls_back_to_enriching_everything():
+    """Consistency is worth an upload; it is not worth failing one."""
+    rag = object.__new__(MoneyRAG)
+    rag.user_id = "user-1"
+    def _boom(*a, **kw):
+        raise RuntimeError("no such column")
+    rag._db_select_in = _boom
+
+    assert rag._known_merchant_names(["ANYTHING"]) == {}
+
+
+def test_no_descriptions_makes_no_query():
+    rag = namer([])
+    assert rag._known_merchant_names([]) == {}
+    assert rag.queried == []
+
+
+# --- the name rule: what a bank and a receipt call the same shop --------------
+#
+# These are the pairs the rule exists for, and the regression that prompted it:
+# dropping the enrichment LLM's `merchant_name` from the key removed the only
+# thing bridging "Stop & Shop" and "STOP AND SHOP", because squashing the
+# punctuation out of both leaves "stopshop" and "stopandshop" — neither of which
+# contains the other.
+
+RECEIPT_AND_STATEMENT = [
+    ("Walmart", "WALMART.COM 800-925-6278 AR"),
+    ("Target", "TARGET T-1234 NORWALK CT"),
+    ("Trader Joe's", "TRADER JOE S #519 QPS"),
+    ("Costco", "COSTCO WHSE #0357"),
+    # The bank spells out a word the receipt prints as "&".
+    ("Stop & Shop", "STOP AND SHOP #1234"),
+    # Three letters, but with word boundaries around them.
+    ("CVS", "CVS/PHARMACY #04567"),
+    # The reverse: boundaries the statement does not have at all.
+    ("TJ Maxx", "TJMAXX 1234"),
+    ("Shell", "SHELL OIL 57444286104"),
+]
+
+DIFFERENT_SHOPS = [
+    ("Shell", "SHEETZ 123"),
+    ("Costco", "COSTA COFFEE LONDON"),
+    # The one a prefix rule would wrongly accept. A false link is worse than a
+    # missed one: linked rows collapse to a single row in the list, so it
+    # REMOVES money from the month rather than showing a duplicate.
+    ("Whole Foods", "WHOLESALE CLUB #22"),
+    # Squashed containment matches across word boundaries; tokens must not.
+    ("Arts", "TARGET T-1234"),
+]
+
+
+@pytest.mark.parametrize("merchant,description", RECEIPT_AND_STATEMENT)
+def test_a_receipt_links_to_its_statement_line(merchant, description):
+    old = [{
+        "id": "receipt", "trans_date": "2026-07-01", "amount": 46.21,
+        "merchant_name": merchant, "description": None,
+        "source": "bill", "source_csv_id": None, "enriched_info": None,
+    }]
+    new = [bank_row("n1", "2026-07-01", 46.21, description, "(enrichment, ignored)", csv_id=NEW)]
+    assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "receipt")}
+
+
+@pytest.mark.parametrize("merchant,description", DIFFERENT_SHOPS)
+def test_two_different_shops_are_never_linked(merchant, description):
+    """Same day, same amount to the penny — only the name keeps them apart."""
+    old = [{
+        "id": "receipt", "trans_date": "2026-07-01", "amount": 46.21,
+        "merchant_name": merchant, "description": None,
+        "source": "bill", "source_csv_id": None, "enriched_info": None,
+    }]
+    new = [bank_row("n1", "2026-07-01", 46.21, description, "(enrichment, ignored)", csv_id=NEW)]
+    assert pair_same_purchase(old + new, NEW) == []
+
+
+def test_the_enrichment_name_cannot_create_a_link():
+    """The whole point: identity may not depend on what the model said today.
+
+    Two unrelated shops that the enrichment call happened to give the same
+    name. Before the key was moved onto the bank's own text, this linked.
+    """
+    old = [bank_row("o1", "2026-07-01", 46.21, "SHEETZ 123", "Fuel Stop")]
+    new = [bank_row("n1", "2026-07-01", 46.21, "SHELL OIL 5744", "Fuel Stop", csv_id=NEW)]
+    assert pair_same_purchase(old + new, NEW) == []
+
+
+# --- manual entries are purchases too ----------------------------------------
+#
+# "I spent $50 at Target today", confirmed in chat, is as real a record as a
+# statement line — and when the bank exports that same purchase weeks later,
+# they are the same money. Excluded from linking, that pair could never be
+# reconciled by anything: no link exists, so the deduped view has nothing to act
+# on and the cost is counted twice permanently.
+
+def manual_row(rid, date, amount, description):
+    return {
+        "id": rid, "trans_date": date, "amount": amount,
+        "merchant_name": description, "description": description,
+        "source": "manual", "source_csv_id": None, "enriched_info": None,
+    }
+
+
+def test_a_confirmed_manual_entry_links_to_its_statement_line():
+    old = [manual_row("m1", "2026-08-04", 50.00, "Target")]
+    new = [bank_row("n1", "2026-08-04", 50.00, "TARGET T-1234 NORWALK CT",
+                    "(enrichment, ignored)", csv_id=NEW)]
+    assert ids(pair_same_purchase(old + new, NEW)) == {("n1", "m1")}
+
+
+def test_a_manual_entry_still_claims_only_one_partner():
+    """Cash payments recur. The one-to-one rule has to hold for them too."""
+    old = [manual_row(f"m{i}", "2026-08-04", 20.00, "Simran") for i in range(3)]
+    new = [bank_row(f"n{i}", "2026-08-04", 20.00, "SIMRAN TRANSFER",
+                    "(ignored)", csv_id=NEW) for i in range(3)]
+    pairs = pair_same_purchase(old + new, NEW)
+    seen = [str(r["id"]) for pair in pairs for r in pair]
+    assert len(pairs) == 3
+    assert len(seen) == len(set(seen)), "a row was linked twice"
+
+
+def test_a_cash_manual_entry_matches_nothing_and_is_left_alone():
+    """The common case: money that never touches a statement."""
+    old = [manual_row("m1", "2026-08-04", 100.00, "Simran")]
+    new = [bank_row("n1", "2026-08-04", 42.00, "TESCO STORES 3421",
+                    "(ignored)", csv_id=NEW)]
+    assert pair_same_purchase(old + new, NEW) == []

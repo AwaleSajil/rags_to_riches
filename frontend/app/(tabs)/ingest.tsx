@@ -33,6 +33,21 @@ const MONTH_NAMES = [
 // `data` identity every render and re-render the whole list.
 const NO_ROWS: FileItem[] = [];
 
+// Ingestion stages, as the worker emits them. Looked up rather than tested one
+// by one: the old chain of `stage === "x" && "..."` rendered NOTHING for any
+// stage it didn't list, so a photo's "review" stage left the card's title line
+// empty and the card collapsed a line mid-run. A stage this build has never
+// heard of now falls back to the generic line instead of a blank.
+const STAGE_LABELS: Record<string, string> = {
+  parsing: "📄 Parsing CSV...",
+  reading: "🖼️ Reading photo...",
+  enriching: "✨ Enriching merchants...",
+  saving: "💾 Saving to database...",
+  embedding: "🧠 Building search index...",
+  review: "📝 Ready for review...",
+};
+const STAGE_FALLBACK = "Processing your files...";
+
 type MonthSection = {
   title: string;
   count: number;
@@ -59,6 +74,7 @@ export default function IngestScreen() {
     visibilityFileId,
     error,
     duplicates,
+    links,
     alreadyImported,
     reviewItems,
     ingestionProgress,
@@ -68,6 +84,7 @@ export default function IngestScreen() {
     setFileRotation,
     loadFiles,
     clearDuplicates,
+    clearLinks,
   } = useFiles();
 
   // Reload whenever this tab comes into view. Tab screens stay MOUNTED when you
@@ -146,6 +163,19 @@ export default function IngestScreen() {
     (month: string) => setCollapsedMonths((prev) => ({ ...prev, [month]: !prev[month] })),
     []
   );
+
+  // What a link means depends on what it matched, and the two read very
+  // differently: another statement is an overlapping export, a receipt is a
+  // photo the user took themselves. Counted rather than lumped together, so a
+  // mixed upload says how many of each.
+  const fromReceipts = links.filter((l) => l.match_type === "csv_receipt").length;
+  const fromStatements = links.length - fromReceipts;
+  const mixedLinks = fromReceipts > 0 && fromStatements > 0;
+  const linkSummary = mixedLinks
+    ? `${fromStatements} matched a statement you imported before and ${fromReceipts} matched a receipt you photographed. Both copies are kept, linked, and counted once:`
+    : fromReceipts > 0
+      ? "You had already photographed the receipt for these. Both copies are kept, linked, and counted once:"
+      : "These also appear in a statement you imported before. Both copies are kept, linked, and counted once:";
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -370,6 +400,20 @@ export default function IngestScreen() {
     return <LoadingSpinner message="Loading files..." />;
   }
 
+  // Progress card copy. Both lines are always non-empty, so the card keeps the
+  // same height for the whole run — it sits in the list header, and a line
+  // appearing or vanishing shifts every row under the user's finger.
+  const stageLabel = ingestionProgress
+    ? STAGE_LABELS[ingestionProgress.stage] ?? STAGE_FALLBACK
+    : STAGE_FALLBACK;
+  // Counts only when the worker reports a countable total. A photo has none —
+  // it's one vision call — so it sends 0 and gets its detail line alone rather
+  // than a meaningless "0 / 1".
+  const progressDetail =
+    ingestionProgress && ingestionProgress.total > 0
+      ? `${ingestionProgress.done} / ${ingestionProgress.total}${ingestionProgress.detail ? ` — ${ingestionProgress.detail}` : ""}`
+      : ingestionProgress?.detail || "Starting up...";
+
   // Passed as an ELEMENT, not a function. An inline `() => <.../>` is a new
   // component type on every render, so SectionList would unmount and remount
   // this whole block — and the Searchbar would lose focus on every keystroke.
@@ -414,30 +458,37 @@ export default function IngestScreen() {
       {/* Section 3: Ingestion Progress */}
       {isIngesting && (
         <GlassCard style={styles.progressSection}>
-          <Text style={styles.progressText}>
-            {ingestionProgress?.stage === "parsing" && "📄 Parsing CSV..."}
-            {ingestionProgress?.stage === "enriching" && "✨ Enriching merchants..."}
-            {ingestionProgress?.stage === "saving" && "💾 Saving to database..."}
-            {ingestionProgress?.stage === "embedding" && "🧠 Building search index..."}
-            {!ingestionProgress?.stage && "Processing your files..."}
+          <Text style={styles.progressText} numberOfLines={1}>
+            {stageLabel}
           </Text>
-          <ProgressBar
-            indeterminate={
-              !ingestionProgress?.stage ||
-              ingestionProgress.total === 0
-            }
-            progress={
-              ingestionProgress && ingestionProgress.total > 0
-                ? ingestionProgress.done / ingestionProgress.total
-                : 0
-            }
-            color={colors.primary}
-            style={styles.progressBar}
-          />
-          <Text style={styles.progressSubtext}>
-            {ingestionProgress && ingestionProgress.total > 0
-              ? `${ingestionProgress.done} / ${ingestionProgress.total}${ingestionProgress.detail ? ` — ${ingestionProgress.detail}` : ""}`
-              : "Starting up..."}
+          {/* Boxed to its own height ON PURPOSE. On web — and only on web —
+              Paper wraps ProgressBar in a View styled `height: "100%"`. As a
+              direct child of this column that resolves against the whole card,
+              and since RN views do not shrink it squeezed both Text siblings to
+              zero height: the words were in the DOM, clipped to nothing by the
+              overflow that numberOfLines adds. A card with a bar and no copy,
+              on web, while the phone looked right. Four points of definite
+              height is what that 100% now resolves against. */}
+          <View style={styles.progressBarBox}>
+            <ProgressBar
+              indeterminate={
+                !ingestionProgress?.stage ||
+                ingestionProgress.total === 0
+              }
+              progress={
+                ingestionProgress && ingestionProgress.total > 0
+                  ? ingestionProgress.done / ingestionProgress.total
+                  : 0
+              }
+              color={colors.primary}
+              style={styles.progressBar}
+            />
+          </View>
+          {/* One line, always. A filename or an extracted merchant can be long
+              enough to wrap, and the card growing a line mid-run moves the file
+              list below it. */}
+          <Text style={styles.progressSubtext} numberOfLines={1}>
+            {progressDetail}
           </Text>
         </GlassCard>
       )}
@@ -494,6 +545,53 @@ export default function IngestScreen() {
           <Button
             mode="text"
             onPress={clearDuplicates}
+            compact
+            style={styles.dismissButton}
+          >
+            Dismiss
+          </Button>
+        </GlassCard>
+      )}
+
+      {/* Section 4b: rows kept, but matched to a purchase already on record.
+          Not a warning — nothing was dropped and nothing double-counts. It is
+          here because the transactions list collapses each linked pair into one
+          row, so a statement re-exported over an overlapping period appears to
+          have imported fewer rows than it contained, with nothing to explain
+          the gap. This is that explanation, with the count. */}
+      {links.length > 0 && (
+        <GlassCard variant="flat" style={styles.linkedCard}>
+          <View style={styles.linkedHeaderRow}>
+            <MaterialCommunityIcons
+              name="link-variant"
+              size={16}
+              color={colors.primary}
+            />
+            <Text style={styles.linkedTitle}>
+              {links.length} transaction{links.length > 1 ? "s" : ""} already recorded elsewhere
+            </Text>
+          </View>
+          <Text style={styles.duplicateSubtitle}>
+            {linkSummary}
+          </Text>
+          {links.slice(0, 10).map((l, i) => (
+            <Text key={i} style={styles.duplicateItem}>
+              {l.date} - {l.merchant} - {money(Number(l.amount))}
+              {mixedLinks
+                ? l.match_type === "csv_receipt"
+                  ? " · receipt"
+                  : " · statement"
+                : ""}
+            </Text>
+          ))}
+          {links.length > 10 && (
+            <Text style={styles.duplicateSubtitle}>
+              ...and {links.length - 10} more
+            </Text>
+          )}
+          <Button
+            mode="text"
+            onPress={clearLinks}
             compact
             style={styles.dismissButton}
           >
@@ -684,6 +782,9 @@ const styles = StyleSheet.create({
     color: colors.primary,
     marginBottom: spacing.md,
   },
+  progressBarBox: {
+    height: 4,
+  },
   progressBar: {
     borderRadius: 4,
     height: 4,
@@ -702,6 +803,25 @@ const styles = StyleSheet.create({
     ...typography.subtitle2,
     color: "#b45309",
     marginBottom: spacing.xs,
+  },
+  // Same shape as the duplicate card, deliberately not the same colour: an
+  // amber warning would read as "something went wrong with your import", and
+  // nothing did.
+  linkedCard: {
+    marginTop: spacing.lg,
+    borderLeftWidth: 3,
+    borderLeftColor: colors.primary,
+  },
+  linkedHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  linkedTitle: {
+    ...typography.subtitle2,
+    color: colors.primaryDark,
+    flexShrink: 1,
   },
   duplicateSubtitle: {
     ...typography.caption,

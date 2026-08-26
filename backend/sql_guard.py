@@ -37,6 +37,11 @@ logger = logging.getLogger("moneyrag.sql_guard")
 # reading), "User", and anything in auth.*.
 ALLOWED_TABLES = frozenset({
     "transaction",
+    # The view over it with linked duplicates removed (migration 041). Readable
+    # for the same reason "transaction" is, and the schema doc steers every
+    # total here — a query the guard rejected would send the agent straight back
+    # to the table that double counts.
+    "transactiondeduped",
     "transactiondetail",
     "transactionlink",
     "billfile",

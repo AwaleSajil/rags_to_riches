@@ -155,6 +155,17 @@ export interface IngestionStatus {
   status: "idle" | "processing" | "review" | "complete" | "failed";
   error?: string | null;
   duplicates?: { date: string; merchant: string; amount: number }[];
+  /**
+   * Rows kept, but matched to a purchase already on record — a statement
+   * re-exported over an overlapping period, or one whose receipt was already
+   * photographed. Distinct from `duplicates`, which were merged away.
+   */
+  links?: {
+    date: string;
+    merchant: string;
+    amount: number;
+    match_type: "csv_csv" | "csv_receipt";
+  }[];
   stage?: string;
   total?: number;
   done?: number;

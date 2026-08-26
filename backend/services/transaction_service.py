@@ -1,14 +1,21 @@
 import asyncio
 import hashlib
 import logging
-import os
 import re
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from backend.dependencies import client_for as _client, get_supabase
 from backend.services import background, config_service
 from backend.services.categories import normalize_category
+from backend.services.purchase_match import (
+    MAX_LINK_AMOUNT_GAP,
+    MAX_LINK_DAY_GAP,
+    has_key,
+    name_match,
+    row_keys,
+)
+from backend.services.naming import photo_extension, slugify
 
 logger = logging.getLogger("moneyrag.services.transaction")
 
@@ -73,71 +80,80 @@ _LIST_COLUMNS = (
 )
 
 
-def _merchant_match_key(transaction: Dict[str, Any]) -> str:
-    """Return a stable comparison key for bank and receipt merchant names."""
-    value = str(transaction.get("merchant_name") or transaction.get("description") or "").lower()
-    return re.sub(r"[^a-z]", "", value)
 
 
-def _link_verified_bill_transaction(user: dict, bill_transaction_id: str) -> int:
-    """Link a newly verified receipt to matching CSV transactions.
+def _link_to_existing(
+    user: dict, transaction_id: str, candidate_sources: Sequence[str]
+) -> int:
+    """Link one just-arrived transaction to earlier records of the same purchase.
 
-    CSV ingestion already creates these links when the CSV arrives last.  This
-    handles the reverse order: a bank statement was imported first and its
-    supporting receipt is verified later.  It deliberately creates links only
-    (never removes a source transaction) and retains the same conservative
-    merchant/date/amount rules used for CSV ingestion.
+    CSV ingestion creates these links when the bank export happens to arrive
+    last. This handles every other order — a statement imported first and its
+    receipt verified later, or a purchase the user described in chat and
+    confirmed before the statement showed up. It creates links only, never
+    removing a source transaction.
+
+    The name test and the date/amount windows are literally the ones
+    `pair_same_purchase` uses, via purchase_match. This used to be a hand-rolled
+    copy of both and had drifted from them.
+
+    What is still NOT shared is one-to-one claiming: `pair_same_purchase` scores
+    every candidate and lets each row claim a single partner, while this links
+    every candidate inside the windows. A weekly identical charge reconciled
+    late can therefore still link to two statement lines here.
     """
     client = _client(user)
-    bill_rows = (
-        client.table("Transaction")
-        .select("id,trans_date,amount,merchant_name,description,source")
-        .eq("id", bill_transaction_id)
-        .eq("user_id", user["id"])
-        .eq("source", "bill")
-        .limit(1)
+    columns = "id,trans_date,amount,merchant_name,description,source"
+    rows = (
+        client.table("Transaction").select(columns)
+        .eq("id", transaction_id).eq("user_id", user["id"]).limit(1)
         .execute().data or []
     )
-    if not bill_rows:
+    if not rows:
         return 0
-    bill = bill_rows[0]
-    bill_merchant = _merchant_match_key(bill)
-    if len(bill_merchant) < 4:
+    row = rows[0]
+    keys = row_keys(row)
+    if not has_key(keys):
         return 0
     try:
-        bill_date = date.fromisoformat(str(bill["trans_date"])[:10])
-        bill_amount = float(bill["amount"])
+        row_date = date.fromisoformat(str(row["trans_date"])[:10])
+        row_amount = float(row["amount"])
     except (TypeError, ValueError):
         return 0
 
     candidates = (
-        client.table("Transaction")
-        .select("id,trans_date,amount,merchant_name,description,source")
+        client.table("Transaction").select(columns)
         .eq("user_id", user["id"])
-        .eq("source", "csv")
+        .in_("source", list(candidate_sources))
         .execute().data or []
     )
     links = []
     for candidate in candidates:
-        candidate_merchant = _merchant_match_key(candidate)
-        if (
-            len(candidate_merchant) < 4
-            or (bill_merchant not in candidate_merchant and candidate_merchant not in bill_merchant)
-        ):
+        if str(candidate["id"]) == str(row["id"]):
+            continue
+        if name_match(keys, row_keys(candidate)) is None:
             continue
         try:
-            date_gap = abs((bill_date - date.fromisoformat(str(candidate["trans_date"])[:10])).days)
-            amount_gap = abs(bill_amount - float(candidate["amount"]))
+            date_gap = abs((row_date - date.fromisoformat(str(candidate["trans_date"])[:10])).days)
+            amount_gap = abs(row_amount - float(candidate["amount"]))
         except (TypeError, ValueError):
             continue
-        if date_gap > 1 or amount_gap > 0.10:
+        if date_gap > MAX_LINK_DAY_GAP or amount_gap > MAX_LINK_AMOUNT_GAP:
             continue
-        left_id, right_id = sorted((str(bill["id"]), str(candidate["id"])))
+        left_id, right_id = sorted((str(row["id"]), str(candidate["id"])))
         links.append({
             "user_id": user["id"],
             "transaction_id": left_id,
             "linked_transaction_id": right_id,
-            "match_type": "csv_receipt",
+            # The stored vocabulary is only two values and the app's types spell
+            # them out, so a manual row reuses them rather than inventing a
+            # third: what the UI actually asks of this field is whether a
+            # RECEIPT took part, and that stays true.
+            "match_type": (
+                "csv_receipt"
+                if "bill" in (row.get("source"), candidate.get("source"))
+                else "csv_csv"
+            ),
             "confidence": 1,
         })
     if links:
@@ -422,10 +438,9 @@ def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Opt
     receipt_time = (review.get("time") or "").strip()
     # Rename only the display filename — the object-storage key remains stable.
     # This makes later review easy to find when the OCR merchant/date was fixed.
-    import re
     original_filename = bill.data[0].get("filename") or "receipt.jpg"
-    extension = os.path.splitext(original_filename)[1] or ".jpg"
-    merchant_slug = re.sub(r"[^A-Za-z0-9]+", "_", merchant).strip("_") or "receipt"
+    extension = photo_extension(original_filename)
+    merchant_slug = slugify(merchant, "receipt")
     date_slug = str(date_value).replace("-", "") or "nodate"
     filename = f"{merchant_slug}_{date_slug}{extension}"
 
@@ -504,9 +519,17 @@ def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Opt
         client.table("Transaction").select("id").eq("user_id", user["id"])
         .eq("source_bill_file_id", file_id).limit(1).execute()
     )
+    # Scoped to receipts, because content_hash is not one formula. A manual
+    # entry hashes date+amount+merchant with no delimiters, and so does a
+    # receipt whose time OCR could not read — so "$38.12 at Walmart on the 29th"
+    # typed into chat produces the SAME digest as the photographed receipt for
+    # it. Unscoped, this found that manual row, took the duplicate branch, and
+    # returned without writing: the line items, the tax breakdown and the link
+    # back to the photo were all silently dropped, and the app reported the
+    # receipt as already recorded.
     existing = (
         client.table("Transaction").select("id").eq("user_id", user["id"])
-        .eq("content_hash", content_hash).limit(1).execute()
+        .eq("content_hash", content_hash).eq("source", "bill").limit(1).execute()
     )
     tax_breakdown = []
     for rate in sorted({d["tax_rate"] for d in details if d["tax_rate"] > 0}):
@@ -547,6 +570,28 @@ def _verify_receipt_row(user: dict, file_id: str, review: Dict[str, Any]) -> Opt
     return {"id": tx_id}
 
 
+async def link_manual_transaction(user: dict, transaction_id: str) -> int:
+    """Reconcile a just-confirmed manual entry against what is already stored.
+
+    A purchase the user described in chat is frequently the FIRST record of one
+    the bank will export weeks later; a cash payment is the case where no second
+    record ever arrives. Both are ordinary, and only the first needs reconciling
+    — but nothing was doing it, so a manual entry and its eventual statement row
+    stayed two unlinked transactions and the money was counted twice with no
+    mechanism that could ever notice.
+
+    Never raises: a link is supplementary, and a transaction the user just
+    confirmed must not be lost because reconciliation was briefly unavailable.
+    """
+    try:
+        return await asyncio.to_thread(
+            _link_to_existing, user, transaction_id, ("csv", "bill")
+        )
+    except Exception as e:  # noqa: BLE001 - see docstring
+        logger.warning("Could not link manual transaction %s: %s", transaction_id, e)
+        return 0
+
+
 async def verify_receipt(user: dict, file_id: str, review: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     result = await asyncio.to_thread(_verify_receipt_row, user, file_id, review)
     if not result:
@@ -554,7 +599,9 @@ async def verify_receipt(user: dict, file_id: str, review: Dict[str, Any]) -> Op
     try:
         # A receipt may be verified after its bank CSV was already imported.
         # Reconcile in that direction as well as during CSV ingestion.
-        await asyncio.to_thread(_link_verified_bill_transaction, user, result["id"])
+        await asyncio.to_thread(
+            _link_to_existing, user, result["id"], ("csv", "manual")
+        )
     except Exception as e:
         # A link is supplementary: never make a successfully reviewed receipt
         # fail to save because reconciliation was temporarily unavailable.

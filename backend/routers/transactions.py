@@ -126,7 +126,13 @@ async def create_transaction(
 
     user_id = user["id"]
 
-    # Content hash (same algorithm as money_rag.py _ingest_csv)
+    # NOT the CSV algorithm, despite what this comment used to claim.
+    # _ingest_csv keys on the bank's verbatim description plus an
+    # occurrence index; there is no description to key on here and no
+    # index, so two identical manual entries on one day collapse to one
+    # row via the upsert below. It is also close enough to the RECEIPT
+    # formula to collide with it: a timeless receipt for a single-word
+    # merchant hashes identically to the same purchase entered by hand.
     date_str = body.trans_date.isoformat()
     amount_str = str(round(body.amount, 2))
     # split() on an all-whitespace name yields [], so index only when non-empty —
@@ -155,33 +161,30 @@ async def create_transaction(
         [record], on_conflict="user_id,content_hash"
     ).execute()
 
-    if result.data:
-        row = result.data[0]
-        return TransactionResponse(
-            id=row["id"],
-            description=row["description"],
-            amount=float(row["amount"]),
-            trans_date=str(row["trans_date"]),
-            category=row.get("category", "Uncategorized"),
-            merchant_name=row.get("merchant_name"),
+    row = result.data[0] if result.data else None
+    if row is None:
+        # Fallback: fetch by hash if upsert didn't return data
+        fetch = (
+            sb.table("Transaction")
+            .select("*")
+            .eq("content_hash", content_hash)
+            .eq("user_id", user_id)
+            .execute()
         )
+        row = fetch.data[0] if fetch.data else None
+    if row is None:
+        raise HTTPException(status_code=500, detail="Transaction insert returned no data")
 
-    # Fallback: fetch by hash if upsert didn't return data
-    fetch = (
-        sb.table("Transaction")
-        .select("*")
-        .eq("content_hash", content_hash)
-        .eq("user_id", user_id)
-        .execute()
+    # The bank may export this same purchase weeks from now. Reconcile against
+    # what is already stored so the pair collapses to one row rather than being
+    # counted twice — CSV ingestion does the same in the other direction.
+    await transaction_service.link_manual_transaction(user, str(row["id"]))
+
+    return TransactionResponse(
+        id=row["id"],
+        description=row["description"],
+        amount=float(row["amount"]),
+        trans_date=str(row["trans_date"]),
+        category=row.get("category", "Uncategorized"),
+        merchant_name=row.get("merchant_name"),
     )
-    if fetch.data:
-        row = fetch.data[0]
-        return TransactionResponse(
-            id=row["id"],
-            description=row["description"],
-            amount=float(row["amount"]),
-            trans_date=str(row["trans_date"]),
-            category=row.get("category", "Uncategorized"),
-            merchant_name=row.get("merchant_name"),
-        )
-    raise HTTPException(status_code=500, detail="Transaction insert returned no data")

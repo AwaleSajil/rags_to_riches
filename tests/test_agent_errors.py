@@ -84,3 +84,46 @@ def test_running_out_of_steps_is_not_retried():
 
 def test_a_real_provider_outage_is_still_retried():
     assert _is_transient(Exception("503 Service Unavailable"))
+
+
+# --- the deduped view --------------------------------------------------------
+#
+# A receipt and the bank line for the same purchase are two rows on purpose.
+# The mobile list has always collapsed them before summing; the agent writes its
+# own SQL and had nothing but one sentence of schema prose between it and a
+# doubled total. Migration 041 makes the correct query the obvious one, which
+# only works if the guard lets the agent run it and the schema doc names it.
+
+def test_the_agent_may_query_the_deduped_view():
+    """A rejected query would send the agent back to the table that double counts."""
+    from backend.sql_guard import validate_select
+
+    user_id = "11111111-1111-1111-1111-111111111111"
+    validate_select(
+        'SELECT category, SUM(amount) AS total FROM "TransactionDeduped" '
+        f"WHERE user_id = '{user_id}' GROUP BY category",
+        user_id,
+    )
+
+
+def test_the_schema_doc_sends_totals_to_the_view():
+    """The agent only knows what this string tells it."""
+    from mcp_server import get_schema_info
+
+    doc = get_schema_info()
+    assert '"TransactionDeduped"' in doc
+    # Naming it is not enough — it has to say which one to reach for.
+    assert "USE THIS" in doc
+
+
+def test_the_view_is_not_offered_as_a_place_to_write():
+    """It is a view; an INSERT against it must fail the guard like any other."""
+    import pytest as _pytest
+
+    from backend.sql_guard import validate_select
+
+    user_id = "11111111-1111-1111-1111-111111111111"
+    with _pytest.raises(Exception):
+        validate_select(
+            f"INSERT INTO \"TransactionDeduped\" (user_id) VALUES ('{user_id}')", user_id
+        )

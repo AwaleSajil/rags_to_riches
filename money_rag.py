@@ -24,6 +24,17 @@ from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from backend.vector_db_client import get_vector_client
 from backend.services import stream_gate as markers
+from backend.services.purchase_match import (
+    MAX_LINK_AMOUNT_GAP,
+    MAX_LINK_DAY_GAP,
+    csv_row_hash,
+    csv_row_signature,
+    has_key,
+    name_match,
+    row_keys,
+)
+from backend.services.upload_utils import content_type_for, is_image
+from backend.services.naming import photo_extension, slugify
 
 # Import specific embeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -76,19 +87,10 @@ def _chunk_text(chunk) -> str:
 
 
 
-# Bank posting dates slip by a day, and a receipt total can round against the
-# statement by a penny or two. Wider than this starts matching purchases that
-# genuinely happened separately.
-MAX_LINK_DAY_GAP = 1
-MAX_LINK_AMOUNT_GAP = 0.10
-# Shorter names identify nothing: "bp", "atm" and "h&m" would match half a
-# statement between them.
-MIN_MERCHANT_KEY = 4
-
-
-def _merchant_key(row: dict) -> str:
-    value = str(row.get("merchant_name") or row.get("description") or "").lower()
-    return re.sub(r"[^a-z]", "", value)
+# The whole match rule — the name test and the date/amount windows above —
+# lives in backend/services/purchase_match.py (imported above), shared with the
+# receipt-verified-last direction in transaction_service.py. The two used to
+# carry a copy each and had already drifted apart — see that module's docstring.
 
 
 def pair_same_purchase(rows: List[dict], csv_id: str) -> List[tuple]:
@@ -108,26 +110,31 @@ def pair_same_purchase(rows: List[dict], csv_id: str) -> List[tuple]:
     """
     prepared = []
     for row in rows:
-        key = _merchant_key(row)
-        if len(key) < MIN_MERCHANT_KEY:
+        keys = row_keys(row)
+        if not has_key(keys):
             continue
         try:
             when = pd.to_datetime(row["trans_date"]).date()
             amount = float(row["amount"])
         except (TypeError, ValueError):
             continue
-        prepared.append({"row": row, "key": key, "date": when, "amount": amount})
+        prepared.append({"row": row, "keys": keys, "date": when, "amount": amount})
 
     # Bucketed by date, the tightest filter available, so each new row consults
-    # three buckets instead of the entire history. The merchant key and the
-    # parsed date are computed once per row rather than once per comparison —
-    # they used to sit inside the inner loop, which meant a regex and two date
-    # parses per pair, millions of them on a long history.
+    # three buckets instead of the entire history. The name keys and the parsed
+    # date are computed once per row rather than once per comparison — they used
+    # to sit inside the inner loop, which meant a regex and two date parses per
+    # pair, millions of them on a long history.
     by_date: dict = {}
     for info in prepared:
         if info["row"].get("source_csv_id") == csv_id:
             continue
-        if info["row"].get("source") not in ("csv", "bill"):
+        # "manual" included: a purchase the user described in chat and
+        # confirmed is as real as one off a statement, and when the bank
+        # export arrives later the two are the same money. Left out, that
+        # pair could never be reconciled by anything — no link exists for
+        # the deduped view to act on, so the cost is counted twice forever.
+        if info["row"].get("source") not in ("csv", "bill", "manual"):
             continue
         by_date.setdefault(info["date"], []).append(info)
 
@@ -142,19 +149,18 @@ def pair_same_purchase(rows: List[dict], csv_id: str) -> List[tuple]:
             for other in by_date.get(info["date"] + timedelta(days=offset), []):
                 if str(other["row"]["id"]) == str(info["row"]["id"]):
                     continue
-                # Receipt OCR often drops store numbers and suffixes, so one
-                # normalised name containing the other still counts.
-                if info["key"] not in other["key"] and other["key"] not in info["key"]:
+                strength = name_match(info["keys"], other["keys"])
+                if strength is None:
                     continue
                 amount_gap = abs(info["amount"] - other["amount"])
                 if amount_gap > MAX_LINK_AMOUNT_GAP:
                     continue
                 scored.append((
                     (
-                        abs(offset),                                  # same day first
-                        round(amount_gap, 2),                         # then closest amount
-                        0 if info["key"] == other["key"] else 1,      # then exact name
-                        str(info["row"]["id"]),                       # deterministic tiebreak
+                        abs(offset),                     # same day first
+                        round(amount_gap, 2),            # then closest amount
+                        strength,                        # then the surest name match
+                        str(info["row"]["id"]),          # deterministic tiebreak
                         str(other["row"]["id"]),
                     ),
                     info["row"],
@@ -241,11 +247,16 @@ class MoneyRAG:
         res = q.execute()
         return res.data or []
 
-    def _db_select_in(self, table: str, columns: str, field: str, values_list: list) -> List[dict]:
-        """SELECT rows WHERE field IN (...)."""
+    def _db_select_in(
+        self, table: str, columns: str, field: str, values_list: list, filters: dict = None
+    ) -> List[dict]:
+        """SELECT rows WHERE field IN (...), optionally narrowed by equality filters."""
         if not values_list:
             return []
-        res = self.supabase.table(table).select(columns).in_(field, values_list).execute()
+        q = self.supabase.table(table).select(columns).in_(field, values_list)
+        for k, v in (filters or {}).items():
+            q = q.eq(k, v)
+        res = q.execute()
         return res.data or []
 
     def _db_upsert(self, table: str, records: List[dict], conflict_key: str = None):
@@ -273,26 +284,98 @@ class MoneyRAG:
             q = q.eq(k, v)
         q.execute()
 
-    def _link_new_csv_transactions(self, csv_id: str):
+    def _known_merchant_names(self, descriptions: List[str]) -> dict:
+        """Names this user's earlier uploads already gave these descriptions.
+
+        `merchant_name` is generated by the enrichment model, one call per
+        upload, so the same statement line comes back named differently each
+        time — "Credit Card Payment" in one export, "Online Payment" in the
+        next. Nothing downstream expects that: linking, grouping and search all
+        assume one merchant has one name.
+
+        Reusing the stored name makes the mapping stable by construction rather
+        than by hoping the model repeats itself, and skips an LLM call for every
+        description already seen. Only genuinely new descriptions reach the
+        model at all.
+        """
+        if not descriptions:
+            return {}
+
+        rows = []
+        # Chunked smaller than the content-hash lookup below: these go into the
+        # same URL-encoded IN clause, and a statement description is both longer
+        # than a hash and full of characters that encode to three bytes each.
+        # A chunk that fails costs its own descriptions an LLM call, not the
+        # whole file's — one description postgrest cannot quote should not undo
+        # the consistency of every other row in the upload.
+        for i in range(0, len(descriptions), 50):
+            try:
+                rows.extend(self._db_select_in(
+                    "Transaction", "description,merchant_name,enriched_info",
+                    "description", descriptions[i:i + 50],
+                    filters={"user_id": self.user_id},
+                ))
+            except Exception as e:
+                logger.warning("Merchant name lookup failed for one batch: %s", e)
+
+        # A description may already carry several names, from uploads made
+        # before this lookup existed. The most-used one wins, alphabetical on a
+        # tie, so the choice is stable across runs rather than dependent on
+        # whichever row the database happened to return first.
+        tally: dict = {}
+        for row in rows:
+            name = row.get("merchant_name")
+            if not row.get("description") or not name:
+                continue
+            entry = tally.setdefault(row["description"], {})
+            info = row.get("enriched_info") or ""
+            count, best_info = entry.get(name, (0, ""))
+            entry[name] = (count + 1, best_info or info)
+
+        known = {}
+        for description, names in tally.items():
+            name, (_, info) = min(names.items(), key=lambda kv: (-kv[1][0], kv[0]))
+            known[description] = {"merchant_name": name, "enriched_info": info}
+        if known:
+            logger.info("Reusing %d merchant name(s) from earlier uploads", len(known))
+        return known
+
+    def _link_new_csv_transactions(self, csv_id: str) -> List[dict]:
         """Record the pairings found by `pair_same_purchase` as TransactionLinks.
 
         Links, never merges or deletes: a bank statement line and a receipt are
         both durable records of one purchase and neither is safe to discard.
+
+        Returns one summary per link created, so the upload screen can say how
+        many rows of this file already existed elsewhere. Without that the
+        overlap is invisible at upload time: the transactions list quietly
+        collapses each linked pair to a single row, so a statement re-exported
+        with a week of overlap looks like it imported fewer rows than it had.
         """
         if not csv_id:
-            return
+            return []
         columns = "id,trans_date,amount,merchant_name,description,enriched_info,source,source_csv_id"
         rows = self._db_select("Transaction", columns, {"user_id": self.user_id})
 
         links = []
+        summaries = []
         for new_row, other in pair_same_purchase(rows, csv_id):
             left_id, right_id = sorted((str(new_row["id"]), str(other["id"])))
+            match_type = "csv_receipt" if other.get("source") == "bill" else "csv_csv"
             links.append({
                 "user_id": self.user_id,
                 "transaction_id": left_id,
                 "linked_transaction_id": right_id,
-                "match_type": "csv_receipt" if other.get("source") == "bill" else "csv_csv",
+                "match_type": match_type,
                 "confidence": 1,
+            })
+            # Described from the newly uploaded row: that is the one the user
+            # just handed over and expects to see accounted for.
+            summaries.append({
+                "date": str(new_row.get("trans_date") or ""),
+                "merchant": new_row.get("merchant_name") or new_row.get("description") or "",
+                "amount": new_row.get("amount"),
+                "match_type": match_type,
             })
             # CSV enrichment carries a useful merchant description. When it is
             # linked to a receipt that has not been deep-enriched, hand it over
@@ -312,43 +395,55 @@ class MoneyRAG:
                 "TransactionLink", links,
                 conflict_key="user_id,transaction_id,linked_transaction_id",
             )
+        return summaries
 
     async def setup_session(self, uploaded_files: List[dict]):
         """Ingest CSVs and extract photo drafts for the user to review.
 
-        Returns (duplicates, review_items) where review_items is
+        Returns (duplicates, review_items, links) where review_items is
         [{"file_id": ..., "kind": "receipt"|"price_tag"|"unknown"}] — the caller
         routes each photo to the matching review screen, or to the "which is
         this?" prompt when the model could not tell.
+
+        `duplicates` and `links` are two different overlaps and are reported
+        separately: a duplicate is the same row arriving again and being merged
+        away, a link is a row that survives alongside an existing record of the
+        same purchase.
         """
         # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
         all_duplicates = []
+        all_links = []
         review_items = []
         has_committed_transactions = False
         committed_csv_ids = []
         for file_info in uploaded_files:
             file_path = file_info["path"]
             file_name = os.path.basename(file_path)
-            ext = file_path.lower().split('.')[-1]
             try:
-                if ext in ['png', 'jpg', 'jpeg']:
+                # The same routing rule the upload route used to decide which
+                # table this row went in. Anything not an image is handed to the
+                # CSV parser, so the two must agree or a file is filed as one
+                # kind and parsed as the other.
+                if is_image(file_path):
                     # First value is the draft, not duplicates — a photo cannot
                     # duplicate anything until it is reviewed, and dedup happens
                     # at verify time against content_hash.
                     _, kind = await self._ingest_bill(file_path, file_info.get("file_id"))
-                    dups = []
+                    dups, links = [], []
                     if file_info.get("file_id"):
                         review_items.append({
                             "file_id": str(file_info["file_id"]),
                             "kind": kind,
                         })
                 else:
-                    dups = await self._ingest_csv(file_path, file_info.get("file_id"))
+                    dups, links = await self._ingest_csv(file_path, file_info.get("file_id"))
                     has_committed_transactions = True
                     if file_info.get("file_id"):
                         committed_csv_ids.append(str(file_info["file_id"]))
                 if dups:
                     all_duplicates.extend(dups)
+                if links:
+                    all_links.extend(links)
             except Exception as e:
                 raise RuntimeError(f"Failed to ingest '{file_name}': {e}") from e
 
@@ -372,7 +467,7 @@ class MoneyRAG:
                 self._emit_progress("embedding", 1, 1, "Vector rebuild complete")
             except Exception as e:
                 raise RuntimeError(f"Failed to sync to vector store: {e}") from e
-        return all_duplicates, review_items
+        return all_duplicates, review_items, all_links
 
     def _emit_progress(self, stage: str, total: int, done: int, detail: str = ""):
         """Emit a progress update as a JSON line to stderr for the parent process to parse."""
@@ -472,8 +567,16 @@ class MoneyRAG:
         # --- Async Enrichment Step (batched for speed) ---
         unique_descriptions = standard_df['description'].unique().tolist()
         total_unique = len(unique_descriptions)
+        # Descriptions this user has uploaded before keep the name they were
+        # already given. Seeded into the same per-run cache the batches consult,
+        # so a description found here never reaches the model.
+        self.merchant_cache.update(self._known_merchant_names(unique_descriptions))
         self._emit_progress("enriching", total_unique, 0, f"{total_unique} unique merchants to enrich")
-        logger.info("Enriching %d unique descriptions for %s", total_unique, filename)
+        logger.info(
+            "Enriching %d unique descriptions for %s (%d already named)",
+            total_unique, filename,
+            sum(1 for d in unique_descriptions if d in self.merchant_cache),
+        )
 
         sem = asyncio.Semaphore(15)  # Higher concurrency for faster enrichment
         enriched_count = 0
@@ -481,6 +584,12 @@ class MoneyRAG:
         # Batch enrichment prompt — process up to 10 descriptions at once
         batch_extract_prompt = ChatPromptTemplate.from_template("""
 You are a financial data assistant. For each transaction description below, extract the clean merchant name and a one-sentence description of the business.
+
+Take the merchant name from the words in the description itself — strip store
+numbers, phone numbers, city/state codes and payment-processor prefixes, and do
+not substitute a parent company, a category, or a synonym. Where the description
+names no merchant, describe what it is in the plainest words available. The same
+description must always produce the same name.
 
 Transaction descriptions:
 {descriptions_json}
@@ -579,25 +688,21 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         self._emit_progress("saving", total_rows, 0, "Saving transactions to database")
         records = json.loads(standard_df.to_json(orient='records'))
 
-        # Calculate content_hash and source for deduplication.
-        def base_sig(row):
-            date_str = str(row['trans_date']).strip()
-            amount_str = str(round(float(row['amount']), 2))
-            words = str(row.get('merchant_name', row['description'])).lower().strip().split()
-            merch = ''.join(c for c in (words[0] if words else "") if c.isalnum())
-            # The source file id makes every CSV row durable. A later CSV export
-            # can be linked to it, but must never overwrite or remove it.
-            return f"{csv_id or filename}|{date_str}|{amount_str}|{merch}"
-
-        # An occurrence counter (in file order) distinguishes genuinely-distinct rows
-        # that share date+amount+merchant (e.g. two $5 coffees the same day), while
-        # staying stable when the SAME file is re-uploaded so real re-uploads still dedup.
+        # content_hash identifies the PURCHASE, and the rule lives in
+        # purchase_match alongside the rest of it — the backfill script has to
+        # reproduce it byte for byte over rows written before it changed, and a
+        # second copy of this formula is precisely how the two would drift.
+        #
+        # The counter is per file, which is what makes it mean "never dedup
+        # within one export, only across them"; see csv_row_hash.
         occ = {}
         for r in records:
-            sig = base_sig(r)
+            sig = csv_row_signature(r['trans_date'], r['amount'], r.get('description'))
             n = occ.get(sig, 0)
             occ[sig] = n + 1
-            r['content_hash'] = hashlib.sha256(f"{sig}#{n}".encode()).hexdigest()
+            r['content_hash'] = csv_row_hash(
+                r['trans_date'], r['amount'], r.get('description'), n
+            )
             r['source'] = 'csv'
 
         # Detect duplicates before upserting
@@ -605,18 +710,37 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         existing_hashes = set()
         for i in range(0, len(hashes), 100):
             batch_hashes = hashes[i:i+100]
-            existing_rows = self._db_select_in("Transaction", "content_hash", "content_hash", batch_hashes)
+            existing_rows = self._db_select_in(
+                "Transaction", "content_hash", "content_hash", batch_hashes,
+                # Rows are per-user anyway under RLS, but a receipt already
+                # verified for this purchase must not suppress the bank's own
+                # record of it — those two are LINKED, never deduplicated.
+                filters={"user_id": self.user_id, "source": "csv"},
+            )
             existing_hashes.update(row['content_hash'] for row in existing_rows)
 
         duplicates = [
-            {"date": r['trans_date'], "merchant": r.get('merchant_name', r.get('description', '')), "amount": r['amount']}
+            {"date": r['trans_date'],
+             "merchant": r.get('merchant_name') or r.get('description') or "",
+             "amount": r['amount']}
             for r in records if r['content_hash'] in existing_hashes
         ]
 
+        # SKIPPED, not upserted over. Writing the duplicate would carry its
+        # `source_csv_id` onto the row already stored, handing ownership to the
+        # newer file — and `delete_file` removes transactions by source_csv_id,
+        # so deleting the overlapping export would then delete purchases that
+        # arrived with the first one. The stored row is already correct; the
+        # only thing the second copy has to do is not overwrite it.
+        fresh = [r for r in records if r['content_hash'] not in existing_hashes]
+
         batch_size = 100
-        saved_rows = 0
-        for i in range(0, len(records), batch_size):
-            batch = records[i:i + batch_size]
+        # Seeded with the rows being skipped, so the bar still reaches the row
+        # count the user was shown at parse time. Counting only what is written
+        # would leave a half-finished bar on the upload that worked perfectly.
+        saved_rows = len(records) - len(fresh)
+        for i in range(0, len(fresh), batch_size):
+            batch = fresh[i:i + batch_size]
             try:
                 self._db_upsert("Transaction", batch, conflict_key="user_id,content_hash")
             except Exception as e:
@@ -641,14 +765,15 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             saved_rows += len(batch)
             self._emit_progress("saving", total_rows, saved_rows)
 
+        links = []
         try:
-            self._link_new_csv_transactions(csv_id)
+            links = self._link_new_csv_transactions(csv_id)
         except Exception as e:
             # Linking is supplementary; never reject a valid CSV upload if the
             # migration has not yet been applied or matching fails.
             logger.warning("Transaction linking skipped: %s", e)
 
-        return duplicates
+        return duplicates, links
 
     async def _ingest_bill(self, file_path, file_id=None):
         import base64
@@ -656,13 +781,19 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         from langchain_core.messages import HumanMessage
         
         filename = os.path.basename(file_path)
-        self._emit_progress("parsing", 1, 0, f"Reading image: {filename}")
-        
+        # "reading", not "parsing": a photo shares no step with a CSV, and the UI
+        # labels the stage it is given — a picture being sent to the vision model
+        # was announcing itself as "Parsing CSV...".
+        #
+        # total=0 on purpose. There is no measurable progress through a single
+        # vision call, and a determinate bar sitting at 0/1 for ten seconds reads
+        # as a hang; 0 tells the client to run the bar indeterminate instead.
+        self._emit_progress("reading", 0, 0, f"Reading photo: {filename}")
+
         with open(file_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
         
-        ext = file_path.lower().split('.')[-1]
-        mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
+        mime = content_type_for(file_path)
 
         schema = {
             "date": "YYYY-MM-DD",
@@ -714,7 +845,9 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         # Vision extraction — ONE call that both classifies and extracts. A
         # separate classification pass would double latency and cost on the
         # critical path, and the user is standing in a shop waiting.
-        self._emit_progress("parsing", 1, 0, "Reading photo...")
+        self._emit_progress(
+            "reading", 0, 0, f"Looking at {filename} — this takes a few seconds..."
+        )
         prompt = (
             "You are given ONE photo. First decide what it is, then extract accordingly.\n\n"
             "KIND — choose exactly one:\n"
@@ -840,7 +973,7 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             label = f"{first} +{len(tags) - 1} more" if len(tags) > 1 else first
         else:
             label = extracted.get("merchant_name") or "photo"
-        self._emit_progress("parsing", 1, 1, f"Read {kind.replace('_', ' ')}: {label}")
+        self._emit_progress("reading", 1, 1, f"Read {kind.replace('_', ' ')}: {label}")
 
         # Save the extracted draft and what kind of photo this is.
         if file_id:
@@ -918,27 +1051,23 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         """A recognisable display name, so a stored photo is findable later."""
         import re
 
-        extension = os.path.splitext(original)[1] or ".jpg"
-
-        def slug(value, fallback):
-            cleaned = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "")).strip("_")
-            return cleaned or fallback
+        extension = photo_extension(original)
 
         if kind == "price_tag":
             # Named after the first tag; a shelf photo holding several is still
             # one file, and listing them all would blow past any sane filename.
             tags = extracted.get("tags") or [extracted]
             first = tags[0] if isinstance(tags[0], dict) else {}
-            item = slug(first.get("item_description"), "item")
+            item = slugify(first.get("item_description"), "item")
             if len(tags) > 1:
                 item = f"{item}_and_{len(tags) - 1}_more"
-            store = slug(first.get("merchant_name"), "")
+            store = slugify(first.get("merchant_name"))
             # A tag carries no date of its own; when it was seen is the date.
             date_slug = pd.Timestamp.now().strftime("%Y%m%d")
             parts = [p for p in ("pricetag", item, store, date_slug) if p]
             return "_".join(parts)[:120] + extension
 
-        merchant = slug(extracted.get("merchant_name"), "receipt")
+        merchant = slugify(extracted.get("merchant_name"), "receipt")
         date_slug = str(extracted.get("date") or "nodate").replace("-", "")
         time_slug = re.sub(r"[^0-9]", "", str(extracted.get("time") or ""))
         return f"{merchant}_{date_slug}{f'_{time_slug}' if time_slug else ''}{extension}"
@@ -1063,6 +1192,14 @@ Return ONLY a valid JSON array with one object per description, in the same orde
                 "Nothing was bought and no money left the user's account, so NEVER add one to a "
                 "spending total, an average spend, or a category breakdown. They live in the "
                 '"PriceObservation" table and are labelled [SHELF PRICE] in search results.\n'
+                "ONE PURCHASE, TWO ROWS: a photographed receipt and the bank-statement "
+                "line for the same purchase are stored as two rows and reconciled in "
+                '"TransactionLink" — neither is thrown away, because the statement is what '
+                "the bank says and the receipt is what was actually bought. Adding both counts "
+                "that money twice. So for EVERY total, average, count or category breakdown, "
+                'query the "TransactionDeduped" view instead of "Transaction": same columns, '
+                'duplicates already removed. Use "Transaction" itself only when you deliberately '
+                "want a row the view drops, such as showing both records of one purchase.\n"
                 "IS THIS A GOOD PRICE: lead with ONE SHORT SENTENCE of verdict, then list the 2-3 most comparable prices you actually have, one per line, in the shortest form that is still clear: date - price per unit - shop. Showing several is the point: one number reads like a rule, three show the range the user is really choosing within and whether this shelf price is an outlier or ordinary. Add a caveat line only if it would change their decision.\n""Keep it to that. No headings, no 'Price Analysis' / 'Insights' sections, no restating the tag back to them, no paragraph of reasoning around each line — someone standing in a shop needs an answer, not a report. The detailed-analysis rule above does NOT apply here. List ONLY prices for the same product: a near-miss with a similar name is worse than a short list.\n""Use the 'check_price' tool. When the user says the sighting is ALREADY RECORDED, pass record=false — the confirm card saved it before asking you, and saving again stores one sighting twice. Otherwise it records the sighting, "
                 "researches the product, RANKS past purchases by similarity without filtering them, "
                 "converts both sides to the same unit and weights recent evidence more heavily. "

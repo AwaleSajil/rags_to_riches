@@ -12,6 +12,12 @@ export interface DuplicateInfo {
   amount: number;
 }
 
+/** A row that survived ingestion but describes a purchase already on record. */
+export interface LinkInfo extends DuplicateInfo {
+  /** csv_csv: another statement. csv_receipt: a receipt you photographed. */
+  match_type: "csv_csv" | "csv_receipt";
+}
+
 export interface IngestionProgress {
   stage: string;
   total: number;
@@ -41,6 +47,11 @@ export function useFiles() {
   const [visibilityFileId, setVisibilityFileId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
+  // Rows matched to a purchase already on record and linked to it. Both copies
+  // are kept, and the transactions list shows the pair as one row — which is
+  // exactly why it has to be said here: otherwise a statement that overlaps the
+  // previous one looks like it lost the overlapping rows.
+  const [links, setLinks] = useState<LinkInfo[]>([]);
   // Whole files the server refused as already imported. Distinct from
   // `duplicates`, which are individual rows merged during ingestion — these
   // never reached ingestion at all.
@@ -58,6 +69,21 @@ export function useFiles() {
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
+    }
+  }, []);
+
+  // Both terminal statuses carry these. "review" used to drop them on the
+  // floor, so uploading a CSV together with a photo reported neither the merged
+  // duplicates nor the links — the overlap was silent precisely when the upload
+  // was most mixed.
+  const applyOverlaps = useCallback((status: fileService.IngestionStatus) => {
+    if (status.duplicates?.length) {
+      log.info("Duplicates detected", { count: status.duplicates.length });
+      setDuplicates(status.duplicates);
+    }
+    if (status.links?.length) {
+      log.info("Linked transactions detected", { count: status.links.length });
+      setLinks(status.links);
     }
   }, []);
 
@@ -121,10 +147,7 @@ export function useFiles() {
           stopPolling();
           setIsIngesting(false);
           setIngestionProgress(null);
-          if (status.duplicates && status.duplicates.length > 0) {
-            log.info("Duplicates detected", { count: status.duplicates.length });
-            setDuplicates(status.duplicates);
-          }
+          applyOverlaps(status);
           // Reload files now that ingestion is done
           const data = await fileService.listFiles();
           setFiles(data);
@@ -132,6 +155,7 @@ export function useFiles() {
           stopPolling();
           setIsIngesting(false);
           setIngestionProgress(null);
+          applyOverlaps(status);
           // Fall back to the old field so a client running against a
           // not-yet-updated backend still routes its receipts somewhere.
           setReviewItems(
@@ -153,7 +177,7 @@ export function useFiles() {
         log.error("Ingestion poll error", e);
       }
     }, POLL_INTERVAL_MS);
-  }, [stopPolling]);
+  }, [stopPolling, applyOverlaps]);
 
   useEffect(() => {
     return () => stopPolling();
@@ -193,6 +217,7 @@ export function useFiles() {
     setIsUploading(true);
     setError(null);
     setDuplicates([]);
+    setLinks([]);
     setAlreadyImported([]);
     setReviewItems([]);
     try {
@@ -282,6 +307,8 @@ export function useFiles() {
     setAlreadyImported([]);
   }, []);
 
+  const clearLinks = useCallback(() => setLinks([]), []);
+
   return {
     files,
     isLoading,
@@ -292,6 +319,7 @@ export function useFiles() {
     visibilityFileId,
     error,
     duplicates,
+    links,
     alreadyImported,
     reviewItems,
     ingestionProgress,
@@ -301,5 +329,6 @@ export function useFiles() {
     setFileRotation,
     loadFiles,
     clearDuplicates,
+    clearLinks,
   };
 }

@@ -47,6 +47,7 @@ def get_current_user_id() -> str:
 # what to write. test_schema_doc holds the two in step.
 TABLE_NAMES = (
     "Transaction",
+    "TransactionDeduped",
     "TransactionDetail",
     "TransactionLink",
     "BillFile",
@@ -123,6 +124,15 @@ SCHEMA_DOC = dedent(f"""
       - content_hash (TEXT) — deduplication key, not meaningful to report
       - embedding (VECTOR), embedding_model (TEXT) — never select
       - created_at (TIMESTAMPTZ)
+
+    VIEW: {_quote_table("TransactionDeduped")}  — the same columns as
+    {_quote_table("Transaction")} (minus the embedding) with linked duplicates
+    already removed: exactly one row per real-world purchase.
+    USE THIS, NOT {_quote_table("Transaction")}, for every sum, average, count
+    or category breakdown of spending. Querying the table directly counts a
+    photographed receipt and its bank-statement line as two separate purchases.
+    Reach for {_quote_table("Transaction")} only when you specifically want a row
+    this view drops — e.g. showing BOTH records of one purchase.
 
     TABLE: {_quote_table("TransactionDetail")}  — one line on a receipt.
     Only receipts have these; a bank-statement transaction has no line items.

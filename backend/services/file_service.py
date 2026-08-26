@@ -8,7 +8,7 @@ from typing import List
 from backend.dependencies import client_for, get_supabase
 from backend.db_client import get_db_client
 from backend.services.rag_manager import rag_manager
-from backend.services.upload_utils import file_sha256
+from backend.services.upload_utils import content_type_for, file_sha256, is_image
 from backend.services import background, config_service
 
 logger = logging.getLogger("moneyrag.services.file_service")
@@ -99,8 +99,8 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
         for file_info in saved_files:
             local_path = file_info["local_path"]
             filename = file_info["filename"]
-            is_image = filename.lower().endswith((".png", ".jpg", ".jpeg"))
-            folder = "bills" if is_image else "csvs"
+            image = is_image(filename)
+            folder = "bills" if image else "csvs"
             s3_key = f"{user['id']}/{folder}/{filename}"
 
             # Both kinds. A duplicate CSV writes every transaction a second
@@ -111,7 +111,7 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
             # and passes straight through here — that duplicate is caught at
             # verification by receipt_content_hash, which compares what was read
             # rather than the bytes.
-            table = "BillFile" if is_image else "CSVFile"
+            table = "BillFile" if image else "CSVFile"
             content_hash = file_sha256(local_path)
             seen = db.file_by_content_hash(table, user["id"], content_hash)
             if seen:
@@ -130,11 +130,7 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
                 })
                 continue
 
-            content_type = "text/csv"
-            if filename.lower().endswith(".png"):
-                content_type = "image/png"
-            elif filename.lower().endswith((".jpg", ".jpeg")):
-                content_type = "image/jpeg"
+            content_type = content_type_for(filename)
 
             logger.debug(
                 "Uploading '%s' to storage — s3_key=%s, content_type=%s",
@@ -299,12 +295,14 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
 
         if proc.returncode == 0:
             duplicates = []
+            links = []
             review_items = []
             if stdout:
                 for line in reversed(stdout.decode().strip().split("\n")):
                     try:
                         result = json.loads(line)
                         duplicates = result.get("duplicates", [])
+                        links = result.get("links", [])
                         review_items = result.get("review_items", [])
                         if not review_items:
                             # Older worker output, or a deploy mid-flight.
@@ -319,6 +317,10 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
                 "status": "review" if review_items else "complete",
                 "error": None,
                 "duplicates": duplicates,
+                # Rows that overlapped an earlier file and were linked rather
+                # than merged. Reported separately from duplicates: they are
+                # still in the database, just collapsed to one row on screen.
+                "links": links,
                 "review_items": review_items,
                 # Retained for clients that have not picked up review_items yet.
                 "receipt_review_file_ids": [
@@ -327,8 +329,9 @@ async def _run_ingestion_subprocess(user: dict, config: dict, uploaded_files_inf
                 ],
             }
             logger.info(
-                "Background ingestion complete for user_id=%s — PID=%d, %.1fms, %d duplicates",
-                user_id, proc.pid, elapsed_ms, len(duplicates),
+                "Background ingestion complete for user_id=%s — PID=%d, %.1fms, "
+                "%d duplicates, %d linked",
+                user_id, proc.pid, elapsed_ms, len(duplicates), len(links),
             )
             await rag_manager.invalidate(user_id)
         else:
