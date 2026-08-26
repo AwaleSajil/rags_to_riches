@@ -68,7 +68,11 @@ export function CameraCapture({
     setIsTaking(true);
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.8,
+        // Captured lossless-ish, not at 0.8. compressImage re-encodes this
+        // frame before it is uploaded — a 12MP capture is always over
+        // MAX_BYTES — so encoding once here and again there threw away detail
+        // twice to reach the same stored file. What survives is one encode.
+        quality: 1,
       });
       const timestamp = Date.now();
       onCapture(

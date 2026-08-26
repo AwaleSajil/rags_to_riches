@@ -32,7 +32,7 @@ from typing import Optional
 
 from backend.dependencies import client_for, get_supabase
 from backend.services import background, config_service
-from backend.services.upload_utils import file_sha256
+from backend.services.upload_utils import content_type_for, file_sha256
 
 logger = logging.getLogger("moneyrag.services.capture")
 
@@ -174,11 +174,10 @@ def _upload_photo_sync(user: dict, local_path: str, filename: str) -> str:
     client = client_for(user)
     s3_key = f"{user['id']}/bills/{filename}"
 
-    content_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
     client.storage.from_("money-rag-files").upload(
         file=local_path,
         path=s3_key,
-        file_options={"content-type": content_type, "upsert": "true"},
+        file_options={"content-type": content_type_for(filename), "upsert": "true"},
     )
 
     inserted = client.table("BillFile").insert({

@@ -8,6 +8,7 @@ that never happened. "unknown" routes to a one-tap question instead.
 
 import pytest
 
+from backend.services.naming import photo_extension, slugify
 from money_rag import MoneyRAG
 
 split = MoneyRAG._split_classified_photo
@@ -123,3 +124,35 @@ def test_filename_survives_missing_fields():
 
 def test_filename_keeps_the_original_extension():
     assert filename("scan.png", "receipt", {"merchant_name": "X"}).endswith(".png")
+
+
+# --- the shared naming primitives --------------------------------------------
+# Used both here and by the rename that runs after the user corrects a receipt
+# at review, so the same merchant has to slug identically down both paths.
+
+@pytest.mark.parametrize("value,expected", [
+    ("Stop & Shop", "Stop_Shop"),
+    ("  Trader Joe's  ", "Trader_Joe_s"),
+    ("7-Eleven", "7_Eleven"),
+    ("&Co", "Co"),               # no leading underscore
+    ("Co&", "Co"),               # no trailing underscore
+    ("A  ---  B", "A_B"),        # a run collapses to one separator
+])
+def test_slugify_reduces_free_text(value, expected):
+    assert slugify(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, "&&&", "---"])
+def test_slugify_falls_back_when_nothing_survives(value):
+    """A model that returned null, or a name written entirely in punctuation."""
+    assert slugify(value, "receipt") == "receipt"
+    assert slugify(value) == ""
+
+
+def test_photo_extension_preserves_case():
+    """The display name has to keep pointing at the stored key."""
+    assert photo_extension("IMG_0001.JPG") == ".JPG"
+
+
+def test_photo_extension_falls_back_when_there_is_none():
+    assert photo_extension("noextension") == ".jpg"

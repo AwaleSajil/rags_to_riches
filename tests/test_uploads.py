@@ -10,6 +10,7 @@ import io
 import pytest
 
 from backend.routers.files import ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, _safe_filename
+from backend.services.upload_utils import content_type_for, is_image
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -53,9 +54,58 @@ def test_traversal_can_never_escape_the_temp_dir():
 
 
 def test_allowlist_matches_what_the_pipeline_understands():
-    # is_image in file_service keys off exactly these image types; everything
-    # else in the allowlist must be something the CSV path can read.
+    # is_image keys off exactly these image types; everything else in the
+    # allowlist must be something the CSV path can read.
     assert ALLOWED_EXTENSIONS == {".csv", ".png", ".jpg", ".jpeg"}
+
+
+# --- routing and content type ------------------------------------------------
+# One helper each, shared by the upload route, the capture route, and the vision
+# pass. These used to be open-coded at all three, and the copies disagreed on
+# what an unrecognised extension was.
+
+@pytest.mark.parametrize("name,expected", [
+    ("statement.csv", False),
+    ("receipt.png", True),
+    ("receipt.jpg", True),
+    ("receipt.jpeg", True),
+    ("IMG_0001.JPG", True),      # iPhone shouts its extensions
+    ("photo.heic", False),       # blocked upstream; must not route as an image
+    ("noextension", False),
+])
+def test_image_routing_is_case_insensitive(name, expected):
+    assert is_image(name) is expected
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("statement.csv", "text/csv"),
+    ("receipt.png", "image/png"),
+    ("receipt.jpg", "image/jpeg"),
+    ("receipt.jpeg", "image/jpeg"),
+    ("IMG_0001.PNG", "image/png"),
+    ("IMG_0001.JPEG", "image/jpeg"),
+])
+def test_content_type_follows_the_extension(name, expected):
+    assert content_type_for(name) == expected
+
+
+@pytest.mark.parametrize("name", ["photo.heic", "notes.pdf", "noextension"])
+def test_unrecognised_extension_is_not_labelled_an_image(name):
+    """The whole point of centralising this.
+
+    Each old copy invented its own default — the capture path called anything
+    that was not .png a JPEG, the vision path called anything that was not a
+    JPEG a PNG — so a file that slipped past the allowlist was handed to the
+    model under a type it did not have. It is now labelled as what it is.
+    """
+    assert content_type_for(name) == "application/octet-stream"
+    assert not content_type_for(name).startswith("image/")
+
+
+def test_every_allowed_extension_has_a_content_type():
+    """No file the allowlist admits may fall through to the generic default."""
+    for extension in ALLOWED_EXTENSIONS:
+        assert content_type_for(f"x{extension}") != "application/octet-stream"
 
 
 # --- end-to-end through the route -------------------------------------------

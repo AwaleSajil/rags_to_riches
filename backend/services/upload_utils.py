@@ -25,10 +25,56 @@ ALLOWED_EXTENSIONS = frozenset({".csv", ".png", ".jpg", ".jpeg"})
 # sending a CSV there is a client bug, not a user mistake to be accommodated.
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
 
+# One extension → content type mapping for every path that writes a file to
+# storage or hands one to the vision model.
+#
+# It used to be spelled out at each of those call sites, and the copies had
+# already drifted apart: the capture path defaulted an unrecognised extension to
+# image/jpeg while the vision path defaulted the same name to image/png, so one
+# file could be labelled two different things depending on how it arrived.
+CONTENT_TYPES = {
+    ".csv": "text/csv",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+# Unreachable for anything that came through safe_filename, which admits only
+# the extensions above. Deliberately not an image type: a file that reached here
+# by some other route should be refused by whatever receives it rather than
+# mislabelled as a picture, which is exactly what the old per-site defaults did.
+DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
 # Receipts and bank exports are small; this is generous for both and keeps a
 # single request from filling the disk.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def extension_of(filename: str) -> str:
+    """The lowercased extension including its dot, or "" when there is none.
+
+    Lowercased because every comparison in this module is against a lowercase
+    allowlist, and an iPhone hands back `IMG_0001.JPG` often enough that the
+    per-call-site `.lower().endswith(...)` chains this replaces all had to
+    remember it individually.
+    """
+    return os.path.splitext(filename)[1].lower()
+
+
+def is_image(filename: str) -> bool:
+    """Whether this name routes to the image pipeline instead of the CSV parser.
+
+    The routing decision itself, in one place: storage folder, destination
+    table, and content type all follow from it, and a name that answers False
+    here is handed to the CSV parser.
+    """
+    return extension_of(filename) in IMAGE_EXTENSIONS
+
+
+def content_type_for(filename: str) -> str:
+    """The content type to store or transmit this file under."""
+    return CONTENT_TYPES.get(extension_of(filename), DEFAULT_CONTENT_TYPE)
 
 
 def safe_filename(raw: str | None, allowed: frozenset[str] = ALLOWED_EXTENSIONS) -> str:
@@ -46,7 +92,7 @@ def safe_filename(raw: str | None, allowed: frozenset[str] = ALLOWED_EXTENSIONS)
     if not name:
         raise ValueError("A file was uploaded without a usable filename")
 
-    extension = os.path.splitext(name)[1].lower()
+    extension = extension_of(name)
     if extension not in allowed:
         if allowed is IMAGE_EXTENSIONS:
             raise ValueError(f"'{name}' is not an image. Capture a PNG or JPG photo.")
