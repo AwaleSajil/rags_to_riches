@@ -155,6 +155,40 @@ The frontend Space requires one build secret:
 |---|---|
 | `EXPO_PUBLIC_API_URL` | Backend Space URL, e.g. `https://ksmu-rags2riches-backend.hf.space/api/v1` |
 
+### Android app (Play Store)
+
+Build profiles live in `frontend/eas.json`. `eas.json` is strict JSON and takes
+no comments, so the reasoning is here.
+
+```bash
+cd frontend
+npm i -g eas-cli && eas login
+eas init          # first time only: writes extra.eas.projectId into app.config.js
+eas build --platform android --profile production
+```
+
+| Profile | Output | For |
+|---|---|---|
+| `development` | APK, dev client | Emulator. Sets `EXPO_ALLOW_CLEARTEXT=1` so it can reach the backend over plain HTTP. |
+| `preview` | APK | Sideloading a release-configured build onto a real phone. |
+| `production` | AAB | Play upload. |
+
+**Why `EXPO_PUBLIC_API_URL` is pinned in the two release profiles:** without it,
+`src/lib/apiUrl.ts` falls back to `http://10.0.2.2:8000/api/v1` — the Android
+*emulator's* address for the host machine. A release build also has
+`usesCleartextTraffic: false`, so that request is blocked outright. The app would
+install, open, and fail every call with nothing in the UI to explain why. The
+pinned HTTPS URL is what stops a shipped build pointing at a dev machine.
+
+No Supabase keys are needed at build time: when `EXPO_PUBLIC_SUPABASE_*` are
+absent, `src/lib/supabase.ts` fetches them from the backend's
+`/api/v1/public-config`. That is why this file contains no secrets and can be
+committed.
+
+`appVersionSource: "remote"` with `autoIncrement` lets EAS own the Android
+`versionCode`, so two builds can never collide on an upload Play would reject.
+The user-facing `version` stays in `app.config.js`.
+
 ### Single-Container Deployment
 
 ```bash

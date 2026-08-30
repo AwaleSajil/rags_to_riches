@@ -104,7 +104,11 @@ Small, unblocked, and it gets a build in front of testers. With §5 deferred,
       against reality. Upload a CSV, photograph and verify a receipt, then edit
       one line item and confirm the unit and size survive — that is bug #2, and
       it is the one worth seeing.
-- [ ] **`eas.json`** with an Android profile → build → Play internal testing.
+- [~] **`eas.json`** — written (`frontend/eas.json`, three profiles, documented
+      in the README). Remaining: `eas init` (needs your Expo login, writes
+      `extra.eas.projectId`), then
+      `eas build --platform android --profile production` → Play internal
+      testing.
 - [ ] **Create the personal Play account** ($25, one-time) and **start
       recruiting the 12 testers immediately.** The closed test needs them opted
       in *continuously for 14 days*, so it is the longest pole in this list and
