@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delete your R2R account</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1a1a1a; --muted:#5c5c6b; --bg:#faf9f7; --card:#fff; --line:#e4e2dd; --accent:#6366f1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#ececf1; --muted:#a1a1b0; --bg:#141416; --card:#1c1c20; --line:#2c2c33; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:32px 20px; background:var(--bg); color:var(--fg);
+         font:16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:640px; margin:0 auto; }
+  h1 { font-size:1.6rem; margin:0 0 4px; letter-spacing:-0.02em; }
+  h2 { font-size:1.05rem; margin:32px 0 8px; letter-spacing:-0.01em; }
+  .sub { color:var(--muted); margin:0 0 28px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 24px; }
+  ol, ul { padding-left:22px; margin:8px 0; }
+  li { margin:6px 0; }
+  code { background:rgba(127,127,127,.14); padding:1px 6px; border-radius:4px; font-size:.9em; }
+  .note { color:var(--muted); font-size:.9rem; margin-top:28px; padding-top:16px; border-top:1px solid var(--line); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Delete your R2R account</h1>
+  <p class="sub">R2R &mdash; personal finance transaction analysis</p>
+
+  <div class="card">
+    <h2 style="margin-top:0">From inside the app</h2>
+    <ol>
+      <li>Open <strong>R2R</strong> and sign in.</li>
+      <li>Go to the <strong>Settings</strong> tab.</li>
+      <li>Scroll to <strong>Delete account</strong>.</li>
+      <li>Tap <strong>Delete my account</strong>, type your email address to confirm, then tap <strong>Delete forever</strong>.</li>
+    </ol>
+    <p>Your account is deleted immediately and you are signed out. There is no recovery step and no waiting period.</p>
+  </div>
+
+  <h2>What is deleted</h2>
+  <p>Everything. Deleting your account removes:</p>
+  <ul>
+    <li>your login and email address;</li>
+    <li>every bank statement (CSV) you uploaded, and every receipt or price-tag photo;</li>
+    <li>all transactions, line items, price observations, notes and chat history;</li>
+    <li>your saved AI provider API key.</li>
+  </ul>
+
+  <h2>What is kept, and for how long</h2>
+  <p>
+    Nothing that identifies you is kept. Deletion is immediate and permanent, and
+    it is not recoverable by us or by you.
+  </p>
+  <p>
+    Server logs may briefly contain your account identifier as part of ordinary
+    operational records. These contain no financial data, no file contents and no
+    API keys, and they age out on the hosting provider&rsquo;s normal retention
+    schedule.
+  </p>
+  <p>
+    Note that R2R sends transaction descriptions and receipt images to the AI
+    provider whose API key you configured (for example Google or OpenAI) in order
+    to read and categorise them. Anything that provider retains is governed by
+    <em>their</em> policy and your account with them, and deleting your R2R
+    account does not reach it. To remove that data, contact your AI provider
+    directly.
+  </p>
+
+  <h2>If you cannot sign in</h2>
+  <p>
+    Email <a href="mailto:{{SUPPORT_EMAIL}}">{{SUPPORT_EMAIL}}</a>
+    from the address on the account, asking for deletion. We will confirm and
+    delete it manually.
+  </p>
+
+  <p class="note">
+    This page exists so account deletion can be requested without installing the
+    app, as required by Google Play&rsquo;s data deletion policy.
+  </p>
+</main>
+</body>
+</html>

@@ -71,6 +71,63 @@ python scripts/encrypt_existing_api_keys.py          # dry run
 python scripts/encrypt_existing_api_keys.py --apply
 ```
 
+### Account deletion (required by both app stores)
+
+| Variable | Description |
+|---|---|
+| `SUPABASE_SERVICE_KEY` | Supabase **service_role** key. Required for `DELETE /api/v1/auth/account`. |
+| `SUPPORT_EMAIL` | Contact address shown on `/account-deletion`, `/privacy` and `/terms`. |
+| `PUBLISHER_NAME` | The party named as responsible for user data in the privacy policy. |
+
+### Policy pages
+
+Three public pages are served from the API, so their URLs exist wherever the
+backend does and cannot drift out of step with what the app actually does:
+
+| Path | Required by |
+|---|---|
+| `/privacy` | Apple and Play both refuse a listing without a resolving privacy policy URL |
+| `/terms` | Apple expects an EULA; Play expects it in the listing |
+| `/account-deletion` | Play requires this to be readable **without** installing the app |
+
+They are plain HTML in `backend/pages/`, editable without touching code.
+`PUBLISHER_NAME` and `SUPPORT_EMAIL` are substituted at request time; anything
+unset renders as a visible `[not configured]` marker, and a test asserts no
+`{{placeholder}}` can survive to a served page.
+
+**Before publishing**, set both variables and fill in the governing-law
+jurisdiction in `backend/pages/terms.html` — it is deliberately left as a loud
+red marker rather than defaulted, because it is a real legal choice.
+
+`tests/test_policy_pages.py` also holds the policy to the code: it fails if
+`deep_enrichment` stops defaulting to off, if an analytics or crash-reporting
+SDK appears in `frontend/package.json`, or if the capture route grows a
+latitude/longitude parameter — each of which would make a specific sentence on
+the privacy page untrue.
+
+Apple guideline 5.1.1(v) and Google Play's deletion policy both require an app
+that offers account creation to offer account *deletion* from inside the app —
+clearing your data, or writing to support, does not satisfy either. Play
+additionally requires a deletion page reachable **without** installing the app;
+this backend serves one at `/account-deletion`, so the URL to give the Play
+Console is `https://<your-backend>/account-deletion`.
+
+Deleting the `auth.users` row is what makes it a real deletion: `"User".id`
+references it `ON DELETE CASCADE` and every user-scoped table cascades from
+`"User"`, so one delete takes all of it. Object storage does not cascade and is
+cleared explicitly first — if that fails the account survives, so the user can
+retry, rather than losing their files with nothing left pointing at them.
+
+The anon key cannot delete a user, so this needs the service key. **It bypasses
+row-level security**, so it is deliberately kept apart from `SUPABASE_KEY`: it
+is reachable only through `dependencies.admin_client()` (grep that name to find
+every place RLS is skipped), and `tests/test_production_guards.py` asserts it
+never reaches `/public-config`.
+
+Without it the app still boots and logs a warning at startup; "Delete my
+account" answers 503 with a message telling the user to contact support. Set it
+before submitting a build.
+
 ### Database
 
 | Variable | Description |

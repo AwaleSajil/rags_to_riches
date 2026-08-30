@@ -5,12 +5,14 @@ import {
   ScrollView,
   KeyboardAvoidingView,
   Platform,
+  Linking,
 } from "react-native";
 import { Text, TextInput, Button, Snackbar, SegmentedButtons } from "react-native-paper";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "../src/providers/AuthProvider";
 import { GlassCard } from "../src/components/GlassCard";
 import { colors, typography, spacing } from "../src/styles/theme";
+import { LEGAL_URLS } from "../src/lib/apiUrl";
 import { createLogger } from "../src/lib/logger";
 
 const log = createLogger("LoginScreen");
@@ -112,6 +114,21 @@ export default function LoginScreen() {
           </Button>
         </GlassCard>
 
+        {/* Shown at the point of account creation, which is where consent to
+            these terms is actually given. Both stores expect the policy to be
+            reachable before someone hands over their financial records. */}
+        <Text style={styles.legal}>
+          By continuing you agree to our{" "}
+          <Text style={styles.legalLink} onPress={() => Linking.openURL(LEGAL_URLS.terms)}>
+            Terms of Service
+          </Text>{" "}
+          and{" "}
+          <Text style={styles.legalLink} onPress={() => Linking.openURL(LEGAL_URLS.privacy)}>
+            Privacy Policy
+          </Text>
+          .
+        </Text>
+
         <Text style={styles.footer}>Secured by Supabase Auth</Text>
       </ScrollView>
 
@@ -185,5 +202,17 @@ const styles = StyleSheet.create({
     ...typography.caption,
     color: colors.textTertiary,
     textAlign: "center",
+  },
+  legal: {
+    ...typography.caption,
+    color: colors.textTertiary,
+    textAlign: "center",
+    marginTop: spacing.lg,
+    marginBottom: spacing.xs,
+    paddingHorizontal: spacing.md,
+  },
+  legalLink: {
+    color: colors.primary,
+    textDecorationLine: "underline",
   },
 });

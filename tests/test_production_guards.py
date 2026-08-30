@@ -278,3 +278,100 @@ def test_a_value_error_still_maps_to_its_own_status(client, monkeypatch):
     monkeypatch.setattr(file_service, "delete_file", _missing)
     response = client.delete("/api/v1/files/abc?type=bill")
     assert response.status_code == 404
+
+
+# --- the privileged key must never leave the server -------------------------
+#
+# SUPABASE_SERVICE_KEY bypasses every RLS policy in the database. It was added
+# for account deletion, which both stores require, and it now sits in the same
+# Settings object as the anon key that /public-config hands to anonymous
+# callers. The two must never be confused, so the boundary is tested rather
+# than trusted.
+
+def test_public_config_never_serves_the_service_key(anon_client, monkeypatch):
+    from backend.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "sb_secret_do_not_leak_me")
+    try:
+        body = anon_client.get("/api/v1/public-config").json()
+        assert "sb_secret_do_not_leak_me" not in str(body)
+        # And it still serves the key the frontend legitimately needs.
+        assert body["supabase_anon_key"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_the_service_key_is_not_reachable_through_the_ordinary_client_helpers():
+    """Only admin_client() may hold it, so `grep admin_client` finds every
+    place RLS is skipped. get_supabase/client_for must stay on the anon key."""
+    from backend.config import get_settings
+    from backend.dependencies import client_for, get_supabase
+
+    service = "sb_secret_do_not_leak_me"
+    anon = get_settings().SUPABASE_KEY
+    assert anon != service
+    for client in (get_supabase(), get_supabase("tok"), client_for({"access_token": "tok"})):
+        assert service not in str(getattr(client, "supabase_key", ""))
+
+
+# --- telling the operator WHICH wrong key they pasted -------------------------
+#
+# The dashboard shows the publishable key prominently and hides the secret one
+# behind a Reveal or a Create, so reaching for the wrong one is the ordinary
+# mistake. This actually happened during setup. "Not a service key" would send
+# someone back to a page where everything looks like what they already copied,
+# so the check names the specific key instead.
+
+@pytest.mark.parametrize("key,expected", [
+    ("sb_publishable_" + "a" * 30, "publishable"),
+    ("sbp_" + "a" * 40, "personal access token"),
+])
+def test_a_wrong_key_is_named_not_just_rejected(monkeypatch, caplog, key, expected):
+    import logging
+
+    from backend.config import get_settings, verify_service_key_is_privileged
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", key)
+    try:
+        with caplog.at_level(logging.ERROR, logger="moneyrag.config"):
+            verify_service_key_is_privileged()
+        assert expected in caplog.text.lower()
+        # And it says where to get the right one.
+        assert "sb_secret_" in caplog.text or "service_role" in caplog.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_a_real_secret_key_is_accepted(monkeypatch, caplog):
+    import logging
+
+    from backend.config import get_settings, verify_service_key_is_privileged
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "sb_secret_" + "a" * 30)
+    try:
+        with caplog.at_level(logging.INFO, logger="moneyrag.config"):
+            verify_service_key_is_privileged()
+        assert "account deletion is available" in caplog.text.lower()
+        assert "ERROR" not in caplog.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_a_missing_key_warns_rather_than_erroring(monkeypatch, caplog):
+    """An existing deploy must still boot; it just cannot delete accounts."""
+    import logging
+
+    from backend.config import get_settings, verify_service_key_is_privileged
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "")
+    try:
+        with caplog.at_level(logging.WARNING, logger="moneyrag.config"):
+            verify_service_key_is_privileged()
+        assert "not set" in caplog.text.lower()
+        assert "before submitting" in caplog.text.lower()
+    finally:
+        get_settings.cache_clear()

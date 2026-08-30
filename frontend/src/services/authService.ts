@@ -98,3 +98,30 @@ export async function logout(): Promise<void> {
   await supabase.auth.signOut();
   log.info("Supabase signOut complete");
 }
+
+/**
+ * Permanently delete this account and everything in it.
+ *
+ * Required to exist inside the app by both stores — Apple guideline 5.1.1(v)
+ * and Play's account deletion policy — and required to delete the ACCOUNT, not
+ * merely its contents.
+ *
+ * The server signs out afterwards by removing the auth user, so the local
+ * session is already dead by the time this returns; signing out locally is
+ * still done so the app does not sit on a token it will never be able to
+ * refresh.
+ */
+export async function deleteAccount(): Promise<void> {
+  log.info("Account deletion requested");
+  // Generous: this clears object storage and cascades every table.
+  await apiJson("/auth/account", { method: "DELETE", timeout: 30000 });
+  log.info("Account deleted — clearing local session");
+  try {
+    const supabase = await getSupabase();
+    await supabase.auth.signOut();
+  } catch (e) {
+    // The account is already gone; a failed local sign-out just means a dead
+    // token in storage, which the next refresh discards anyway.
+    log.warn("Local sign-out after deletion failed", e);
+  }
+}

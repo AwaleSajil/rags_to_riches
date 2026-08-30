@@ -64,3 +64,23 @@ function getApiUrl(): string {
 }
 
 export const API_URL = getApiUrl();
+
+/**
+ * The site root, for pages served beside the API rather than under it.
+ *
+ * The privacy policy, terms and deletion instructions live at the origin root
+ * (`/privacy`, not `/api/v1/privacy`) because both stores want URLs a person
+ * can open in a browser, and Play requires the deletion page to work without
+ * the app at all. Derived from API_URL rather than configured separately so
+ * they cannot point at different deployments.
+ *
+ * On web API_URL is the relative "/api/v1", which reduces to "" — leaving
+ * "/privacy", correctly same-origin.
+ */
+export const SITE_URL = API_URL.replace(/\/api\/v1\/?$/, "");
+
+export const LEGAL_URLS = {
+  privacy: `${SITE_URL}/privacy`,
+  terms: `${SITE_URL}/terms`,
+  deletion: `${SITE_URL}/account-deletion`,
+};

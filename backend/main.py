@@ -8,7 +8,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from backend.config import allowed_origins, verify_public_key_is_not_privileged
+from backend.config import (
+    allowed_origins,
+    verify_public_key_is_not_privileged,
+    verify_service_key_is_privileged,
+)
 from backend.crypto import verify_encryption_key
 from backend.routers import corrections, auth, captures, config_router, files, chat, prices, transactions, conversations
 from backend.services.rag_manager import rag_manager, run_janitor
@@ -60,6 +64,9 @@ async def lifespan(app: FastAPI):
     verify_encryption_key()
     # And refuse to start if the key the frontend is handed can bypass RLS.
     verify_public_key_is_not_privileged()
+    # Says out loud whether account deletion — which both stores require — can
+    # actually run on this deployment.
+    verify_service_key_is_privileged()
     logger.debug("Registered routers: auth, config, files, chat")
 
     # Releases idle RAG instances and abandoned photo captures. Without it both
@@ -229,6 +236,81 @@ async def public_config():
         "supabase_url": s.SUPABASE_URL,
         "supabase_anon_key": s.SUPABASE_KEY,
     }
+
+
+# The legal and policy pages, served from the API so their URLs exist wherever
+# the backend does. Both stores require a reachable privacy policy URL, and Play
+# additionally requires the deletion page to be readable WITHOUT installing the
+# app — which rules out putting any of this behind the login.
+#
+# Kept as HTML files rather than strings in Python so they can be edited (and
+# reviewed by someone who is not a programmer) without touching code.
+_PAGES = {
+    "account-deletion": "account_deletion.html",
+    "privacy": "privacy.html",
+    "terms": "terms.html",
+}
+
+
+def _render_page(slug: str) -> str:
+    """One policy page, with the deployment's own details filled in.
+
+    Placeholders are substituted rather than hard-coded so the same file serves
+    every deployment. An UNSET placeholder renders as a visible admission that
+    it is unset — never as a plausible-looking address or company name, because
+    a policy naming the wrong party is worse than one that is obviously
+    incomplete, and the second kind gets fixed.
+    """
+    from backend.config import get_settings
+
+    html = (Path(__file__).resolve().parent / "pages" / _PAGES[slug]).read_text(
+        encoding="utf-8"
+    )
+    settings = get_settings()
+    values = {
+        "SUPPORT_EMAIL": (settings.SUPPORT_EMAIL or "").strip(),
+        "PUBLISHER_NAME": (settings.PUBLISHER_NAME or "").strip(),
+    }
+    for name, value in values.items():
+        if value:
+            html = html.replace("{{%s}}" % name, value)
+        else:
+            logger.warning("%s is not set — %s page renders a placeholder", name, slug)
+            html = html.replace(
+                "{{%s}}" % name,
+                f'<mark style="background:#fee;color:#900">[{name} not configured]</mark>',
+            )
+    return html
+
+
+@app.get("/account-deletion", include_in_schema=False)
+async def account_deletion_page():
+    """How to delete your account, readable without installing the app.
+
+    Play's deletion policy requires a publicly reachable URL for this, separate
+    from the in-app flow — the point being that someone who has already
+    uninstalled, or who never had a working sign-in, can still ask. Apple only
+    requires the in-app path, but one page serves both.
+    """
+    from starlette.responses import HTMLResponse
+
+    return HTMLResponse(_render_page("account-deletion"))
+
+
+@app.get("/privacy", include_in_schema=False)
+async def privacy_page():
+    """The privacy policy. Both stores require this URL to exist and resolve."""
+    from starlette.responses import HTMLResponse
+
+    return HTMLResponse(_render_page("privacy"))
+
+
+@app.get("/terms", include_in_schema=False)
+async def terms_page():
+    """Terms of service. Apple expects an EULA; Play expects a link in-listing."""
+    from starlette.responses import HTMLResponse
+
+    return HTMLResponse(_render_page("terms"))
 
 
 def static_file_within(root: Path, url_path: str) -> Path | None:

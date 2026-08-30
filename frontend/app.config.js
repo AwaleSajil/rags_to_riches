@@ -36,11 +36,19 @@ module.exports = {
     ios: {
       supportsTablet: true,
       bundleIdentifier: "com.r2r.app",
-      // No ATS key at all in a release build — that is the secure default, and
-      // an absent key is stricter than any value we could write here.
-      ...(allowCleartext
-        ? { infoPlist: { NSAppTransportSecurity: { NSAllowsArbitraryLoads: true } } }
-        : {}),
+      infoPlist: {
+        // Declares that this app uses no non-exempt encryption. The app itself
+        // only speaks HTTPS; the Fernet encryption protecting stored API keys
+        // runs on the SERVER and is not in this binary. Without this key App
+        // Store Connect asks the export-compliance question on every single
+        // upload, which is the kind of friction that eventually gets answered
+        // carelessly. Confirm it against your own build before submitting —
+        // this is a legal declaration, not a config flag.
+        ITSAppUsesNonExemptEncryption: false,
+        // No ATS exception in a release build — that is the secure default, and
+        // an absent key is stricter than any value we could write here.
+        ...(allowCleartext ? { NSAppTransportSecurity: { NSAllowsArbitraryLoads: true } } : {}),
+      },
     },
     android: {
       adaptiveIcon: {

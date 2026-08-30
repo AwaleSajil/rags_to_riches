@@ -32,6 +32,31 @@ def client_for(user: dict):
     return get_supabase(user.get("access_token"))
 
 
+def admin_client():
+    """A Supabase client that BYPASSES row-level security. Handle with care.
+
+    Exists for one operation: removing a user's `auth.users` record, which is
+    what actually deletes an account. The anon key cannot do it at all, and
+    every user-scoped table cascades from that row, so this single call is what
+    turns "delete my account" into a real deletion rather than a logout.
+
+    Deliberately not a module-level singleton and deliberately not reachable
+    from `client_for` or `get_supabase`: the only way to hold this client is to
+    ask for it by this name, so a reviewer can grep for the name and see every
+    place RLS is being skipped.
+    """
+    settings = get_settings()
+    key = (settings.SUPABASE_SERVICE_KEY or "").strip()
+    if not key:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_KEY is not configured, so accounts cannot be "
+            "deleted. Set it to the Supabase service_role key (Project "
+            "Settings -> API). It must never be sent to a client."
+        )
+    logger.info("Creating privileged Supabase client (RLS bypassed)")
+    return create_client(settings.SUPABASE_URL, key)
+
+
 def _validate_token_sync(token: str, supabase_url: str, supabase_key: str) -> dict:
     """Sync Supabase auth call — runs in thread pool to avoid blocking the event loop."""
     logger.debug("Validating token via Supabase auth.get_user (token=%s...)", token[:20])

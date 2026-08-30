@@ -25,6 +25,23 @@ class Settings(BaseSettings):
     # Declared here so it can live in .env alongside everything else — the app
     # refuses to start when it is blank, so the default is not a fallback.
     APP_ENCRYPTION_KEY: str = ""
+    # Supabase SERVICE key. Bypasses RLS, so it is kept strictly apart from
+    # SUPABASE_KEY above, which is handed to every anonymous caller by
+    # /public-config. Used on exactly one path — deleting a user's auth record,
+    # which the anon key cannot do and which both app stores require — via
+    # dependencies.admin_client(). Optional so an existing deploy still boots;
+    # account deletion returns a clear error until it is set.
+    SUPABASE_SERVICE_KEY: str = ""
+    # Shown on the public account-deletion page, which Play requires to be
+    # reachable without installing the app. Left obviously unset rather than
+    # defaulted to a plausible-looking address: a deletion request that silently
+    # goes nowhere is worse than a page that admits it is unconfigured.
+    SUPPORT_EMAIL: str = ""
+    # Who publishes the app — the party a privacy policy has to name as the one
+    # responsible for the data. Blank renders as an obvious placeholder rather
+    # than a guess, because naming the wrong entity in a published policy is
+    # worse than admitting it is unfilled.
+    PUBLISHER_NAME: str = ""
 
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -103,3 +120,51 @@ def verify_public_key_is_not_privileged() -> None:
             "security. Use the anon / publishable key instead."
         )
     logger.info("SUPABASE_KEY role=%s — safe to expose publicly", role or "publishable")
+
+
+def verify_service_key_is_privileged() -> None:
+    """Warn at startup if the service key is missing or is not actually one.
+
+    A warning rather than a refusal, deliberately: this key exists for account
+    deletion, and a deployment that predates it should still boot. But both
+    stores require deletion to work, so it must not be possible to ship without
+    noticing — a silently disabled delete button is the version of this failure
+    that gets an app pulled rather than rejected.
+
+    The wrong-key case is the one worth catching loudly. An anon key pasted here
+    fails only at the moment a user asks to delete their account, deep inside a
+    Supabase permission error, which is the worst possible time to find out.
+    """
+    key = (get_settings().SUPABASE_SERVICE_KEY or "").strip()
+    if not key:
+        logger.warning(
+            "SUPABASE_SERVICE_KEY is not set — account deletion will be "
+            "unavailable. Both app stores require a working in-app delete, so "
+            "set it before submitting a build."
+        )
+        return
+    role = _jwt_role(key)
+    if not (key.startswith("sb_secret_") or role == "service_role"):
+        # Named specifically, because the dashboard shows the publishable key
+        # prominently and hides the secret one behind a Reveal (or a Create),
+        # so reaching for the wrong one is the easy mistake rather than an
+        # exotic one. "Not a service key" sends someone back to a page where
+        # everything looks like what they already copied.
+        looks_like = (
+            "the PUBLISHABLE key (sb_publishable_…), which is public"
+            if key.startswith("sb_publishable_")
+            else "a personal access token (sbp_…), which is account-level"
+            if key.startswith("sbp_")
+            else f"the ANON key (role={role}), which is public"
+            if role == "anon"
+            else f"an unrecognised key (role={role or 'not a JWT'})"
+        )
+        logger.error(
+            "SUPABASE_SERVICE_KEY is %s — not a service key. Account deletion "
+            "will fail at the moment a user asks for it. Use the secret key "
+            "(sb_secret_…) or the legacy service_role key from Project "
+            "Settings -> API Keys.",
+            looks_like,
+        )
+        return
+    logger.info("SUPABASE_SERVICE_KEY present — account deletion is available")

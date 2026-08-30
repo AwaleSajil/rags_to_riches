@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.schemas.auth import LoginRequest, RegisterRequest, AuthResponse, UserInfo
 from backend.config import get_settings, Settings
 from backend.dependencies import client_for, get_current_user, get_optional_user
+from backend.services import account_service
 from supabase import create_client
 
 logger = logging.getLogger("moneyrag.routers.auth")
@@ -150,3 +151,33 @@ async def register(
 async def logout(user: dict = Depends(get_current_user)):
     logger.info("Logout for user_id=%s", user["id"])
     return {"message": "Logged out"}
+
+
+@router.delete("/account")
+async def delete_account(user: dict = Depends(get_current_user)):
+    """Permanently delete the caller's account and everything it owns.
+
+    Required by both stores — Apple guideline 5.1.1(v) and Play's account
+    deletion policy — and required to be reachable from inside the app, not
+    only by writing to support.
+
+    Scoped to the caller by construction: the id comes from the validated JWT,
+    never from the request, so there is no parameter here that could name
+    somebody else's account. That is why this takes no body.
+    """
+    try:
+        result = await account_service.delete_account(user)
+    except RuntimeError as e:
+        # The service key is missing. Say what is wrong plainly instead of a
+        # generic 500 — a user who has decided to leave should not be met with
+        # "something went wrong", and this is a deployment fault, not theirs.
+        logger.error("Account deletion unavailable for user_id=%s: %s", user["id"], e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Account deletion is temporarily unavailable. Please contact "
+                "support and your account will be removed."
+            ),
+        )
+    logger.info("Account deleted for user_id=%s", user["id"])
+    return {"message": "Your account and all of its data have been deleted", **result}

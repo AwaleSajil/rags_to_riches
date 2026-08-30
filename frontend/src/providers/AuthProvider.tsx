@@ -12,6 +12,7 @@ interface AuthContextType {
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<string>;
   logout: () => Promise<void>;
+  deleteAccount: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType>({
@@ -20,6 +21,7 @@ const AuthContext = createContext<AuthContextType>({
   login: async () => {},
   register: async () => "",
   logout: async () => {},
+  deleteAccount: async () => {},
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -128,9 +130,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     log.info("Logout flow complete - state cleared");
   };
 
+  const deleteAccount = async () => {
+    log.info("Account deletion flow started");
+    await authService.deleteAccount();
+    // Cleared here rather than left to onAuthStateChange: the auth user no
+    // longer exists, so there may be no sign-out event to listen for.
+    setUser(null);
+    log.info("Account deletion flow complete - state cleared");
+  };
+
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, register, logout }}
+      value={{ user, loading, login, register, logout, deleteAccount }}
     >
       {children}
     </AuthContext.Provider>
