@@ -56,3 +56,102 @@ jobs:
 
       - name: Typecheck
         run: npx tsc --noEmit
+
+  # --- Deployment -----------------------------------------------------------
+  # Runs on the OCI VM itself via a self-hosted runner. That choice is not
+  # incidental: the alternative — SSH from a GitHub-hosted runner — means
+  # storing a private key here AND opening port 22 to GitHub's dynamic IP
+  # ranges, which on a box holding financial records is a poor trade. A polling
+  # runner needs no inbound access and no key in this repository.
+  deploy:
+    name: Deploy to production
+    needs: [backend, frontend]
+    # Never from a pull request, and never from another branch. `needs` already
+    # means a red test cannot reach this job.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    # Auto-created on first run. Add a required reviewer here to turn this into
+    # a one-click approval gate rather than push-and-pray.
+    environment: production
+    concurrency:
+      # Deploys must queue, never overlap, and never be cancelled half-done —
+      # an interrupted deploy leaves no container running at all.
+      group: deploy-production
+      cancel-in-progress: false
+
+    env:
+      APP_DIR: ${{ vars.DEPLOY_APP_DIR }}
+      IMAGE: rags2riches
+      CONTAINER: rags2riches
+      PORT_BIND: 127.0.0.1:7860:7860
+
+    steps:
+      - name: Build and start the pushed commit
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+
+          # Deploy the exact commit that triggered this run, not whatever main
+          # happens to be by the time the runner gets here.
+          git fetch --prune origin
+          git checkout -q main
+          git reset --hard "$GITHUB_SHA"
+
+          # Tag what is live now, before it is overwritten. This is the only
+          # thing that makes the rollback step below possible.
+          if docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
+            ROLLBACK="$IMAGE:rollback-$(date -u +%Y%m%d_%H%M%S)"
+            docker tag "$IMAGE:latest" "$ROLLBACK"
+            echo "ROLLBACK_TAG=$ROLLBACK" >> "$GITHUB_ENV"
+            echo "Tagged current image as $ROLLBACK"
+          fi
+
+          # --no-cache because stage 1 runs `expo export`: a cached layer here
+          # ships a stale web bundle with a fresh backend, which is precisely
+          # the failure that broke signup in production once already.
+          docker build --no-cache -t "$IMAGE:latest" .
+
+          docker stop "$CONTAINER" || true
+          docker rm "$CONTAINER" || true
+          docker run -d --name "$CONTAINER" --restart unless-stopped \
+            --env-file .env -p "$PORT_BIND" "$IMAGE:latest"
+
+      - name: Wait for readiness
+        run: |
+          set -euo pipefail
+          # /api/v1/ready checks the database, unlike /health which is liveness
+          # only. A container that boots but cannot reach Postgres is a failed
+          # deploy, not a healthy one.
+          for i in $(seq 1 36); do
+            if curl -fsS --max-time 5 http://127.0.0.1:7860/api/v1/ready >/dev/null; then
+              echo "Ready after $((i * 5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Never became ready within 180s"
+          docker logs --tail 50 "$CONTAINER" || true
+          exit 1
+
+      - name: Roll back if the new build never came up
+        if: failure() && env.ROLLBACK_TAG != ''
+        run: |
+          set -euo pipefail
+          echo "Rolling back to $ROLLBACK_TAG"
+          docker stop "$CONTAINER" || true
+          docker rm "$CONTAINER" || true
+          docker run -d --name "$CONTAINER" --restart unless-stopped \
+            --env-file .env -p "$PORT_BIND" "$ROLLBACK_TAG"
+          # Deliberately not gated on readiness: this image was serving traffic
+          # a few minutes ago, and a failed rollback needs a human either way.
+
+      - name: Prune old rollback images
+        if: always()
+        run: |
+          set -euo pipefail
+          # Every deploy leaves a tagged image behind. Unchecked, they fill the
+          # disk and take production down by a route nobody is watching.
+          docker images --format '{{.Repository}}:{{.Tag}}' \
+            | grep "^$IMAGE:rollback-" | sort -r | tail -n +6 \
+            | xargs -r -n1 docker rmi || true
+          docker image prune -f || true
