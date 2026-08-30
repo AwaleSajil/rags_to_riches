@@ -20,7 +20,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://ksmu-rags2riches-backend.hf.space/api/v1"
+        "EXPO_PUBLIC_API_URL": "https://rags2riches.duckdns.org/api/v1"
       }
     },
     "production": {
@@ -29,7 +29,7 @@
         "buildType": "app-bundle"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://ksmu-rags2riches-backend.hf.space/api/v1"
+        "EXPO_PUBLIC_API_URL": "https://rags2riches.duckdns.org/api/v1"
       }
     }
   },
