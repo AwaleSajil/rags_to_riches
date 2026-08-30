@@ -5,25 +5,26 @@ in that session unless it says otherwise.
 
 ---
 
-## 0. DO THIS FIRST — there is uncommitted work
+## 0. State of the branch — the work is committed
+
+Re-verified 29 Aug 2026. Working tree clean; §4 is where to start.
 
 ```
 branch: feat/pgvector-and-mobile
-28 files changed, 925 insertions(+), 63 deletions(-)
-8 new files, untracked
 740 tests passing, frontend typecheck clean
 ```
 
-None of it is committed. It is one bad `git checkout` from gone. **Commit before
-doing anything else.** Suggested split, each standing alone:
+The session's work landed in four commits, each standing alone:
 
-1. **security** — path traversal in the SPA fallback (`backend/main.py`) + `tests/test_static_fallback.py`
-2. **schemas** — line-item unit/size round trip (`backend/schemas/transactions.py`, both editing screens, `receiptMath.ts`) + `tests/test_detail_round_trip.py`
-3. **fixes** — storage keys, `check_price` size keys, observation metadata, capture temp dir, `splitSize`, migration `034b`
-4. **account deletion** — `account_service.py`, the route, Settings UI, `/account-deletion`
-5. **policies** — `/privacy`, `/terms`, page rendering, app links
+| Commit | Contents |
+|---|---|
+| `f2b44d8` | **security** — path traversal in the SPA fallback (`backend/main.py`) + `tests/test_static_fallback.py` |
+| `15e1487` | **schemas** — line-item unit/size round trip (`backend/schemas/transactions.py`, both editing screens, `receiptMath.ts`) + `tests/test_detail_round_trip.py` |
+| `f845476` | **fixes** — storage keys, `check_price` size keys, observation metadata, capture temp dir, `splitSize`, migration `034b` |
+| `a0dba52` | **account deletion + policies** — `account_service.py`, the route, Settings UI, `/account-deletion`, `/privacy`, `/terms`, page rendering, app links |
 
-Verify with `.venv/bin/python -m pytest -q` and `cd frontend && npx tsc --noEmit`.
+Nothing here is pushed to a remote yet. Verify with `.venv/bin/python -m pytest -q`
+and `cd frontend && npx tsc --noEmit`.
 
 ---
 
@@ -86,7 +87,7 @@ applied to the database but never committed.
 
 Small, unblocked, and it gets a build in front of testers. Prefer it over §5.
 
-- [ ] **Commit** (§0).
+- [x] ~~**Commit** (§0).~~ Done — four commits, see §0.
 - [ ] **Set three values.** `PUBLISHER_NAME` and `SUPPORT_EMAIL` in `.env`;
       governing-law jurisdiction in `backend/pages/terms.html` (a loud red marker,
       deliberately not defaulted). Pages render `[not configured]` until then.
@@ -104,8 +105,10 @@ Small, unblocked, and it gets a build in front of testers. Prefer it over §5.
       descriptions and receipt images go to a third-party AI provider, and
       DuckDuckGo receives merchant/item names when Deep Enrichment is on.
 
-Housekeeping: stale servers squat on port 8000, one running an **Aug 25 build**.
-Clear them or you will smoke-test code that predates every fix.
+Housekeeping: the stale **Aug 25 build** that squatted on port 8000 has been
+killed (it predated every fix, so smoke-testing against it would have proved
+nothing). Port 8000 is still held by an unrelated `auto_etl` uvicorn running
+since 22 Aug — leave it or kill it, but run this backend on 8011 either way.
 
 ---
 
