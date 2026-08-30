@@ -12,7 +12,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "../src/providers/AuthProvider";
 import { GlassCard } from "../src/components/GlassCard";
 import { colors, typography, spacing } from "../src/styles/theme";
-import { LEGAL_URLS } from "../src/lib/apiUrl";
+import { LEGAL_URLS, API_URL } from "../src/lib/apiUrl";
 import { createLogger } from "../src/lib/logger";
 
 const log = createLogger("LoginScreen");
@@ -152,6 +152,15 @@ export default function LoginScreen() {
         </Text>
 
         <Text style={styles.footer}>Secured by Supabase Auth</Text>
+
+        {/* Only ever rendered by a Metro-served build — `expo export` compiles
+            __DEV__ to false, so the deployed bundle cannot show this. The two
+            builds are otherwise pixel-identical on a phone, which made it
+            impossible to tell whether a signup was hitting local code or the
+            stale deployed one, and cost an afternoon of chasing the wrong bug. */}
+        {__DEV__ && (
+          <Text style={styles.devBadge}>DEV BUILD · {API_URL}</Text>
+        )}
       </ScrollView>
 
       <Snackbar
@@ -219,6 +228,13 @@ const styles = StyleSheet.create({
   submitButtonLabel: {
     fontWeight: "600",
     paddingVertical: spacing.xs,
+  },
+  devBadge: {
+    marginTop: spacing.sm,
+    textAlign: "center",
+    fontSize: 11,
+    fontWeight: "700",
+    color: colors.error,
   },
   footer: {
     ...typography.caption,
