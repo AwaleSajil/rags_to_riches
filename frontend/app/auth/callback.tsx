@@ -30,18 +30,25 @@ const AUTO_CONTINUE_MS = 2500;
  * the thing they just did worked, which reads as a failure. So this says so.
  */
 export default function AuthCallback() {
-  const { user, loading } = useAuth();
+  const { user, loading, recoveryPending } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
-    if (loading || !user) return;
+    if (loading || !user || recoveryPending) return;
     log.info("Verification complete — entering the app", { userId: user.id });
     const timer = setTimeout(() => router.replace("/(tabs)/chat"), AUTO_CONTINUE_MS);
     return () => clearTimeout(timer);
-  }, [user, loading]);
+  }, [user, loading, recoveryPending]);
 
   if (loading) {
     return <LoadingSpinner message="Verifying your email..." />;
+  }
+
+  // A recovery link proves the address, but confirming it is not the point —
+  // the password still has to change, so this hands off rather than celebrating.
+  if (recoveryPending) {
+    log.info("Recovery link — routing to set a new password");
+    return <Redirect href="/auth/reset-password" />;
   }
 
   // The fragment carried no usable tokens, or setSession rejected them — an

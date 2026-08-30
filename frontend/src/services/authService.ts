@@ -132,6 +132,57 @@ export async function register(
   return { message: "Account created successfully" };
 }
 
+/**
+ * Send a password-reset link to an address.
+ *
+ * Deliberately does not report whether the address has an account. Supabase
+ * answers the same way either way, and surfacing the difference here would
+ * hand back exactly the account-enumeration oracle that the signup path goes
+ * out of its way to avoid.
+ *
+ * The link lands on the same /auth/callback route as email verification and
+ * carries the same token fragment — the only difference is type=recovery,
+ * which AuthProvider uses to route to the set-a-new-password screen instead
+ * of dropping straight into the app.
+ */
+export async function requestPasswordReset(email: string): Promise<void> {
+  const normalizedEmail = email.trim().toLowerCase();
+  log.info("Password reset requested", { email: normalizedEmail });
+
+  const supabase = await getSupabase();
+  const { error } = await supabase.auth.resetPasswordForEmail(normalizedEmail, {
+    redirectTo: Linking.createURL("auth/callback"),
+  });
+
+  if (error) {
+    log.error("Password reset request failed", {
+      email: normalizedEmail,
+      error: error.message,
+    });
+    throw error;
+  }
+  log.info("Password reset email dispatched", { email: normalizedEmail });
+}
+
+/**
+ * Set a new password using the session a recovery link created.
+ *
+ * Supabase revokes the other sessions on a password change, so anyone who had
+ * hold of the account is signed out — which is the point of resetting it.
+ */
+export async function updatePassword(newPassword: string): Promise<void> {
+  log.info("Password update requested");
+
+  const supabase = await getSupabase();
+  const { error } = await supabase.auth.updateUser({ password: newPassword });
+
+  if (error) {
+    log.error("Password update failed", { error: error.message });
+    throw error;
+  }
+  log.info("Password updated");
+}
+
 export async function logout(): Promise<void> {
   log.info("Logout initiated");
   const supabase = await getSupabase();

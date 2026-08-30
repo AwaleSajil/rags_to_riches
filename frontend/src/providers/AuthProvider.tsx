@@ -10,24 +10,34 @@ const log = createLogger("AuthProvider");
 interface AuthContextType {
   user: User | null;
   loading: boolean;
+  // True once a recovery link has established a session but the password has
+  // not been changed yet. The callback screen reads it to route to the
+  // set-a-new-password screen rather than into the app.
+  recoveryPending: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<string>;
   logout: () => Promise<void>;
   deleteAccount: () => Promise<void>;
+  requestPasswordReset: (email: string) => Promise<void>;
+  updatePassword: (newPassword: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType>({
   user: null,
   loading: true,
+  recoveryPending: false,
   login: async () => {},
   register: async () => "",
   logout: async () => {},
   deleteAccount: async () => {},
+  requestPasswordReset: async () => {},
+  updatePassword: async () => {},
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [recoveryPending, setRecoveryPending] = useState(false);
 
   useEffect(() => {
     log.info("Checking for existing session on mount...");
@@ -40,10 +50,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const supabase = await getSupabase();
 
       // Supabase sends access and refresh tokens back in the fragment of the
-      // r2r://auth/callback URL after the recipient confirms their address.
-      // React Native does not automatically consume that URL, so exchange it
-      // for the normal persisted session ourselves.
-      const completeEmailVerification = async (url: string) => {
+      // auth/callback URL after the recipient follows an emailed link. React
+      // Native does not automatically consume that URL, so exchange it for the
+      // normal persisted session ourselves.
+      //
+      // Signup confirmation and password recovery arrive here identically
+      // apart from the type parameter. Ignoring it would be a real hole: a
+      // recovery link would silently sign someone in with the old password
+      // still valid, having "reset" nothing, which is worse than failing.
+      const completeAuthCallback = async (url: string) => {
         const fragment = url.split("#", 2)[1] ?? "";
         const params = new URLSearchParams(fragment);
         const redirectError = params.get("error_description") ?? params.get("error");
@@ -61,9 +76,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           refresh_token: refreshToken,
         });
         if (error) {
-          log.error("Could not create session from email verification", {
+          log.error("Could not create session from emailed link", {
             error: error.message,
           });
+          return;
+        }
+
+        // Only after a session actually exists — the reset screen has nothing
+        // to update the password with otherwise.
+        if (params.get("type") === "recovery") {
+          log.info("Recovery link consumed — a new password is required");
+          setRecoveryPending(true);
         }
       };
 
@@ -93,13 +116,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       linkingSubscription = Linking.addEventListener("url", ({ url }) => {
-        void completeEmailVerification(url);
+        void completeAuthCallback(url);
       });
 
-      // Handles a verification link that launches R2R from a fully-closed
-      // state, before the event listener has been attached.
+      // Handles an emailed link that launches R2R from a fully-closed state,
+      // before the event listener has been attached.
       const initialUrl = await Linking.getInitialURL();
-      if (initialUrl) await completeEmailVerification(initialUrl);
+      if (initialUrl) await completeAuthCallback(initialUrl);
 
       // Verify session on mount by refreshing with the server.
       // getSession() only returns the local cache which may be stale
@@ -170,6 +193,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     log.info("Logout flow complete - state cleared");
   };
 
+  const requestPasswordReset = async (email: string) => {
+    log.info("Password reset flow started", { email });
+    await authService.requestPasswordReset(email);
+  };
+
+  const updatePassword = async (newPassword: string) => {
+    log.info("Password update flow started");
+    await authService.updatePassword(newPassword);
+    // Cleared only on success, so a failed attempt leaves the user on the reset
+    // screen with their recovery session intact rather than bouncing them into
+    // the app with the old password still live.
+    setRecoveryPending(false);
+    log.info("Password update flow complete");
+  };
+
   const deleteAccount = async () => {
     log.info("Account deletion flow started");
     await authService.deleteAccount();
@@ -181,7 +219,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, register, logout, deleteAccount }}
+      value={{
+        user,
+        loading,
+        recoveryPending,
+        login,
+        register,
+        logout,
+        deleteAccount,
+        requestPasswordReset,
+        updatePassword,
+      }}
     >
       {children}
     </AuthContext.Provider>

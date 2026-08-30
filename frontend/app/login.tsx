@@ -13,6 +13,7 @@ import { useAuth } from "../src/providers/AuthProvider";
 import { GlassCard } from "../src/components/GlassCard";
 import { colors, typography, spacing } from "../src/styles/theme";
 import { LEGAL_URLS, API_URL } from "../src/lib/apiUrl";
+import { MIN_PASSWORD_LENGTH } from "../src/lib/passwordPolicy";
 import { createLogger } from "../src/lib/logger";
 
 const log = createLogger("LoginScreen");
@@ -20,11 +21,10 @@ const log = createLogger("LoginScreen");
 // This catches obvious typos before an unnecessary auth request. Supabase is
 // still the authority for account creation and email ownership verification.
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MIN_PASSWORD_LENGTH = 10;
 
 export default function LoginScreen() {
   log.debug("LoginScreen rendered");
-  const { login, register } = useAuth();
+  const { login, register, requestPasswordReset } = useAuth();
 
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
@@ -61,6 +61,37 @@ export default function LoginScreen() {
       }
     } catch (e: any) {
       log.error(`${mode} failed from UI`, { error: e.message });
+      setSnackbar({ visible: true, message: e.message, error: true });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!EMAIL_PATTERN.test(normalizedEmail)) {
+      setSnackbar({
+        visible: true,
+        message: "Enter your email address first, then tap Forgot password.",
+        error: true,
+      });
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      log.info("Forgot password pressed", { email: normalizedEmail });
+      await requestPasswordReset(normalizedEmail);
+      // Worded so it says nothing about whether the account exists. Supabase
+      // answers identically either way, and a more helpful message here would
+      // turn this button into an account-enumeration oracle.
+      setSnackbar({
+        visible: true,
+        message: "If that address has an account, a reset link is on its way.",
+        error: false,
+      });
+    } catch (e: any) {
+      log.error("Password reset request failed from UI", { error: e.message });
       setSnackbar({ visible: true, message: e.message, error: true });
     } finally {
       setIsSubmitting(false);
@@ -134,6 +165,18 @@ export default function LoginScreen() {
           >
             {mode === "login" ? "Sign In" : "Create Account"}
           </Button>
+
+          {mode === "login" && (
+            <Button
+              mode="text"
+              onPress={handleForgotPassword}
+              disabled={isSubmitting}
+              style={styles.forgotButton}
+              labelStyle={styles.forgotLabel}
+            >
+              Forgot password?
+            </Button>
+          )}
         </GlassCard>
 
         {/* Shown at the point of account creation, which is where consent to
@@ -228,6 +271,13 @@ const styles = StyleSheet.create({
   submitButtonLabel: {
     fontWeight: "600",
     paddingVertical: spacing.xs,
+  },
+  forgotButton: {
+    marginTop: spacing.xs,
+  },
+  forgotLabel: {
+    fontSize: 13,
+    color: colors.textSecondary,
   },
   devBadge: {
     marginTop: spacing.sm,
