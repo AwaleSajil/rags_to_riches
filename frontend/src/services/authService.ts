@@ -58,10 +58,19 @@ export async function register(
   email: string,
   password: string
 ): Promise<{ message: string }> {
-  log.info("Register attempt", { email });
+  const normalizedEmail = email.trim().toLowerCase();
+  log.info("Register attempt", { email: normalizedEmail });
 
   const supabase = await getSupabase();
-  const { data, error } = await supabase.auth.signUp({ email, password });
+  const { data, error } = await supabase.auth.signUp({
+    email: normalizedEmail,
+    password,
+    options: {
+      // The standalone Android app owns this scheme (declared in app.config.js).
+      // Supabase must allow r2r://** as an Auth redirect URL before release.
+      emailRedirectTo: "r2r://auth/callback",
+    },
+  });
 
   if (error) {
     log.error("Supabase registration failed", { email, error: error.message });
@@ -77,7 +86,18 @@ export async function register(
     email: data.user.email,
   });
 
-  // Sync user to User table
+  // With Confirm Email enabled, Supabase deliberately returns no session until
+  // the recipient follows the verification link. There is no Bearer token yet,
+  // so defer the User-table sync until their first verified sign-in.
+  if (!data.session) {
+    return {
+      message:
+        "Check your email to verify your account. The verification link will reopen R2R.",
+    };
+  }
+
+  // This path only applies while email confirmation is disabled. Retaining it
+  // keeps local development usable, but production must enable Confirm Email.
   try {
     log.debug("Syncing new user to backend...");
     await apiJson("/auth/register", {

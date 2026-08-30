@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
+import * as Linking from "expo-linking";
 import { getSupabase } from "../lib/supabase";
 import * as authService from "../services/authService";
 import { createLogger } from "../lib/logger";
@@ -32,10 +33,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     log.info("Checking for existing session on mount...");
 
     let subscription: { unsubscribe: () => void } | null = null;
+    let linkingSubscription: { remove: () => void } | null = null;
     let cancelled = false;
 
     async function bootstrap() {
       const supabase = await getSupabase();
+
+      // Supabase sends access and refresh tokens back in the fragment of the
+      // r2r://auth/callback URL after the recipient confirms their address.
+      // React Native does not automatically consume that URL, so exchange it
+      // for the normal persisted session ourselves.
+      const completeEmailVerification = async (url: string) => {
+        const fragment = url.split("#", 2)[1] ?? "";
+        const params = new URLSearchParams(fragment);
+        const redirectError = params.get("error_description") ?? params.get("error");
+        if (redirectError) {
+          log.error("Email verification redirect failed", { redirectError });
+          return;
+        }
+
+        const accessToken = params.get("access_token");
+        const refreshToken = params.get("refresh_token");
+        if (!accessToken || !refreshToken) return;
+
+        const { error } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        });
+        if (error) {
+          log.error("Could not create session from email verification", {
+            error: error.message,
+          });
+        }
+      };
 
       // Register the listener BEFORE the network call. If the refresh below
       // fails we still want sign-in events to reach the app — previously the
@@ -61,6 +91,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         subscription.unsubscribe();
         return;
       }
+
+      linkingSubscription = Linking.addEventListener("url", ({ url }) => {
+        void completeEmailVerification(url);
+      });
+
+      // Handles a verification link that launches R2R from a fully-closed
+      // state, before the event listener has been attached.
+      const initialUrl = await Linking.getInitialURL();
+      if (initialUrl) await completeEmailVerification(initialUrl);
 
       // Verify session on mount by refreshing with the server.
       // getSession() only returns the local cache which may be stale
@@ -106,6 +145,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       cancelled = true;
       log.debug("Unsubscribing auth state listener");
       subscription?.unsubscribe();
+      linkingSubscription?.remove();
     };
   }, []);
 

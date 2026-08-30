@@ -17,6 +17,11 @@ import { createLogger } from "../src/lib/logger";
 
 const log = createLogger("LoginScreen");
 
+// This catches obvious typos before an unnecessary auth request. Supabase is
+// still the authority for account creation and email ownership verification.
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 10;
+
 export default function LoginScreen() {
   log.debug("LoginScreen rendered");
   const { login, register } = useAuth();
@@ -28,16 +33,29 @@ export default function LoginScreen() {
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
 
   const handleSubmit = async () => {
-    if (!email || !password) return;
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!EMAIL_PATTERN.test(normalizedEmail)) {
+      setSnackbar({ visible: true, message: "Enter a valid email address.", error: true });
+      return;
+    }
+    if (mode === "register" && password.length < MIN_PASSWORD_LENGTH) {
+      setSnackbar({
+        visible: true,
+        message: `Use a password with at least ${MIN_PASSWORD_LENGTH} characters.`,
+        error: true,
+      });
+      return;
+    }
+
     setIsSubmitting(true);
     try {
       if (mode === "login") {
-        log.info("Login button pressed", { email });
-        await login(email, password);
+        log.info("Login button pressed", { email: normalizedEmail });
+        await login(normalizedEmail, password);
         log.info("Login successful from UI");
       } else {
-        log.info("Register button pressed", { email });
-        const msg = await register(email, password);
+        log.info("Register button pressed", { email: normalizedEmail });
+        const msg = await register(normalizedEmail, password);
         log.info("Registration successful from UI", { message: msg });
         setSnackbar({ visible: true, message: msg, error: false });
       }
@@ -94,7 +112,11 @@ export default function LoginScreen() {
           <TextInput
             mode="outlined"
             label="Password"
-            placeholder="Enter your password"
+            placeholder={
+              mode === "register"
+                ? `At least ${MIN_PASSWORD_LENGTH} characters`
+                : "Enter your password"
+            }
             value={password}
             onChangeText={setPassword}
             secureTextEntry
