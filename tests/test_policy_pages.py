@@ -160,7 +160,16 @@ def test_the_pages_link_to_each_other(anon_client):
     assert "/account-deletion" in anon_client.get("/privacy").text
 
 
-def test_the_governing_law_placeholder_is_loud(anon_client):
-    """Deliberately not defaulted to a jurisdiction — that is a real legal
-    choice. It must be impossible to publish without noticing."""
-    assert "set this before publishing" in prose(anon_client.get("/terms"))
+def test_the_governing_law_names_a_real_jurisdiction(anon_client):
+    """This guarded the empty case until a jurisdiction was actually chosen;
+    now it guards the other direction.
+
+    The publisher is in Connecticut, so the terms name Connecticut. Contract law
+    in the US is state law, which is why this is a state and not "the USA" —
+    the latter names no body of contract law at all. If someone moves, or
+    restores the placeholder, that is a real legal change and it should have to
+    be made deliberately here rather than discovered on a store listing.
+    """
+    text = prose(anon_client.get("/terms"))
+    assert "set this before publishing" not in text
+    assert "governed by the laws of the state of connecticut, usa" in text

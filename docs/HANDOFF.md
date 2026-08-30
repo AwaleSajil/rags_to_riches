@@ -92,7 +92,12 @@ Small, unblocked, and it gets a build in front of testers. With §5 deferred,
 **this is the whole remaining path to launch.** Total cash cost: $25.
 
 - [x] ~~**Commit** (§0).~~ Done — four commits, see §0.
-- [ ] **Set three values.** `PUBLISHER_NAME` and `SUPPORT_EMAIL` in `.env`;
+- [x] ~~**Set three values.**~~ Done: `PUBLISHER_NAME=Sajil Awale` and
+      `SUPPORT_EMAIL=r2rapp.support@gmail.com` in `.env` (gitignored — set these
+      as HF Space secrets too), and governing law is the State of Connecticut,
+      USA, in `backend/pages/terms.html`. All three pages verified rendering
+      with no placeholders. Original note follows:
+      ~~**Set three values.**~~ `PUBLISHER_NAME` and `SUPPORT_EMAIL` in `.env`;
       governing-law jurisdiction in `backend/pages/terms.html` (a loud red marker,
       deliberately not defaulted). Pages render `[not configured]` until then.
       Publishing as an individual, `PUBLISHER_NAME` is your own legal name — the
