@@ -110,6 +110,12 @@ export default function ReceiptReviewScreen() {
         unitPrice: numberText(item.item_unit_price),
         taxRate: numberText(item.tax_rate, "0"),
         savings: numberText(item.item_savings, "0"),
+        // Not fields on this form, carried so verifying does not discard what
+        // the vision pass read off the label. Dropping them here is what left
+        // TransactionDetail.size_value NULL on every receipt.
+        quantityUnit: item.item_quantity_unit ?? "",
+        sizeValue: item.size_value != null ? String(item.size_value) : "",
+        sizeUnit: item.size_unit ?? "",
       })));
     } catch (e: any) {
       setError(e.message || "Could not load the receipt review");
@@ -154,6 +160,9 @@ export default function ReceiptReviewScreen() {
     const lineItems = validated.rows.map((row) => ({
       item_description: row.description,
       item_quantity: row.quantity,
+      item_quantity_unit: row.quantityUnit,
+      size_value: row.sizeValue,
+      size_unit: row.sizeUnit,
       item_unit_price: row.unitPrice,
       item_savings: row.savings,
       tax_rate: row.taxRate,

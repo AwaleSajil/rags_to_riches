@@ -85,6 +85,8 @@ function toDetailForm(d: TransactionDetailItem): LineItemForm {
     taxRate: numberText(d.tax_rate),
     // Not shown in the form, carried so a save does not wipe it.
     quantityUnit: d.item_quantity_unit ?? "",
+    sizeValue: d.size_value != null ? String(d.size_value) : "",
+    sizeUnit: d.size_unit ?? "",
   };
 }
 
@@ -310,6 +312,8 @@ export default function TransactionDetailScreen() {
         item_description: r.description,
         item_quantity: r.quantity,
         item_quantity_unit: r.quantityUnit,
+        size_value: r.sizeValue,
+        size_unit: r.sizeUnit,
         unit_quantity_subtotal: r.unitPrice,
         item_savings: r.savings,
         tax_rate: r.taxRate,

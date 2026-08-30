@@ -42,6 +42,14 @@ export interface ReceiptTotals extends LineTotals {
   savings: number;
 }
 
+/** A carried size, or null. Never rejects — see the note at the call site. */
+function sizeNumber(value: Amount): number | null {
+  const raw = typeof value === "string" ? value.trim() : value;
+  if (raw === "" || raw === null || raw === undefined) return null;
+  const parsed = parseNumber(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function num(value: Amount, fallback: number): number {
   const parsed = parseNumber(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -111,10 +119,22 @@ export interface LineItemForm {
    * the form drops is deleted from the row.
    */
   quantityUnit?: string;
+  /**
+   * How much is in ONE unit — 5 and "lb" for a 5 lb bag. Carried for the same
+   * reason as `quantityUnit`, and it matters more: this is the confirmed size
+   * a per-unit price comparison rests on, and when it is missing the size has
+   * to be guessed back out of the abbreviated description ("+RED POTA 5L US#"
+   * read as five litres).
+   */
+  sizeValue?: string;
+  sizeUnit?: string;
 }
 
-/** The fields a form actually edits — `key` and `quantityUnit` are carried, not typed into. */
-export type LineItemField = Exclude<keyof LineItemForm, "key" | "quantityUnit">;
+/** The fields a form actually edits — the rest are carried, not typed into. */
+export type LineItemField = Exclude<
+  keyof LineItemForm,
+  "key" | "quantityUnit" | "sizeValue" | "sizeUnit"
+>;
 
 let keySequence = 0;
 
@@ -152,6 +172,8 @@ export interface ValidLineItem {
   taxRate: number;
   savings: number;
   quantityUnit: string | null;
+  sizeValue: number | null;
+  sizeUnit: string | null;
 }
 
 export type ValidationResult =
@@ -209,6 +231,11 @@ export function validateLineItems(rows: LineItemForm[]): ValidationResult {
       taxRate: numbers.taxRate,
       savings: numbers.savings,
       quantityUnit: row.quantityUnit?.trim() || null,
+      // Carried, not validated: neither form offers a size field, so the only
+      // value here is one the vision pass or an earlier save put there. A blank
+      // is a genuine "unknown", which is what the column already means.
+      sizeValue: sizeNumber(row.sizeValue),
+      sizeUnit: row.sizeUnit?.trim().toLowerCase() || null,
     });
   }
 

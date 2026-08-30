@@ -143,6 +143,8 @@ export interface TransactionDetailItem {
   item_description: string | null;
   item_quantity: number | null;
   item_quantity_unit: string | null; // what item_quantity counts: each|lb|oz|ml|ct…
+  size_value: number | null; // how much is in ONE unit — 5 for a 5 lb bag
+  size_unit: string | null; // unit of size_value; NOT item_quantity_unit
   unit_quantity_subtotal: number | null; // pre-tax unit price actually paid (net of markdown)
   item_subtotal_price: number | null; // pre-tax line total (qty x unit)
   item_savings?: number | null; // how much this line was marked down, display only
@@ -188,6 +190,12 @@ export interface TransactionWithDetails extends TransactionListItem {
 export interface ReceiptReviewLineItem {
   item_description?: string;
   item_quantity?: number;
+  // Read off the label by the vision pass. Carried through the review form
+  // rather than dropped: the alternative is parsing the size back out of an
+  // abbreviated description, which is the guess migration 034 replaced.
+  item_quantity_unit?: string | null; // what item_quantity counts
+  size_value?: number | null; // how much is in ONE unit
+  size_unit?: string | null;
   item_unit_price?: number; // net price actually paid per unit
   item_savings?: number; // markdown on this line, display only
   tax_rate?: number;

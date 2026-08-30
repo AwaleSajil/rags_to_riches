@@ -79,6 +79,13 @@ class TransactionDetailItem(BaseModel):
     id: str
     item_description: Optional[str] = None
     item_quantity: Optional[float] = None
+    # What item_quantity counts, and how big ONE of them is. Declared because a
+    # field this model does not name is dropped from the response entirely:
+    # the screen read `d.item_quantity_unit` and always got undefined, so the
+    # form carried a blank forward and the save below wiped the column.
+    item_quantity_unit: Optional[str] = None
+    size_value: Optional[float] = None
+    size_unit: Optional[str] = None
     unit_quantity_subtotal: Optional[float] = None
     item_subtotal_price: Optional[float] = None
     item_savings: Optional[float] = None
@@ -96,6 +103,17 @@ class TransactionDetailInput(BaseModel):
 
     item_description: Optional[str] = None
     item_quantity: Optional[float] = None
+    # Carried by the editor rather than typed into, and REQUIRED here for that
+    # to work: pydantic drops what a model does not declare, so leaving these
+    # out meant the client sent them, the server read them as None, and
+    # _prepare_detail_rows — which is written to preserve them — wrote NULL over
+    # every line of the receipt the moment an unrelated field was touched.
+    # size_value/size_unit are what migration 034 added so a per-unit price
+    # comparison would not have to re-parse "+RED POTA 5L US#" and read pounds
+    # as litres.
+    item_quantity_unit: Optional[str] = None
+    size_value: Optional[float] = Field(default=None, ge=0)
+    size_unit: Optional[str] = None
     unit_quantity_subtotal: Optional[float] = None
     item_subtotal_price: Optional[float] = None
     item_savings: Optional[float] = None
@@ -120,6 +138,14 @@ class ReceiptReviewLineItem(BaseModel):
     # Null when the receipt does not say; inferring it would feed a guess
     # straight into per-unit price comparisons.
     item_quantity_unit: Optional[str] = None
+    # How much is in ONE purchase unit — 5 for a 5 lb bag. Read off the label by
+    # the vision pass and confirmable on the review form, and undeclared here
+    # until now, so _verify_receipt_row's `item.get("size_value")` never saw one
+    # and TransactionDetail.size_value was NULL on every receipt ever verified.
+    # That is the gap scripts/backfill_line_item_sizes.py exists to paper over
+    # by parsing the description, which is the guess migration 034 replaced.
+    size_value: Optional[float] = Field(default=None, ge=0)
+    size_unit: Optional[str] = None
     # Net price actually paid per unit (after any item-level markdown).
     item_unit_price: float = Field(default=0, ge=0)
     # How much this line was marked down (regular price minus what was paid);

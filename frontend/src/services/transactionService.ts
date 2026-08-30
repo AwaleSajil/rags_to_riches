@@ -106,6 +106,8 @@ export interface TransactionDetailInput {
   // Sent back unchanged by the editor. The server rewrites every line on save,
   // so a field omitted here is a field erased.
   item_quantity_unit?: string | null;
+  size_value?: number | null;
+  size_unit?: string | null;
   unit_quantity_subtotal?: number | null;
   item_savings?: number | null;
   tax_rate?: number | null;
