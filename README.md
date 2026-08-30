@@ -142,18 +142,37 @@ service or keys. It reuses `DATABASE_URL` above. Enable the extension by running
 
 ## Deployment
 
-### Two-Space Deployment (HF Spaces)
+### Production — OCI, https://rags2riches.duckdns.org
 
-The application is deployed as two separate Hugging Face Spaces:
+One container, built from the root `Dockerfile`, serving both halves. Stage 1
+runs `expo export --platform web`; stage 2 copies that build into `static/`,
+which `backend/main.py` serves behind an SPA fallback. **The frontend therefore
+ships with a backend image rebuild — there is no separate frontend deploy.**
 
-- **Backend** ([rags2riches-backend](https://huggingface.co/spaces/ksmu/rags2riches-backend)): FastAPI server with RAG engine
-- **Frontend** ([rags2riches-frontend](https://huggingface.co/spaces/ksmu/rags2riches-frontend)): Expo web static build
+The container listens on **7860** and runs uvicorn with `--proxy-headers
+--forwarded-allow-ips *`, so it expects the TLS terminator that fronts the
+public hostname.
 
-The frontend Space requires one build secret:
+Stage 1 deliberately deletes any `.env*` and forces `EXPO_PUBLIC_API_URL=""`, so
+the web bundle calls a *relative* `/api/v1` and is correct wherever it is served.
+Baking an absolute URL in produces a page that loads and then talks to the wrong
+host, which is a slow bug to find.
 
-| Variable | Description |
-|---|---|
-| `EXPO_PUBLIC_API_URL` | Backend Space URL, e.g. `https://ksmu-rags2riches-backend.hf.space/api/v1` |
+Required environment is `.env.example` in full. `SUPABASE_SERVICE_KEY` is the
+one most often missing: without it the app boots but in-app account deletion
+answers 503, which both stores treat as a submission blocker. `APP_ENCRYPTION_KEY`
+must never change between deploys — it decrypts users' stored LLM API keys, and a
+new value fails silently rather than loudly.
+
+> **The deploy mechanism itself is not yet documented.** How a checkout reaches
+> the VM, how the image is rebuilt and restarted, where env vars live, and how to
+> roll back are known only to whoever runs it. `docs/DEPLOY_HANDOFF.md` covers
+> what a redeploy must achieve and asks for those steps to be filled in here.
+> Until then this section describes the artifact, not the procedure.
+
+*Previously deployed as two Hugging Face Spaces (`ksmu/rags2riches-backend` and
+`-frontend`). That arrangement is retired; the single-container build below is
+what production runs.*
 
 ### Android app (Play Store)
 
