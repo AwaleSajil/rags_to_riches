@@ -231,12 +231,43 @@ async def public_config():
     }
 
 
+def static_file_within(root: Path, url_path: str) -> Path | None:
+    """The file `url_path` names inside `root`, or None if it escapes it.
+
+    `request.url.path` arrives percent-DECODED — uvicorn unquotes the target
+    before it builds the ASGI scope — so a request for "/%2e%2e/%2e%2e/.env"
+    reaches the SPA fallback as "/../../.env". Joining that onto the static root
+    and calling is_file() served anything this process could read:
+    /proc/self/environ alone carries DATABASE_URL, SUPABASE_KEY and
+    APP_ENCRYPTION_KEY, which is every stored user's LLM credentials. Only the
+    plain "/../x" spelling is normalised away by clients; the encoded ones
+    arrive intact.
+
+    The two StaticFiles mounts below are safe because Starlette does this check
+    itself. The fallback is hand-rolled and has to do it too.
+
+    Module level, and taking its root as an argument, so it is reachable from a
+    test — the version that lived inside `if _static_dir.is_dir()` could only be
+    exercised by a deployment that had already shipped.
+    """
+    root = root.resolve()
+    candidate = (root / url_path.lstrip("/")).resolve()
+    if not candidate.is_relative_to(root):
+        logger.warning("Refusing static path outside the build: %s", url_path)
+        return None
+    return candidate if candidate.is_file() else None
+
+
 # --- Serve Expo web build as static files (for Docker / HF Spaces) ---
 _static_dir = Path(__file__).resolve().parent.parent / "static"
 if _static_dir.is_dir():
     from starlette.responses import FileResponse
 
     logger.info("Serving static frontend from %s", _static_dir)
+
+    # The build root with symlinks resolved, so a candidate path can be tested
+    # against it. Computed once — it never changes, and resolve() hits the disk.
+    _static_root = _static_dir.resolve()
 
     # Mount known static asset directories so they're served directly
     app.mount("/_expo", StaticFiles(directory=str(_static_dir / "_expo")), name="expo-assets")
@@ -259,10 +290,10 @@ if _static_dir.is_dir():
             and not path.startswith("/api/")
         ):
             # Try exact static file first
-            file_path = _static_dir / path.lstrip("/")
-            if file_path.is_file():
+            file_path = static_file_within(_static_root, path)
+            if file_path is not None:
                 return FileResponse(file_path)
             # SPA fallback
-            return FileResponse(_static_dir / "index.html")
+            return FileResponse(_static_root / "index.html")
 
         return response
