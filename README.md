@@ -164,14 +164,56 @@ answers 503, which both stores treat as a submission blocker. `APP_ENCRYPTION_KE
 must never change between deploys — it decrypts users' stored LLM API keys, and a
 new value fails silently rather than loudly.
 
-> **The deploy mechanism itself is not yet documented.** How a checkout reaches
-> the VM, how the image is rebuilt and restarted, where env vars live, and how to
-> roll back are known only to whoever runs it. `docs/DEPLOY_HANDOFF.md` covers
-> what a redeploy must achieve and asks for those steps to be filled in here.
-> Until then this section describes the artifact, not the procedure.
+**Checkout.** A plain `git clone` of this repo lives at `~/rags_to_riches` on
+the OCI VM, on `main`. There is no CI/CD hook — redeploying means SSHing in
+and running the steps below by hand. `docker-compose.yml` and
+`Dockerfile.backend`/`Dockerfile.frontend` are **not** used in production —
+those are leftovers from the retired two-Space HF layout. Production builds
+straight from the root `Dockerfile` with a plain `docker build`/`docker run`.
+
+**Build and restart:**
+
+```bash
+cd ~/rags_to_riches
+git pull origin main
+
+# keep a rollback target before overwriting :latest
+docker tag rags2riches:latest rags2riches:rollback-$(date +%Y%m%d_%H%M%S)
+
+docker build --no-cache -t rags2riches:latest .   # --no-cache: see note below
+docker stop rags2riches && docker rm rags2riches
+docker run -d --name rags2riches --restart unless-stopped \
+  --env-file .env -p 127.0.0.1:7860:7860 rags2riches:latest
+```
+
+`--no-cache` isn't optional for a frontend fix: Docker's layer cache follows
+the `COPY frontend/ ./` layer, so it usually does invalidate correctly on its
+own when frontend source changes — but there's no CI here catching a case
+where it doesn't, and the cost of forcing it is a few extra minutes against a
+silently-stale bundle in production. Verify by checking the app, not the
+build log: a stale bundle means stage 1 didn't actually rerun.
+
+**Env vars** live in `~/rags_to_riches/.env` (`chmod 600`, gitignored), loaded
+into the container via `--env-file .env`. This is the *only* place they're
+set — there is no secrets manager or HF Space config anymore. Back this file
+up (especially `APP_ENCRYPTION_KEY`, see above) before changing anything in
+it.
+
+**TLS** is terminated by Caddy (`/etc/caddy/Caddyfile`), running as a
+systemd service and reverse-proxying `rags2riches.duckdns.org` to
+`127.0.0.1:7860` with automatic HTTPS. The container itself binds only to
+`127.0.0.1:7860`, not `0.0.0.0`, so it's unreachable except through Caddy.
+
+**Rollback** is retagging and rerunning the previous image:
+
+```bash
+docker stop rags2riches && docker rm rags2riches
+docker run -d --name rags2riches --restart unless-stopped \
+  --env-file .env -p 127.0.0.1:7860:7860 rags2riches:rollback-<timestamp>
+```
 
 *Previously deployed as two Hugging Face Spaces (`ksmu/rags2riches-backend` and
-`-frontend`). That arrangement is retired; the single-container build below is
+`-frontend`). That arrangement is retired; the single-container build above is
 what production runs.*
 
 ### Android app (Play Store)

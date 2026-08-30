@@ -104,12 +104,14 @@ Small, unblocked, and it gets a build in front of testers. With §5 deferred,
       Publishing as an individual, `PUBLISHER_NAME` is your own legal name — the
       policy templates interpolate a name and an email and **no physical
       address**, so this exposes nothing the store listing wouldn't.
-- [ ] **`SUPABASE_SERVICE_KEY` on the deployed backend.** Deletion works locally
-      and 503s in production without it. Production moved to OCI
-      (`rags2riches.duckdns.org`); it is no longer an HF Spaces repository
-      secret, and where that box keeps its environment is not yet written down.
-      See `docs/DEPLOY_HANDOFF.md`, which also carries the redeploy this is
-      part of.
+- [x] ~~**`SUPABASE_SERVICE_KEY` on the deployed backend.**~~ Set in
+      `~/rags_to_riches/.env` on the OCI box (`rags2riches.duckdns.org`) and
+      confirmed present in the running container's environment. Production
+      is no longer an HF Spaces repository secret setup — env vars live in
+      that one `.env` file, loaded via `docker run --env-file`. The deploy
+      mechanism itself (checkout location, build/restart commands, TLS,
+      rollback) is now written down in `README.md` under Deployment; see
+      `docs/DEPLOY_HANDOFF.md` for the redeploy this was part of.
 - [ ] **Smoke-test the six fixes in the real app.** Only deletion was proven
       against reality. Upload a CSV, photograph and verify a receipt, then edit
       one line item and confirm the unit and size survive — that is bug #2, and
