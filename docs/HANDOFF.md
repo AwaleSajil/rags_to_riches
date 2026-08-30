@@ -32,7 +32,8 @@ and `cd frontend && npx tsc --noEmit`.
 
 Personal finance app. Upload bank CSVs and photograph receipts; an LLM reads
 them; chat with your spending. FastAPI + LangGraph backend, Expo/React Native
-frontend, Supabase (auth, Postgres, pgvector, storage), deployed on HF Spaces.
+frontend, Supabase (auth, Postgres, pgvector, storage), deployed as a single
+container on OCI at `rags2riches.duckdns.org` (HF Spaces is retired).
 
 **Users bring their own LLM API key, and that is the shipping model** — not a
 stopgap. See §2. It means the app has no marginal cost per user, which is what
@@ -103,8 +104,12 @@ Small, unblocked, and it gets a build in front of testers. With §5 deferred,
       Publishing as an individual, `PUBLISHER_NAME` is your own legal name — the
       policy templates interpolate a name and an email and **no physical
       address**, so this exposes nothing the store listing wouldn't.
-- [ ] **`SUPABASE_SERVICE_KEY` on the deployed backend** (HF Spaces → repository
-      secrets). Deletion works locally and would 503 in production without it.
+- [ ] **`SUPABASE_SERVICE_KEY` on the deployed backend.** Deletion works locally
+      and 503s in production without it. Production moved to OCI
+      (`rags2riches.duckdns.org`); it is no longer an HF Spaces repository
+      secret, and where that box keeps its environment is not yet written down.
+      See `docs/DEPLOY_HANDOFF.md`, which also carries the redeploy this is
+      part of.
 - [ ] **Smoke-test the six fixes in the real app.** Only deletion was proven
       against reality. Upload a CSV, photograph and verify a receipt, then edit
       one line item and confirm the unit and size survive — that is bug #2, and
