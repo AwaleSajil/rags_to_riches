@@ -17,9 +17,12 @@ export async function getConfig(): Promise<AccountConfig | null> {
 
 export async function updateConfig(data: {
   llm_provider: string;
-  api_key: string;
+  /** Omit to keep the key already stored — the server never sends it back, so
+   *  there is nothing for the client to echo when only a model changed. */
+  api_key?: string;
   decode_model: string;
   embedding_model: string;
+  deep_enrichment?: boolean;
 }): Promise<AccountConfig> {
   log.info("Saving config", {
     provider: data.llm_provider,

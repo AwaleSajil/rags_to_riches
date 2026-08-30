@@ -1,5 +1,14 @@
 demo_data/*
 .env*.png
 .env
+.mcp.json
+.venv/
 **/node_modules
 **/__pycache__
+*.pyc
+.pytest_cache/
+temp_data/
+.DS_Store
+*.swp
+*.swo
+*~

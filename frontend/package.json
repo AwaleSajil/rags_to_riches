@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "main": "expo-router/entry",
   "scripts": {
-    "start": "expo start",
-    "android": "expo run:android",
-    "ios": "expo run:ios",
-    "web": "expo start --web"
+    "//": "EXPO_ALLOW_CLEARTEXT lets dev builds reach the backend over plain HTTP (see app.config.js). Release builds go through `eas build` / `expo export`, which do not run these scripts, so they stay HTTPS-only.",
+    "start": "EXPO_ALLOW_CLEARTEXT=1 expo start",
+    "android": "EXPO_ALLOW_CLEARTEXT=1 expo run:android",
+    "ios": "EXPO_ALLOW_CLEARTEXT=1 expo run:ios",
+    "web": "expo start --web",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
@@ -17,9 +19,11 @@
     "expo-camera": "~17.0.10",
     "expo-constants": "~18.0.13",
     "expo-document-picker": "~14.0.8",
+    "expo-file-system": "~19.0.23",
     "expo-image-manipulator": "~14.0.8",
     "expo-linear-gradient": "~15.0.8",
     "expo-linking": "~8.0.11",
+    "expo-location": "~19.0.8",
     "expo-router": "~6.0.23",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",

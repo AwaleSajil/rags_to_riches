@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import * as fileService from "../services/fileService";
 import { createLogger } from "../lib/logger";
+import type { ReviewItem } from "../services/fileService";
 import type { FileItem } from "../lib/types";
 
 const log = createLogger("useFiles");
@@ -11,6 +12,12 @@ export interface DuplicateInfo {
   amount: number;
 }
 
+/** A row that survived ingestion but describes a purchase already on record. */
+export interface LinkInfo extends DuplicateInfo {
+  /** csv_csv: another statement. csv_receipt: a receipt you photographed. */
+  match_type: "csv_csv" | "csv_receipt";
+}
+
 export interface IngestionProgress {
   stage: string;
   total: number;
@@ -18,21 +25,65 @@ export interface IngestionProgress {
   detail?: string;
 }
 
+const POLL_INTERVAL_MS = 2000;
+// "idle" is expected for a poll or two while the worker spins up; beyond that
+// the server has forgotten the job (most likely it restarted).
+const MAX_IDLE_POLLS = 5;
+// Absolute ceiling regardless of what the server reports, so a worker wedged in
+// "processing" can't spin the UI indefinitely either.
+const MAX_INGESTION_MS = 15 * 60 * 1000;
+
 export function useFiles() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  // Whether a load has finished, successfully or not. An empty file list means
+  // two very different things before and after that, and screens that only
+  // checked `files.length` showed "no data" for the moment before the first
+  // response arrived. See the same flag on useAsyncResource.
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isIngesting, setIsIngesting] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [visibilityFileId, setVisibilityFileId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
+  // Rows matched to a purchase already on record and linked to it. Both copies
+  // are kept, and the transactions list shows the pair as one row — which is
+  // exactly why it has to be said here: otherwise a statement that overlaps the
+  // previous one looks like it lost the overlapping rows.
+  const [links, setLinks] = useState<LinkInfo[]>([]);
+  // Whole files the server refused as already imported. Distinct from
+  // `duplicates`, which are individual rows merged during ingestion — these
+  // never reached ingestion at all.
+  const [alreadyImported, setAlreadyImported] = useState<fileService.AlreadyImported[]>([]);
+  // Photos awaiting review, each tagged receipt | price_tag | unknown so the
+  // screen can route to the right form instead of assuming everything is a receipt.
+  const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
   const [ingestionProgress, setIngestionProgress] = useState<IngestionProgress | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // loadFiles is defined below and depends on nothing, but the poller needs to
+  // call it; a ref avoids reordering the hook or a circular useCallback dep.
+  const loadFilesRef = useRef<(() => Promise<void>) | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
+    }
+  }, []);
+
+  // Both terminal statuses carry these. "review" used to drop them on the
+  // floor, so uploading a CSV together with a photo reported neither the merged
+  // duplicates nor the links — the overlap was silent precisely when the upload
+  // was most mixed.
+  const applyOverlaps = useCallback((status: fileService.IngestionStatus) => {
+    if (status.duplicates?.length) {
+      log.info("Duplicates detected", { count: status.duplicates.length });
+      setDuplicates(status.duplicates);
+    }
+    if (status.links?.length) {
+      log.info("Linked transactions detected", { count: status.links.length });
+      setLinks(status.links);
     }
   }, []);
 
@@ -42,10 +93,45 @@ export function useFiles() {
     setIngestionProgress(null);
     log.info("Starting ingestion status polling");
 
+    // The backend tracks ingestion in an in-memory dict, so a restart mid-run
+    // loses the job and the endpoint reports "idle" forever. Without these two
+    // guards the interval never clears and the spinner never stops.
+    let consecutiveIdle = 0;
+    const startedAt = Date.now();
+
+    const giveUp = (message: string) => {
+      log.warn("Ingestion polling gave up", { message });
+      stopPolling();
+      setIsIngesting(false);
+      setIngestionProgress(null);
+      setError(message);
+      loadFilesRef.current?.();
+    };
+
     pollRef.current = setInterval(async () => {
       try {
         const status = await fileService.getIngestionStatus();
         log.debug("Ingestion poll result", status);
+
+        if (Date.now() - startedAt > MAX_INGESTION_MS) {
+          giveUp(
+            "Ingestion is taking longer than expected. Pull to refresh to check whether it finished."
+          );
+          return;
+        }
+
+        // "idle" right after upload is a normal race with the worker starting;
+        // sustained "idle" means the backend no longer knows about the job.
+        if (status.status === "idle") {
+          consecutiveIdle++;
+          if (consecutiveIdle >= MAX_IDLE_POLLS) {
+            giveUp(
+              "Lost track of the upload — the server may have restarted. Pull to refresh to check whether it finished."
+            );
+          }
+          return;
+        }
+        consecutiveIdle = 0;
 
         // Update progress if available
         if (status.stage) {
@@ -61,11 +147,24 @@ export function useFiles() {
           stopPolling();
           setIsIngesting(false);
           setIngestionProgress(null);
-          if (status.duplicates && status.duplicates.length > 0) {
-            log.info("Duplicates detected", { count: status.duplicates.length });
-            setDuplicates(status.duplicates);
-          }
+          applyOverlaps(status);
           // Reload files now that ingestion is done
+          const data = await fileService.listFiles();
+          setFiles(data);
+        } else if (status.status === "review") {
+          stopPolling();
+          setIsIngesting(false);
+          setIngestionProgress(null);
+          applyOverlaps(status);
+          // Fall back to the old field so a client running against a
+          // not-yet-updated backend still routes its receipts somewhere.
+          setReviewItems(
+            status.review_items ??
+              (status.receipt_review_file_ids || []).map((file_id) => ({
+                file_id,
+                kind: "receipt" as const,
+              }))
+          );
           const data = await fileService.listFiles();
           setFiles(data);
         } else if (status.status === "failed") {
@@ -77,8 +176,8 @@ export function useFiles() {
       } catch (e: any) {
         log.error("Ingestion poll error", e);
       }
-    }, 2000);  // Poll faster for progress updates
-  }, [stopPolling]);
+    }, POLL_INTERVAL_MS);
+  }, [stopPolling, applyOverlaps]);
 
   useEffect(() => {
     return () => stopPolling();
@@ -97,8 +196,11 @@ export function useFiles() {
       setError(e.message);
     } finally {
       setIsLoading(false);
+      setHasLoaded(true);
     }
   }, []);
+
+  loadFilesRef.current = loadFiles;
 
   useEffect(() => {
     log.debug("useFiles mounted - loading files");
@@ -115,11 +217,18 @@ export function useFiles() {
     setIsUploading(true);
     setError(null);
     setDuplicates([]);
+    setLinks([]);
+    setAlreadyImported([]);
+    setReviewItems([]);
     try {
-      await fileService.uploadFiles(pickedFiles);
-      log.info("Upload complete - reloading file list and starting ingestion poll");
+      const result = await fileService.uploadFiles(pickedFiles);
+      const skipped = result.already_imported ?? [];
+      setAlreadyImported(skipped);
+      log.info("Upload complete - reloading file list", { skipped: skipped.length });
       await loadFiles();
-      startIngestionPolling();
+      // Nothing was accepted, so no ingestion will run and polling would spin
+      // against a status that never changes.
+      if (result.file_ids.length > 0) startIngestionPolling();
       return true;
     } catch (e: any) {
       log.error("uploadFiles failed", e);
@@ -148,22 +257,78 @@ export function useFiles() {
     }
   };
 
+  /**
+   * Remember a photo's viewing orientation.
+   *
+   * Patched into the local list rather than refetching: the whole point is a
+   * turn that sticks, and reloading the list to learn one number would blink
+   * the picture the user is looking at.
+   */
+  const setFileRotation = useCallback(async (file: FileItem, degrees: number) => {
+    try {
+      const result = await fileService.setFileRotation(file.id, degrees);
+      setFiles((current) =>
+        current.map((item) =>
+          item.id === file.id ? { ...item, rotation: result.rotation } : item
+        )
+      );
+      return true;
+    } catch (e: any) {
+      // Not surfaced: the turn is applied on screen either way, and an error
+      // banner over a receipt someone just straightened is more disruptive
+      // than the angle being forgotten by tomorrow.
+      log.error("setFileRotation failed", e);
+      return false;
+    }
+  }, []);
+
+  // Stable identity: this is a prop on every row in the file list, so a new
+  // function each render would defeat FileListItem's memoization and re-render
+  // the whole visible list on every keystroke in the search box.
+  const toggleFileVisibility = useCallback(async (file: FileItem) => {
+    setVisibilityFileId(file.id);
+    try {
+      const result = await fileService.setFileVisibility(file.id, file.type, !file.is_hidden);
+      setFiles((current) => current.map((item) =>
+        item.id === file.id ? { ...item, is_hidden: result.is_hidden } : item
+      ));
+      return true;
+    } catch (e: any) {
+      log.error("toggleFileVisibility failed", e);
+      setError(e.message);
+      return false;
+    } finally {
+      setVisibilityFileId(null);
+    }
+  }, []);
+
   const clearDuplicates = useCallback(() => {
     setDuplicates([]);
+    setAlreadyImported([]);
   }, []);
+
+  const clearLinks = useCallback(() => setLinks([]), []);
 
   return {
     files,
     isLoading,
+    hasLoaded,
     isUploading,
     isIngesting,
     isDeleting,
+    visibilityFileId,
     error,
     duplicates,
+    links,
+    alreadyImported,
+    reviewItems,
     ingestionProgress,
     uploadFiles,
     deleteFile,
+    toggleFileVisibility,
+    setFileRotation,
     loadFiles,
     clearDuplicates,
+    clearLinks,
   };
 }

@@ -6,6 +6,7 @@ import { colors, typography, spacing } from "../styles/theme";
 import { confirmTransaction } from "../services/transactionService";
 import type { PendingTransaction } from "../lib/types";
 import { createLogger } from "../lib/logger";
+import { formatDate, money } from "../lib/format";
 
 const log = createLogger("TransactionConfirmCard");
 
@@ -35,18 +36,6 @@ export function TransactionConfirmCard({ transaction }: Props) {
   const handleCancel = () => {
     setStatus("cancelled");
     log.info("Transaction cancelled by user", { description: transaction.description });
-  };
-
-  const formatDate = (dateStr: string) => {
-    try {
-      return new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", {
-        month: "short",
-        day: "numeric",
-        year: "numeric",
-      });
-    } catch {
-      return dateStr;
-    }
   };
 
   const iconName =
@@ -81,7 +70,7 @@ export function TransactionConfirmCard({ transaction }: Props) {
 
       <View style={styles.details}>
         <DetailRow label="Description" value={transaction.description} />
-        <DetailRow label="Amount" value={`$${transaction.amount.toFixed(2)}`} highlight />
+        <DetailRow label="Amount" value={money(transaction.amount)} highlight />
         <DetailRow label="Date" value={formatDate(transaction.trans_date)} />
         <DetailRow label="Category" value={transaction.category} />
         {transaction.merchant_name !== transaction.description && (

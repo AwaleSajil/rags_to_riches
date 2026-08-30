@@ -1,0 +1,25 @@
+-- Drop MerchantLocation, and stop coordinates reaching the server at all.
+--
+-- It existed to learn which shop you are standing in: the first price check at
+-- a new store asked "which shop is this?", the answer was saved with a fix, and
+-- later captures within ~150m resolved the merchant automatically — store
+-- identification without a billed Places API.
+--
+-- Never built. 0 rows, and nothing ever wrote it: capture_service only read it,
+-- so nearest_merchant() was matching against a list that was always empty.
+-- expo-location was never a dependency either, so no fix ever existed to match.
+--
+-- It was also the last place raw coordinates were stored. PriceObservation.location
+-- is now a resolved place name ("Main St, Norwalk") produced on the device, so
+-- with this table gone no latitude/longitude reaches the database at all. A
+-- shop's location is not secret, but tied to a user_id the set of shops someone
+-- visits says a great deal about where they live and work.
+--
+-- Consequence: capture_photo and POST /captures take a `location` string instead
+-- of latitude/longitude/place_label. The device does the GPS fix and reverse
+-- geocode and sends only the answer.
+--
+-- price_service.nearest_merchant and haversine_m are kept with their tests. They
+-- are pure functions over any list of locations and depend on nothing here, so
+-- whichever way store learning is rebuilt they still apply.
+DROP TABLE IF EXISTS public."MerchantLocation";

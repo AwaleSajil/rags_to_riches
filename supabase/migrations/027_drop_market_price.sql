@@ -1,0 +1,22 @@
+-- Drop MarketPrice. Retailer prices are not stored in this database.
+--
+-- Created by migration 016 as a shared cache of prices fetched from retailers,
+-- so that one user's lookup would spare everyone else the API call. It was never
+-- written to — 0 rows, no code references — and the decision now is not to hold
+-- third-party pricing locally at all.
+--
+-- It was also the only table in the schema without a user_id, which made it the
+-- one exception to every rule the rest of the design relies on: it could not be
+-- scoped by RLS the way every other table is, and it could not be added to
+-- sql_guard.ALLOWED_TABLES because the guard requires a user_id equality in
+-- every SELECT scope. Removing it means that rule now holds everywhere without
+-- exception.
+--
+-- Consequence for the market-price comparison (was Phase 6): prices must be
+-- fetched live per query rather than read from a shared cache. That costs an
+-- LLM round trip each time and the free tier allows few per day, so the feature
+-- needs a per-request budget or an external cache — not a table here.
+--
+-- PriceObservation is unaffected: those are prices the user photographed
+-- themselves, which is their own data, not a third party's.
+DROP TABLE IF EXISTS public."MarketPrice";

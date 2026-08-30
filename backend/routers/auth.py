@@ -3,7 +3,8 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from backend.schemas.auth import LoginRequest, RegisterRequest, AuthResponse, UserInfo
 from backend.config import get_settings, Settings
-from backend.dependencies import get_current_user
+from backend.dependencies import client_for, get_current_user, get_optional_user
+from backend.services import account_service
 from supabase import create_client
 
 logger = logging.getLogger("moneyrag.routers.auth")
@@ -11,15 +12,53 @@ logger = logging.getLogger("moneyrag.routers.auth")
 router = APIRouter()
 
 
+def normalize_email(email: str | None) -> str | None:
+    """Fold an address to the single form the User table is keyed on.
+
+    Matches the unique index added in migration 019 (`lower(email)`). Without
+    this, "Sam@x.com" logging in after signing up as "sam@x.com" would be the
+    same auth account trying to write a second spelling into the mirror, and
+    the index — not the user — would be the one to notice.
+
+    Lowercasing only: dots and +suffixes are Gmail conventions, not email
+    semantics, and collapsing them would merge addresses that really are
+    different people elsewhere.
+    """
+    return email.strip().lower() if email else email
+
+
+# Both layers can refuse a second account for one address, and they word it
+# differently: the auth service rejects the signup outright, while the unique
+# index on lower(email) (migration 019) raises 23505 if a mirror row somehow
+# gets that far. Either way the user's situation is the same, so both map to one
+# clear answer instead of a stack trace.
+_DUPLICATE_EMAIL_MARKERS = (
+    "already registered",
+    "already been registered",
+    "user_already_exists",
+    "duplicate key value",
+    "user_email_lower_key",
+    "23505",
+)
+
+
+def _is_duplicate_email(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in _DUPLICATE_EMAIL_MARKERS)
+
+
 @router.post("/login")
 async def login(
     body: LoginRequest | None = None,
-    user: dict | None = Depends(get_current_user), 
+    user: dict | None = Depends(get_optional_user), 
     settings: Settings = Depends(get_settings)
 ):
     try:
         # If accessed via Swagger/Postman with raw credentials, generate the token first
-        if body and body.email and body.password and (not user or getattr(user, "email", None) is None):
+        # `user` is a dict from a validated token, so it always carries an email —
+        # the old `getattr(user, "email", None)` read None off the dict every time
+        # and re-ran the password flow even for callers who sent a good token.
+        if body and body.email and body.password and not user:
             logger.debug("Generating token dynamically for Swagger UI login email=%s", body.email)
             client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
             res = client.auth.sign_in_with_password({
@@ -33,17 +72,18 @@ async def login(
 
         # Initialize an authenticated client to bypass RLS policies
         from backend.dependencies import get_supabase
-        client = get_supabase(user["access_token"])
+        client = client_for(user)
         
-        logger.debug("Login sync for email=%s", user["email"])
+        email = normalize_email(user["email"])
+        logger.debug("Login sync for email=%s", email)
         client.table("User").upsert({
             "id": user["id"],
-            "email": user["email"],
+            "email": email,
             "hashed_password": "managed_by_supabase_auth",
         }).execute()
-        
+
         return {
-            "user": {"id": user["id"], "email": user["email"]},
+            "user": {"id": user["id"], "email": email},
             "access_token": user.get("access_token"),
         }
     except Exception as e:
@@ -54,11 +94,14 @@ async def login(
 @router.post("/register")
 async def register(
     body: RegisterRequest | None = None,
-    user: dict | None = Depends(get_current_user), 
+    user: dict | None = Depends(get_optional_user), 
     settings: Settings = Depends(get_settings)
 ):
     try:
-        if body and body.email and body.password and (not user or getattr(user, "email", None) is None):
+        # `user` is a dict from a validated token, so it always carries an email —
+        # the old `getattr(user, "email", None)` read None off the dict every time
+        # and re-ran the password flow even for callers who sent a good token.
+        if body and body.email and body.password and not user:
             logger.debug("Generating token dynamically for Swagger UI register email=%s", body.email)
             client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
             res = client.auth.sign_up({
@@ -74,20 +117,32 @@ async def register(
 
         # Initialize an authenticated client to bypass RLS policies
         from backend.dependencies import get_supabase
-        client = get_supabase(user["access_token"])
+        client = client_for(user)
         
-        logger.debug("Register sync for email=%s", user["email"])
+        email = normalize_email(user["email"])
+        logger.debug("Register sync for email=%s", email)
         client.table("User").upsert({
             "id": user["id"],
-            "email": user["email"],
+            "email": email,
             "hashed_password": "managed_by_supabase_auth",
         }).execute()
 
         return {
-            "user": {"id": user["id"], "email": user["email"]},
+            "user": {"id": user["id"], "email": email},
             "message": "Account created successfully",
         }
+    except HTTPException:
+        # Already a considered response (including the 409 below) — re-raise it
+        # rather than rewrapping it as a generic 400 with the status code
+        # stringified into the detail.
+        raise
     except Exception as e:
+        if _is_duplicate_email(e):
+            logger.info("Registration refused — address already in use")
+            raise HTTPException(
+                status_code=409,
+                detail="An account with that email already exists. Try signing in instead.",
+            )
         logger.error("Registration sync failed: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail=f"Signup sync failed: {e}")
 
@@ -96,3 +151,33 @@ async def register(
 async def logout(user: dict = Depends(get_current_user)):
     logger.info("Logout for user_id=%s", user["id"])
     return {"message": "Logged out"}
+
+
+@router.delete("/account")
+async def delete_account(user: dict = Depends(get_current_user)):
+    """Permanently delete the caller's account and everything it owns.
+
+    Required by both stores — Apple guideline 5.1.1(v) and Play's account
+    deletion policy — and required to be reachable from inside the app, not
+    only by writing to support.
+
+    Scoped to the caller by construction: the id comes from the validated JWT,
+    never from the request, so there is no parameter here that could name
+    somebody else's account. That is why this takes no body.
+    """
+    try:
+        result = await account_service.delete_account(user)
+    except RuntimeError as e:
+        # The service key is missing. Say what is wrong plainly instead of a
+        # generic 500 — a user who has decided to leave should not be met with
+        # "something went wrong", and this is a deployment fault, not theirs.
+        logger.error("Account deletion unavailable for user_id=%s: %s", user["id"], e)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Account deletion is temporarily unavailable. Please contact "
+                "support and your account will be removed."
+            ),
+        )
+    logger.info("Account deleted for user_id=%s", user["id"])
+    return {"message": "Your account and all of its data have been deleted", **result}

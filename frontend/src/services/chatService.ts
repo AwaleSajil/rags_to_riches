@@ -6,9 +6,14 @@ import { createLogger } from "../lib/logger";
 const log = createLogger("ChatService");
 
 export interface ChatEventCallbacks {
+  onConversation?: (conversationId: string) => void;
+  /** A piece of the answer as it is generated. Already stripped server-side of
+   *  the ===MARKER=== blocks the UI must never show, so it is safe to render
+   *  straight away. `onFinal` still replaces it with the authoritative text. */
+  onToken?: (text: string) => void;
   onToolStart: (data: { name: string; input: string }) => void;
   onToolEnd: (data: { name: string; snippet: string }) => void;
-  onFinal: (data: { content: string; charts: string[]; images: string[]; pendingTransactions?: any[] }) => void;
+  onFinal: (data: { content: string; charts: string[]; images: string[]; pendingTransactions?: any[]; pendingCorrections?: any[] }) => void;
   onDone: () => void;
   onError: (error: string) => void;
 }
@@ -32,6 +37,15 @@ function processSSEBuffer(
         const data = JSON.parse(dataLine.substring(6));
 
         switch (eventType) {
+          case "conversation":
+            log.info("Conversation id received", { id: data.conversation_id });
+            callbacks.onConversation?.(data.conversation_id);
+            break;
+          // Deliberately not logged per token — one line per few characters
+          // buries every other event in the stream.
+          case "token":
+            callbacks.onToken?.(data.text || "");
+            break;
           case "tool_start":
             log.info("Tool started", { name: data.name, input: data.input?.substring(0, 100) });
             callbacks.onToolStart(data);
@@ -78,7 +92,9 @@ function processSSEBuffer(
 function streamChatXHR(
   message: string,
   token: string | null,
-  callbacks: ChatEventCallbacks
+  callbacks: ChatEventCallbacks,
+  conversationId?: string | null,
+  billFileIds?: string[] | null
 ): Promise<void> {
   log.info("XHR stream starting (mobile)", { messageLength: message.length, hasToken: !!token });
   return new Promise((resolve) => {
@@ -150,13 +166,18 @@ function streamChatXHR(
     };
 
     log.debug("XHR sending request", { url: `${API_URL}/chat` });
-    xhr.send(JSON.stringify({ message }));
+    xhr.send(JSON.stringify({ message, conversation_id: conversationId ?? null, bill_file_ids: billFileIds ?? null }));
   });
 }
 
 export async function streamChat(
   message: string,
-  callbacks: ChatEventCallbacks
+  callbacks: ChatEventCallbacks,
+  conversationId?: string | null,
+  /** Photos this turn is about. Stored with the message so the picture comes
+   *  back on reload — the local file URI shown at the time does not survive,
+   *  and a signed URL would have expired long before. */
+  billFileIds?: string[] | null
 ): Promise<void> {
   let token: string | null = null;
   try {
@@ -179,7 +200,7 @@ export async function streamChat(
   // Use XMLHttpRequest which supports incremental onprogress events.
   if (Platform.OS !== "web") {
     log.info("Using XHR streaming (mobile platform)");
-    return streamChatXHR(message, token, callbacks);
+    return streamChatXHR(message, token, callbacks, conversationId, billFileIds);
   }
 
   // Web: use fetch + ReadableStream for true streaming
@@ -194,7 +215,7 @@ export async function streamChat(
         "Content-Type": "application/json",
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, conversation_id: conversationId ?? null, bill_file_ids: billFileIds ?? null }),
     });
 
     log.info("Fetch response received", { status: response.status, ok: response.ok });

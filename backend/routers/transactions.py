@@ -1,13 +1,119 @@
 import hashlib
 import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from backend.dependencies import get_current_user, get_supabase
-from backend.schemas.transactions import TransactionCreate, TransactionResponse
+from backend.schemas.transactions import (
+    ReceiptReviewInput,
+    TransactionCreate,
+    TransactionDetailsReplace,
+    TransactionListItem,
+    TransactionResponse,
+    TransactionUpdate,
+    TransactionWithDetails,
+)
+from backend.services import transaction_service
+from backend.services.categories import normalize_category
 
 logger = logging.getLogger("moneyrag.routers.transactions")
 
 router = APIRouter()
+
+
+@router.get("", response_model=List[TransactionListItem])
+async def list_transactions(
+    category: Optional[str] = Query(None, description="Exact category match"),
+    start_date: Optional[str] = Query(None, description="Inclusive lower bound (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Inclusive upper bound (YYYY-MM-DD)"),
+    q: Optional[str] = Query(None, description="Text search on merchant/description"),
+    user: dict = Depends(get_current_user),
+):
+    """List the current user's transactions, newest first, with optional filters."""
+    return await transaction_service.list_transactions(
+        user, category=category, start_date=start_date, end_date=end_date, q=q
+    )
+
+
+@router.get("/{transaction_id}", response_model=TransactionWithDetails)
+async def get_transaction(
+    transaction_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Fetch one transaction plus its line items (ordered), including tax breakdown."""
+    tx = await transaction_service.get_transaction(user, transaction_id)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
+
+
+@router.get("/receipt-review/{file_id}")
+async def get_receipt_review(
+    file_id: str,
+    user: dict = Depends(get_current_user),
+):
+    review = await transaction_service.get_receipt_review(user, file_id)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Receipt review is not available")
+    return review
+
+
+@router.post("/receipt-review/{file_id}/verify", response_model=TransactionWithDetails)
+async def verify_receipt_review(
+    file_id: str,
+    body: ReceiptReviewInput,
+    user: dict = Depends(get_current_user),
+):
+    review = body.model_dump()
+    review["date"] = review["date"].isoformat()
+    tx = await transaction_service.verify_receipt(user, file_id, review)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Receipt review is not available")
+    return tx
+
+
+@router.patch("/{transaction_id}", response_model=TransactionWithDetails)
+async def update_transaction(
+    transaction_id: str,
+    body: TransactionUpdate,
+    user: dict = Depends(get_current_user),
+):
+    """Update editable fields. Re-embeds the vector if merchant/category changed."""
+    changes = body.model_dump(exclude_unset=True)
+    if "trans_date" in changes and changes["trans_date"] is not None:
+        changes["trans_date"] = changes["trans_date"].isoformat()
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    tx = await transaction_service.update_transaction(user, transaction_id, changes)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
+
+
+@router.put("/{transaction_id}/details", response_model=TransactionWithDetails)
+async def replace_details(
+    transaction_id: str,
+    body: TransactionDetailsReplace,
+    user: dict = Depends(get_current_user),
+):
+    """Replace all line items for a transaction (edit/add/delete in one shot)."""
+    details = [d.model_dump() for d in body.details]
+    tx = await transaction_service.replace_details(user, transaction_id, details)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return tx
+
+
+@router.delete("/{transaction_id}")
+async def delete_transaction(
+    transaction_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Delete a transaction (line items cascade) and remove its vector(s)."""
+    deleted = await transaction_service.delete_transaction(user, transaction_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return {"message": "Transaction deleted"}
 
 
 @router.post("", response_model=TransactionResponse)
@@ -20,10 +126,19 @@ async def create_transaction(
 
     user_id = user["id"]
 
-    # Content hash (same algorithm as money_rag.py _ingest_csv)
+    # NOT the CSV algorithm, despite what this comment used to claim.
+    # _ingest_csv keys on the bank's verbatim description plus an
+    # occurrence index; there is no description to key on here and no
+    # index, so two identical manual entries on one day collapse to one
+    # row via the upsert below. It is also close enough to the RECEIPT
+    # formula to collide with it: a timeless receipt for a single-word
+    # merchant hashes identically to the same purchase entered by hand.
     date_str = body.trans_date.isoformat()
     amount_str = str(round(body.amount, 2))
-    merchant = (body.merchant_name or body.description).lower().strip().split()[0]
+    # split() on an all-whitespace name yields [], so index only when non-empty —
+    # the hash just loses its merchant component, which dedup tolerates.
+    merchant_words = (body.merchant_name or body.description).lower().strip().split()
+    merchant = merchant_words[0] if merchant_words else ""
     merchant_clean = "".join(c for c in merchant if c.isalnum())
     hash_input = f"{date_str}{amount_str}{merchant_clean}"
     content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
@@ -33,27 +148,21 @@ async def create_transaction(
         "description": body.description,
         "amount": body.amount,
         "trans_date": date_str,
-        "category": body.category,
+        "category": normalize_category(body.category),
         "merchant_name": body.merchant_name or body.description,
         "source": "manual",
         "content_hash": content_hash,
     }
 
-    try:
-        sb = get_supabase(access_token=user.get("access_token"))
-        result = sb.table("Transaction").upsert([record], on_conflict="content_hash").execute()
+    sb = get_supabase(access_token=user.get("access_token"))
+    # Dedup constraint is UNIQUE(user_id, content_hash) — the conflict target
+    # must name both columns or Postgres raises 42P10.
+    result = sb.table("Transaction").upsert(
+        [record], on_conflict="user_id,content_hash"
+    ).execute()
 
-        if result.data:
-            row = result.data[0]
-            return TransactionResponse(
-                id=row["id"],
-                description=row["description"],
-                amount=float(row["amount"]),
-                trans_date=str(row["trans_date"]),
-                category=row.get("category", "Uncategorized"),
-                merchant_name=row.get("merchant_name"),
-            )
-
+    row = result.data[0] if result.data else None
+    if row is None:
         # Fallback: fetch by hash if upsert didn't return data
         fetch = (
             sb.table("Transaction")
@@ -62,19 +171,20 @@ async def create_transaction(
             .eq("user_id", user_id)
             .execute()
         )
-        if fetch.data:
-            row = fetch.data[0]
-            return TransactionResponse(
-                id=row["id"],
-                description=row["description"],
-                amount=float(row["amount"]),
-                trans_date=str(row["trans_date"]),
-                category=row.get("category", "Uncategorized"),
-                merchant_name=row.get("merchant_name"),
-            )
+        row = fetch.data[0] if fetch.data else None
+    if row is None:
         raise HTTPException(status_code=500, detail="Transaction insert returned no data")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to create transaction: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to save transaction: {e}")
+
+    # The bank may export this same purchase weeks from now. Reconcile against
+    # what is already stored so the pair collapses to one row rather than being
+    # counted twice — CSV ingestion does the same in the other direction.
+    await transaction_service.link_manual_transaction(user, str(row["id"]))
+
+    return TransactionResponse(
+        id=row["id"],
+        description=row["description"],
+        amount=float(row["amount"]),
+        trans_date=str(row["trans_date"]),
+        category=row.get("category", "Uncategorized"),
+        merchant_name=row.get("merchant_name"),
+    )

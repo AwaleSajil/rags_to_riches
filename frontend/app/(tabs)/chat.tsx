@@ -1,15 +1,26 @@
-import React, { useRef, useEffect, useCallback } from "react";
+import React, { useRef, useEffect, useCallback, useState } from "react";
 import { StyleSheet, View, FlatList, KeyboardAvoidingView, Platform, useWindowDimensions } from "react-native";
-import { Banner, Text } from "react-native-paper";
-import { useRouter } from "expo-router";
+import { Banner, Snackbar, Text } from "react-native-paper";
+import { useRouter, useFocusEffect, useLocalSearchParams } from "expo-router";
+import { useCameraPermissions } from "expo-camera";
+import * as DocumentPicker from "expo-document-picker";
 import { ChatMessage } from "../../src/components/ChatMessage";
 import { ChatInput } from "../../src/components/ChatInput";
+import type { ChatAttachAction } from "../../src/components/ChatInput";
+import { CameraCapture } from "../../src/components/CameraCapture";
 import { SuggestedPrompts } from "../../src/components/SuggestedPrompts";
+import { savePriceObservation } from "../../src/services/priceService";
+import { discardCapture } from "../../src/services/captureService";
+import type { CaptureResult, PriceTagDraft } from "../../src/services/captureService";
 import { TypingIndicator } from "../../src/components/TypingIndicator";
+import { ConversationDrawer } from "../../src/components/ConversationDrawer";
 import { useChat } from "../../src/hooks/useChat";
+import { useConversations } from "../../src/hooks/useConversations";
 import { useFiles } from "../../src/hooks/useFiles";
+import { useChatSession } from "../../src/providers/ChatSessionProvider";
 import { colors, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
+import { openReview } from "../../src/lib/reviewRouting";
 import type { ChatMessage as ChatMessageType } from "../../src/lib/types";
 
 const log = createLogger("ChatScreen");
@@ -21,11 +32,70 @@ const MAX_CHAT_WIDTH = 720;
 
 export default function ChatScreen() {
   log.debug("ChatScreen rendered");
-  const { messages, isStreaming, currentToolTraces, sendMessage } = useChat();
-  const { files } = useFiles();
+  const {
+    messages,
+    isStreaming,
+    isReceivingText,
+    currentToolTraces,
+    sendMessage,
+    sendPhoto,
+    showCapture,
+    updateCapture,
+    conversationId,
+    loadConversation,
+    newConversation,
+  } = useChat();
+  const { files, hasLoaded: filesLoaded, loadFiles, uploadFiles } = useFiles();
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [snack, setSnack] = useState<string | null>(null);
+  const {
+    conversations,
+    isLoading: convLoading,
+    refresh: refreshConversations,
+    remove: removeConversation,
+  } = useConversations();
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const flatListRef = useRef<FlatList>(null);
+
+  // Files + conversations are loaded per-screen, so re-check on focus —
+  // otherwise the "no data" banner and chat list stay stale after changes elsewhere.
+  useFocusEffect(
+    useCallback(() => {
+      loadFiles();
+      refreshConversations();
+    }, [loadFiles, refreshConversations])
+  );
+
+  // After a message finishes streaming, refresh the list (new chat / title / order).
+  useEffect(() => {
+    if (!isStreaming) refreshConversations();
+  }, [isStreaming]);
+
+  // Wire the native header's ☰ / ＋ buttons to this screen's actions.
+  const { setHandlers } = useChatSession();
+  useEffect(() => {
+    setHandlers({
+      onMenu: () => setDrawerOpen(true),
+      onNewChat: () => newConversation(),
+    });
+  }, [setHandlers, newConversation]);
+
   const router = useRouter();
   const { width: screenWidth } = useWindowDimensions();
+
+  // A photo read by the batch upload path arrives here as a file id: only a
+  // receipt has its own review screen, so price tags and unclassified photos are
+  // routed to this tab, where their card is the review step. Without this the
+  // param was written and never read, and a price tag uploaded from the Files
+  // tab landed on an empty chat window with no way to confirm it.
+  const { captureFileId } = useLocalSearchParams<{ captureFileId?: string }>();
+  useEffect(() => {
+    if (!captureFileId) return;
+    void showCapture(captureFileId);
+    // Cleared so coming back to this tab later does not re-open the same photo.
+    router.setParams({ captureFileId: undefined });
+  }, [captureFileId, showCapture, router]);
 
   const isWide = Platform.OS === "web" && screenWidth > MAX_CHAT_WIDTH;
   const fileCount = files.length;
@@ -46,9 +116,214 @@ export default function ChatScreen() {
     }
   }, [messages.length, isStreaming]);
 
-  const renderItem = useCallback(
-    ({ item }: { item: ChatMessageType }) => <MemoizedChatMessage message={item} />,
+  // A streaming answer grows without changing the message COUNT, so the effect
+  // above never fires for it and the text runs off the bottom of the screen.
+  // Unanimated on purpose: this lands every ~50ms, and animating each one
+  // fights the next.
+  const streamingLength = isReceivingText
+    ? messages[messages.length - 1]?.content?.length ?? 0
+    : 0;
+  useEffect(() => {
+    if (!streamingLength) return;
+    flatListRef.current?.scrollToEnd({ animated: false });
+  }, [streamingLength]);
+
+  // --- capture entry points -------------------------------------------------
+
+  /**
+   * Capture a photo, then hand a receipt straight to the review form.
+   *
+   * A receipt is not finished when the photo is read — it still has to be
+   * checked and confirmed before it becomes a transaction. The Files tab has
+   * always opened that form itself; chat used to stop at a card and wait to be
+   * tapped, so the identical receipt ended up either reviewed or forgotten
+   * depending on which screen it was uploaded from.
+   *
+   * Price tags and unclassified photos stay put: their card *is* the review
+   * step, and it lives here.
+   */
+  const captureAndRoute = useCallback(
+    async (
+      photo: { uri: string; name: string; type: string },
+      place?: string | null
+    ) => {
+      // A resolved place name, never coordinates. Only a live capture has one:
+      // a photo picked from the library was taken somewhere else, and attaching
+      // where the user is NOW would be worse than attaching nothing.
+      const result = await sendPhoto(photo, place || undefined);
+      if (result?.kind === "receipt") {
+        openReview(router, [{ file_id: result.file_id, kind: result.kind }]);
+      }
+    },
+    [sendPhoto, router]
+  );
+
+  const openCamera = useCallback(async () => {
+    if (!cameraPermission?.granted) {
+      const result = await requestCameraPermission();
+      if (!result.granted) {
+        log.warn("Camera permission denied");
+        return;
+      }
+    }
+    setCameraOpen(true);
+  }, [cameraPermission?.granted, requestCameraPermission]);
+
+  const pickImage = useCallback(async () => {
+    const result = await DocumentPicker.getDocumentAsync({
+      type: ["image/png", "image/jpeg"],
+      multiple: false,
+    });
+    if (result.canceled || !result.assets?.length) return;
+    const asset = result.assets[0];
+    await captureAndRoute({
+      uri: asset.uri,
+      name: asset.name,
+      type: asset.mimeType || "image/jpeg",
+    });
+  }, [captureAndRoute]);
+
+  const pickDocument = useCallback(async () => {
+    // CSVs still go through the batch pipeline — it handles dedup, enrichment
+    // and vector indexing that a single-photo capture has no need for.
+    const result = await DocumentPicker.getDocumentAsync({
+      type: ["text/csv", "text/comma-separated-values", "application/vnd.ms-excel"],
+      multiple: true,
+    });
+    if (result.canceled || !result.assets?.length) return;
+    const picked = result.assets.map((a) => ({
+      uri: a.uri,
+      name: a.name,
+      type: a.mimeType || "text/csv",
+    }));
+    const ok = await uploadFiles(picked);
+    setSnack(
+      ok
+        ? "Statement uploaded — processing in the background."
+        : "That upload didn't work. Try the Files tab?"
+    );
+  }, [uploadFiles]);
+
+  const handleAttach = useCallback(
+    (action: ChatAttachAction) => {
+      if (action === "camera") return void openCamera();
+      if (action === "library") return void pickImage();
+      return void pickDocument();
+    },
+    [openCamera, pickImage, pickDocument]
+  );
+
+  // A shelf photo is not stored until it is confirmed, so the id the card holds
+  // is a CAPTURE handle and the id the photo ends up with is a different one.
+  // Remembering the mapping is what lets the question carry the real id — the
+  // capture id was being stored with the message, matched nothing on reload, and
+  // the picture silently did not come back.
+  const storedFileIds = useRef<Record<string, string>>({});
+
+  const handleConfirmPriceTag = useCallback(
+    async (fileId: string, draft: PriceTagDraft & { tag_index: number }) => {
+      const saved = await savePriceObservation(fileId, draft);
+      if (saved.bill_file_id) storedFileIds.current[fileId] = saved.bill_file_id;
+      return saved.comparison ?? null;
+    },
     []
+  );
+
+  /**
+   * Ask the agent about a whole photo's worth of confirmed prices, in ONE turn.
+   *
+   * This used to fire per tag. Two tags meant two chat turns started back to
+   * back — and because no re-render happens between them, the second one's
+   * `isStreaming` guard still read false, so both ran. They raced on the same
+   * conversation and the second answer inherited the first's context, which is
+   * why confirming potatoes and yams produced two replies both leading with
+   * potatoes.
+   */
+  const handleAskAboutPrices = useCallback(
+    (drafts: (PriceTagDraft & { tag_index: number })[], fileId?: string) => {
+      const describe = (d: PriceTagDraft) => {
+        const size = d.size_value
+          ? ` (${d.size_value}${d.size_unit ? " " + d.size_unit : ""})`
+          : "";
+        const store = d.merchant_name ? ` at ${d.merchant_name}` : "";
+        const tag = d.item_qualitative_description
+          ? ` [tag says: "${d.item_qualitative_description}"]`
+          : "";
+        return `${d.item_description}${size} — $${d.item_subtotal_price}${store}${tag}`;
+      };
+      const many = drafts.length > 1;
+      // The photo id travels with the question, so reopening this conversation
+      // shows the picture again. Only a CONFIRMED capture has one — an
+      // unconfirmed shelf photo is never stored, so there is nothing to replay.
+      void sendMessage(
+        `${drafts.map(describe).join("; ")}. Already recorded, don't save again. ` +
+          (many ? "Good prices? Answer each one separately and briefly." : "Good price?"),
+        // The stored id, not the capture handle it started as.
+        fileId && storedFileIds.current[fileId]
+          ? [storedFileIds.current[fileId]]
+          : undefined
+      );
+    },
+    [sendMessage]
+  );
+
+  /**
+   * Throw a captured photo away for real.
+   *
+   * Discard was local UI state only: the card said "Discarded" while the photo
+   * and its BillFile row stayed exactly where they were, so a tag the user had
+   * explicitly dismissed still turned up in the Files tab. Deleting the file
+   * takes its observations and vectors with it via ON DELETE CASCADE.
+   */
+  const handleDiscardCapture = useCallback(
+    async (fileId: string) => {
+      // /captures, not /files: an unconfirmed capture has no BillFile row to
+      // delete, because a shelf photo is not stored until you confirm it.
+      await discardCapture(fileId);
+      // Only matters once the photo was confirmed and does have a row.
+      await loadFiles();
+    },
+    [loadFiles]
+  );
+
+  // Answering "which is this?" with "receipt" reaches the review form too —
+  // otherwise resolving a photo by hand would be the one way to end up with an
+  // un-reviewed receipt.
+  const handleKindResolved = useCallback(
+    (fileId: string, result: CaptureResult) => {
+      // Matched on the OLD id, because that is what the message on screen holds.
+      updateCapture(fileId, result);
+      if (result.kind === "receipt") {
+        // Opened with the NEW one. Answering "receipt" stores the photo, which
+        // mints a BillFile id and returns it — `fileId` here is still the
+        // capture handle, and it names no row, so routing with it landed on
+        // "Receipt review is not available".
+        openReview(router, [{ file_id: result.file_id, kind: result.kind }]);
+      }
+    },
+    [updateCapture, router]
+  );
+
+  const handleRerun = useCallback((text: string) => void sendMessage(text), [sendMessage]);
+
+  const renderItem = useCallback(
+    ({ item }: { item: ChatMessageType }) => (
+      <MemoizedChatMessage
+        message={item}
+        onRerun={handleRerun}
+        rerunDisabled={isStreaming}
+        onKindResolved={handleKindResolved}
+        onConfirmPriceTag={handleConfirmPriceTag}
+        onDiscardCapture={handleDiscardCapture}
+        onAskAboutPrices={handleAskAboutPrices}
+        // Still reachable: the card stays in the thread after review, so this
+        // is how the user gets back to a receipt they left or want to edit.
+        onReviewReceipt={(fileId) =>
+          openReview(router, [{ file_id: fileId, kind: "receipt" }])
+        }
+      />
+    ),
+    [handleKindResolved, handleConfirmPriceTag, handleDiscardCapture, handleAskAboutPrices, router, handleRerun, isStreaming]
   );
 
   const keyExtractor = useCallback((_: ChatMessageType, i: number) => String(i), []);
@@ -63,8 +338,24 @@ export default function ChatScreen() {
 
   return (
     <KeyboardAvoidingView {...wrapperProps}>
-      {/* File status banner */}
-      {fileCount === 0 && (
+      <ConversationDrawer
+        visible={drawerOpen}
+        conversations={conversations}
+        activeId={conversationId}
+        isLoading={convLoading}
+        onClose={() => setDrawerOpen(false)}
+        onSelect={(id) => loadConversation(id)}
+        onNew={() => newConversation()}
+        onDelete={async (id) => {
+          await removeConversation(id);
+          if (id === conversationId) newConversation();
+        }}
+      />
+
+      {/* File status banner. Waits for the first load to finish: `files` is
+          empty before the response arrives too, so checking only the count
+          flashed "no data loaded yet" on every launch and then withdrew it. */}
+      {filesLoaded && fileCount === 0 && (
         <Banner
           visible
           style={styles.warningBanner}
@@ -93,12 +384,17 @@ export default function ChatScreen() {
         maxToRenderPerBatch={5}
         removeClippedSubviews={false}
         ListEmptyComponent={
-          <SuggestedPrompts onSelectPrompt={sendMessage} />
+          <SuggestedPrompts
+            onSelectPrompt={sendMessage}
+            onAction={handleAttach}
+          />
         }
       />
 
-      {/* Streaming indicator with live tool status */}
-      {isStreaming && (
+      {/* Streaming indicator with live tool status. Hidden once the answer
+          itself starts arriving — "Thinking..." underneath text that is
+          visibly being written is just noise. */}
+      {isStreaming && !isReceivingText && (
         <View style={[styles.streamingIndicator, responsiveStyle]}>
           {currentToolTraces.length > 0 ? (
             <View style={styles.toolStatus}>
@@ -125,9 +421,22 @@ export default function ChatScreen() {
       {/* Chat input */}
       <View style={isWide ? styles.inputWrapper : undefined}>
         <View style={responsiveStyle}>
-          <ChatInput onSend={sendMessage} disabled={isStreaming} />
+          <ChatInput onSend={sendMessage} onAttach={handleAttach} disabled={isStreaming} />
         </View>
       </View>
+
+      <CameraCapture
+        visible={cameraOpen}
+        onCapture={(photo, place) => {
+          setCameraOpen(false);
+          void captureAndRoute(photo, place);
+        }}
+        onClose={() => setCameraOpen(false)}
+      />
+
+      <Snackbar visible={!!snack} onDismiss={() => setSnack(null)} duration={4000}>
+        {snack || ""}
+      </Snackbar>
     </KeyboardAvoidingView>
   );
 }

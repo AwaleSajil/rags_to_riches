@@ -5,6 +5,7 @@ import { colors } from "../styles/theme";
 interface DeleteConfirmModalProps {
   visible: boolean;
   filename: string;
+  loading?: boolean;
   onConfirm: () => void;
   onDismiss: () => void;
 }
@@ -12,6 +13,7 @@ interface DeleteConfirmModalProps {
 export function DeleteConfirmModal({
   visible,
   filename,
+  loading = false,
   onConfirm,
   onDismiss,
 }: DeleteConfirmModalProps) {
@@ -26,17 +28,19 @@ export function DeleteConfirmModal({
           </Text>
         </Dialog.Content>
         <Dialog.Actions>
-          <Button onPress={onDismiss} textColor={colors.textSecondary}>
+          <Button onPress={onDismiss} textColor={colors.textSecondary} disabled={loading}>
             Cancel
           </Button>
           <Button
             onPress={onConfirm}
+            disabled={loading}
+            loading={loading}
             textColor="#ffffff"
             mode="contained"
             buttonColor={colors.error}
             style={{ borderRadius: 8 }}
           >
-            Delete
+            {loading ? "Deleting…" : "Delete"}
           </Button>
         </Dialog.Actions>
       </Dialog>

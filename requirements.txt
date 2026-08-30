@@ -24,8 +24,15 @@ langchain-mcp-adapters>=0.2.1
 ddgs>=7.0.0
 
 # --- Vector DB & Data ---
-qdrant-client>=1.16.2
-langchain-qdrant>=1.1.0
+# sqlglot parses the SQL the chat agent writes so it can be validated before it
+# reaches the database (backend/sql_guard.py).
+sqlglot>=27.0.0
+# langchain-postgres was dropped in migration 026. Vectors live in `embedding`
+# columns on Transaction and TransactionDetail, queried through SQL functions
+# (match_transactions / match_purchase_history), so no vector-store library is
+# involved. langchain-core is still used for the Embeddings interface, and
+# langchain/langgraph for the agent itself.
+psycopg[binary]>=3.2.0
 sqlalchemy>=2.0.45
 pandas>=2.3.3
 redis>=7.1.0
@@ -38,11 +45,18 @@ httpx>=0.28.1
 requests>=2.32.5
 tenacity>=9.1.2
 
+# Fernet, for encrypting stored API keys at rest (backend/crypto.py). Pinned
+# explicitly rather than relied on as a transitive dependency of supabase.
+cryptography>=43.0.0
+
 
 supabase>=2.28.0
 plotly>=6.5.2
 
 psycopg2-binary>=2.9.11
+
+# Re-encoding stored receipt photos (scripts/backfill_compress_images.py)
+Pillow>=11.0.0
 
 
 

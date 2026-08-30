@@ -1,11 +1,14 @@
 import React, { useState, useEffect } from "react";
-import { StyleSheet, View, ScrollView } from "react-native";
+import { StyleSheet, View, ScrollView, Linking } from "react-native";
 import { Text, TextInput, Button, Snackbar, Switch, Dialog, Portal } from "react-native-paper";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { GlassCard } from "../../src/components/GlassCard";
 import { ProviderModelPicker } from "../../src/components/ProviderModelPicker";
 import { ApiKeyHelp } from "../../src/components/ApiKeyHelp";
 import { LoadingSpinner } from "../../src/components/LoadingSpinner";
 import { useConfig } from "../../src/hooks/useConfig";
+import { useAuth } from "../../src/providers/AuthProvider";
+import { LEGAL_URLS } from "../../src/lib/apiUrl";
 import { colors, typography, spacing } from "../../src/styles/theme";
 import { createLogger } from "../../src/lib/logger";
 
@@ -13,13 +16,27 @@ const log = createLogger("ConfigScreen");
 
 export default function ConfigScreen() {
   const { config, isLoading, isSaving, error, saveConfig } = useConfig();
+  const { user, deleteAccount } = useAuth();
 
   const [provider, setProvider] = useState("Google");
   const [decodeModel, setDecodeModel] = useState("gemini-3-flash-preview");
   const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-001");
+  // Only ever holds a key the user just typed. The server does not send stored
+  // keys back, so a blank field means "keep whatever is saved", not "no key".
   const [apiKey, setApiKey] = useState("");
+  const [keyOnServer, setKeyOnServer] = useState<{ set: boolean; hint: string }>({
+    set: false,
+    hint: "",
+  });
+  const [showApiKey, setShowApiKey] = useState(false);
   const [saved, setSaved] = useState(false);
   const [deepEnrichment, setDeepEnrichment] = useState(false);
+  // Deleting the account. Typed confirmation rather than a bare "are you sure":
+  // this is irreversible and takes every receipt and statement with it, so it
+  // should be hard to do by accident on a phone.
+  const [showDeleteAccount, setShowDeleteAccount] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [isDeleting, setIsDeleting] = useState(false);
   const [showWarning, setShowWarning] = useState(false);
   const [snackbar, setSnackbar] = useState({ visible: false, message: "", error: false });
 
@@ -30,18 +47,20 @@ export default function ConfigScreen() {
         provider: config.llm_provider,
         decodeModel: config.decode_model,
         embeddingModel: config.embedding_model,
-        hasApiKey: !!config.api_key,
+        hasApiKey: config.api_key_set,
       });
       setProvider(config.llm_provider || "Google");
       setDecodeModel(config.decode_model || "gemini-3-flash-preview");
       setEmbeddingModel(config.embedding_model || "gemini-embedding-001");
-      setApiKey(config.api_key || "");
+      setKeyOnServer({ set: !!config.api_key_set, hint: config.api_key_hint || "" });
       setDeepEnrichment(config.deep_enrichment || false);
     }
   }, [config]);
 
   const handleSave = async () => {
-    if (!apiKey) {
+    // A blank field is fine once a key is stored — it means "leave it alone",
+    // which is what you want when only the model changed.
+    if (!apiKey.trim() && !keyOnServer.set) {
       log.warn("Save attempted without API key");
       setSnackbar({ visible: true, message: "API Key is required.", error: true });
       return;
@@ -65,13 +84,18 @@ export default function ConfigScreen() {
     });
     const ok = await saveConfig({
       llm_provider: provider,
-      api_key: apiKey,
+      // Sent only when the user typed one, so an untouched field cannot
+      // overwrite the stored key with a blank.
+      ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
       decode_model: decodeModel,
       embedding_model: embeddingModel,
       deep_enrichment: deepEnrichment,
     });
     if (ok) {
       log.info("Config saved successfully from UI");
+      // Clear the field — the key is on the server now, and holding it in
+      // component state serves no purpose beyond leaving it on screen.
+      setApiKey("");
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
       setSnackbar({
@@ -92,6 +116,30 @@ export default function ConfigScreen() {
   if (isLoading) {
     return <LoadingSpinner message="Loading configuration..." />;
   }
+
+  const canConfirmDelete =
+    deleteConfirmation.trim().toLowerCase() === (user?.email ?? "").toLowerCase();
+
+  const handleDeleteAccount = async () => {
+    if (!canConfirmDelete) return;
+    setIsDeleting(true);
+    try {
+      await deleteAccount();
+      // No navigation call: clearing the user drops the app back to the login
+      // screen through the root layout's auth guard, which is the same route
+      // signing out takes.
+      log.info("Account deleted");
+    } catch (e: any) {
+      setIsDeleting(false);
+      setShowDeleteAccount(false);
+      setDeleteConfirmation("");
+      setSnackbar({
+        visible: true,
+        message: e?.message || "Could not delete your account. Please try again.",
+        error: true,
+      });
+    }
+  };
 
   return (
     <View style={styles.container}>
@@ -118,12 +166,36 @@ export default function ConfigScreen() {
           <Text style={styles.sectionSubtitle}>
             Required to process your financial data
           </Text>
+          {keyOnServer.set && (
+            <View style={styles.keyStatusRow}>
+              <MaterialCommunityIcons
+                name="check-circle"
+                size={16}
+                color={colors.success}
+              />
+              <Text style={styles.keyStatusText}>
+                Key saved{keyOnServer.hint ? ` · ${keyOnServer.hint}` : ""}
+              </Text>
+            </View>
+          )}
           <TextInput
             mode="outlined"
-            placeholder="Enter your API key"
+            placeholder={keyOnServer.set ? "Enter a new key to replace it" : "Enter your API key"}
             value={apiKey}
             onChangeText={setApiKey}
-            secureTextEntry
+            // The stored key is never sent back, so the field cannot show what
+            // is saved — which makes a typo in a freshly pasted key invisible.
+            // The reveal toggle is how you check it.
+            secureTextEntry={!showApiKey}
+            autoCapitalize="none"
+            autoCorrect={false}
+            right={
+              <TextInput.Icon
+                icon={showApiKey ? "eye-off" : "eye"}
+                onPress={() => setShowApiKey((v) => !v)}
+                accessibilityLabel={showApiKey ? "Hide API key" : "Show API key"}
+              />
+            }
             style={styles.input}
             outlineStyle={styles.outline}
             dense
@@ -165,6 +237,52 @@ export default function ConfigScreen() {
         >
           {saved ? "Saved!" : "Save Configuration"}
         </Button>
+
+        {/* Reviewers look for these, and a user who wants to know what happens
+            to their bank statements should not have to leave the app to find
+            out. Opened in the browser rather than rendered in-app: they are the
+            same URLs submitted to the stores, so there is one canonical copy. */}
+        <GlassCard style={styles.section}>
+          <Text style={styles.sectionTitle}>About</Text>
+          <Button
+            mode="text"
+            onPress={() => Linking.openURL(LEGAL_URLS.privacy)}
+            icon="shield-lock-outline"
+            contentStyle={styles.legalButtonContent}
+          >
+            Privacy Policy
+          </Button>
+          <Button
+            mode="text"
+            onPress={() => Linking.openURL(LEGAL_URLS.terms)}
+            icon="file-document-outline"
+            contentStyle={styles.legalButtonContent}
+          >
+            Terms of Service
+          </Button>
+        </GlassCard>
+
+        {/* Required in-app by both stores: Apple guideline 5.1.1(v) and Play's
+            account deletion policy. Both are explicit that clearing data, or
+            pointing at a support address, does not count — the account itself
+            has to go, from here. */}
+        <GlassCard style={styles.section}>
+          <Text style={styles.sectionTitle}>Delete account</Text>
+          <Text style={styles.sectionSubtitle}>
+            Permanently deletes your account and everything in it — every uploaded
+            statement, every receipt photo, all transactions and prices, and your
+            saved API key. This cannot be undone and there is no recovery.
+          </Text>
+          <Button
+            mode="outlined"
+            onPress={() => setShowDeleteAccount(true)}
+            textColor={colors.error}
+            style={styles.deleteAccountButton}
+            icon="delete-forever-outline"
+          >
+            Delete my account
+          </Button>
+        </GlassCard>
       </ScrollView>
 
       <Portal>
@@ -182,6 +300,55 @@ export default function ConfigScreen() {
           <Dialog.Actions>
             <Button onPress={() => setShowWarning(false)}>Cancel</Button>
             <Button onPress={executeSave}>Proceed</Button>
+          </Dialog.Actions>
+        </Dialog>
+
+        <Dialog
+          visible={showDeleteAccount}
+          onDismiss={() => !isDeleting && setShowDeleteAccount(false)}
+        >
+          <Dialog.Title>Delete your account?</Dialog.Title>
+          <Dialog.Content>
+            <Text variant="bodyMedium">
+              This permanently deletes your account and everything stored with it:
+              uploaded bank statements, receipt photos, transactions, price notes
+              and your saved API key. It cannot be undone.
+              {"\n\n"}
+              Type your email address to confirm.
+            </Text>
+            <TextInput
+              mode="outlined"
+              label="Email address"
+              value={deleteConfirmation}
+              onChangeText={setDeleteConfirmation}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+              disabled={isDeleting}
+              style={styles.deleteConfirmInput}
+            />
+          </Dialog.Content>
+          <Dialog.Actions>
+            <Button
+              onPress={() => {
+                setShowDeleteAccount(false);
+                setDeleteConfirmation("");
+              }}
+              disabled={isDeleting}
+              textColor={colors.textSecondary}
+            >
+              Cancel
+            </Button>
+            <Button
+              onPress={handleDeleteAccount}
+              disabled={!canConfirmDelete || isDeleting}
+              loading={isDeleting}
+              mode="contained"
+              buttonColor={colors.error}
+              textColor="#ffffff"
+            >
+              {isDeleting ? "Deleting…" : "Delete forever"}
+            </Button>
           </Dialog.Actions>
         </Dialog>
       </Portal>
@@ -212,6 +379,17 @@ const styles = StyleSheet.create({
   section: {
     marginBottom: spacing.lg,
   },
+  legalButtonContent: {
+    justifyContent: "flex-start",
+  },
+  deleteAccountButton: {
+    marginTop: spacing.sm,
+    borderColor: colors.error,
+    borderRadius: 8,
+  },
+  deleteConfirmInput: {
+    marginTop: spacing.md,
+  },
   sectionTitle: {
     ...typography.h3,
     color: colors.text,
@@ -224,6 +402,16 @@ const styles = StyleSheet.create({
   },
   input: {
     backgroundColor: colors.surface,
+  },
+  keyStatusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  keyStatusText: {
+    ...typography.caption,
+    color: colors.textSecondary,
   },
   outline: {
     borderRadius: 10,

@@ -2,10 +2,13 @@ import os
 import sys
 import uuid
 import asyncio
+import logging
 import pandas as pd
 import sqlite3
 import shutil
 import tempfile
+import re
+from datetime import timedelta
 from typing import List, Optional
 from dataclasses import dataclass
 
@@ -18,8 +21,20 @@ from langgraph.runtime import get_runtime
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.agents import create_agent
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_mcp_adapters.client import MultiServerMCPClient  
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from backend.vector_db_client import get_vector_client
+from backend.services import stream_gate as markers
+from backend.services.purchase_match import (
+    MAX_LINK_AMOUNT_GAP,
+    MAX_LINK_DAY_GAP,
+    csv_row_hash,
+    csv_row_signature,
+    has_key,
+    name_match,
+    row_keys,
+)
+from backend.services.upload_utils import content_type_for, is_image
+from backend.services.naming import photo_extension, slugify
 
 # Import specific embeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -30,12 +45,148 @@ from supabase import create_client, ClientOptions
 from dotenv import load_dotenv
 load_dotenv()
 
+# Ingestion used to print() its progress and swallow its failures into stdout,
+# where they are invisible to any log aggregator and carry no level, timestamp
+# or user context. Progress for the UI still goes to stderr as JSON — see
+# _emit_progress — which is a separate channel with a parser on the other end.
+logger = logging.getLogger("moneyrag.money_rag")
+
+
+def _chunk_calls_tool(chunk) -> bool:
+    """True when this streamed chunk is part of the model choosing a tool.
+
+    Providers signal it differently — LangChain normalises most into
+    `tool_call_chunks`, but Gemini and older OpenAI paths put it in
+    additional_kwargs — so check both rather than trusting one shape.
+    """
+    if getattr(chunk, "tool_call_chunks", None):
+        return True
+    if getattr(chunk, "tool_calls", None):
+        return True
+    extra = getattr(chunk, "additional_kwargs", None) or {}
+    return bool(extra.get("function_call") or extra.get("tool_calls"))
+
+
+def _chunk_text(chunk) -> str:
+    """The human-readable text in a streamed chunk, if any.
+
+    `content` is a plain string for most providers and a list of typed blocks
+    for others; only the text blocks are the answer.
+    """
+    raw = getattr(chunk, "content", None)
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts = [
+            block["text"]
+            for block in raw
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        ]
+        return "".join(parts)
+    return ""
+
+
+
+# The whole match rule — the name test and the date/amount windows above —
+# lives in backend/services/purchase_match.py (imported above), shared with the
+# receipt-verified-last direction in transaction_service.py. The two used to
+# carry a copy each and had already drifted apart — see that module's docstring.
+
+
+def pair_same_purchase(rows: List[dict], csv_id: str) -> List[tuple]:
+    """Pair rows from CSV `csv_id` with earlier rows describing the same purchase.
+
+    Returns (new_row, existing_row) pairs, at most one per row on either side.
+
+    That one-to-one rule is the whole point. The obvious version — emit every
+    pair that matches — chains: three £4.50 coffees on consecutive days all
+    match each other inside the ±1 day posting window, and because the
+    transactions list collapses a linked component into a single row, three
+    purchases displayed as one and the month under-reported. Here each row may
+    claim at most one partner, and the closest pairings are settled first.
+
+    Pure and database-free so the pairing can actually be tested; the caller
+    turns the result into TransactionLink rows.
+    """
+    prepared = []
+    for row in rows:
+        keys = row_keys(row)
+        if not has_key(keys):
+            continue
+        try:
+            when = pd.to_datetime(row["trans_date"]).date()
+            amount = float(row["amount"])
+        except (TypeError, ValueError):
+            continue
+        prepared.append({"row": row, "keys": keys, "date": when, "amount": amount})
+
+    # Bucketed by date, the tightest filter available, so each new row consults
+    # three buckets instead of the entire history. The name keys and the parsed
+    # date are computed once per row rather than once per comparison — they used
+    # to sit inside the inner loop, which meant a regex and two date parses per
+    # pair, millions of them on a long history.
+    by_date: dict = {}
+    for info in prepared:
+        if info["row"].get("source_csv_id") == csv_id:
+            continue
+        # "manual" included: a purchase the user described in chat and
+        # confirmed is as real as one off a statement, and when the bank
+        # export arrives later the two are the same money. Left out, that
+        # pair could never be reconciled by anything — no link exists for
+        # the deduped view to act on, so the cost is counted twice forever.
+        if info["row"].get("source") not in ("csv", "bill", "manual"):
+            continue
+        by_date.setdefault(info["date"], []).append(info)
+
+    # Score every allowable pairing, then settle them best-first. Scored
+    # globally rather than row by row: taking the first match in file order
+    # would let an early row claim a partner that fits a later one better.
+    scored = []
+    for info in prepared:
+        if info["row"].get("source_csv_id") != csv_id:
+            continue
+        for offset in range(-MAX_LINK_DAY_GAP, MAX_LINK_DAY_GAP + 1):
+            for other in by_date.get(info["date"] + timedelta(days=offset), []):
+                if str(other["row"]["id"]) == str(info["row"]["id"]):
+                    continue
+                strength = name_match(info["keys"], other["keys"])
+                if strength is None:
+                    continue
+                amount_gap = abs(info["amount"] - other["amount"])
+                if amount_gap > MAX_LINK_AMOUNT_GAP:
+                    continue
+                scored.append((
+                    (
+                        abs(offset),                     # same day first
+                        round(amount_gap, 2),            # then closest amount
+                        strength,                        # then the surest name match
+                        str(info["row"]["id"]),          # deterministic tiebreak
+                        str(other["row"]["id"]),
+                    ),
+                    info["row"],
+                    other["row"],
+                ))
+    scored.sort(key=lambda item: item[0])
+
+    claimed = set()
+    pairs = []
+    for _, new_row, other in scored:
+        new_id, other_id = str(new_row["id"]), str(other["id"])
+        if new_id in claimed or other_id in claimed:
+            continue
+        claimed.add(new_id)
+        claimed.add(other_id)
+        pairs.append((new_row, other))
+    return pairs
+
+
 class MoneyRAG:
     def __init__(self, llm_provider: str, model_name: str, embedding_model_name: str, api_key: str, user_id: str, access_token: str = None, deep_enrichment: bool = False):
         self.llm_provider = llm_provider.lower()
         self.model_name = model_name
         self.embedding_model_name = embedding_model_name
         self.user_id = user_id
+        self.access_token = access_token
         self.deep_enrichment = deep_enrichment
         # Initialize Supabase Client (always needed for auth, storage, and data)
         url = os.environ.get("SUPABASE_URL")
@@ -48,25 +199,33 @@ class MoneyRAG:
         else:
             self.supabase = create_client(url, key)
         
-        # Set API Keys
+        # Keys are passed straight to each client rather than exported to
+        # os.environ: one process serves every logged-in user, so a global would
+        # mean whoever constructed a MoneyRAG last decides which key everyone's
+        # requests are billed to.
+        self.api_key = api_key
         if self.llm_provider == "google":
-            os.environ["GOOGLE_API_KEY"] = api_key
-            self.embeddings = GoogleGenerativeAIEmbeddings(model=embedding_model_name)
+            self.embeddings = GoogleGenerativeAIEmbeddings(
+                model=embedding_model_name, google_api_key=api_key
+            )
             provider_name = "google_genai"
         else:
-            os.environ["OPENAI_API_KEY"] = api_key
-            self.embeddings = OpenAIEmbeddings(model=embedding_model_name)
+            self.embeddings = OpenAIEmbeddings(
+                model=embedding_model_name, openai_api_key=api_key
+            )
             provider_name = "openai"
 
         # Initialize LLM
         self.llm = init_chat_model(
             self.model_name,
             model_provider=provider_name,
+            api_key=api_key,
         )
 
-        # Temporary paths for this session
+        # Temporary paths for this session. temp_dir is handed to the MCP server
+        # through its own env at launch (see chat()) — never via os.environ here,
+        # which another user's instance would immediately overwrite.
         self.temp_dir = tempfile.mkdtemp()
-        os.environ["DATA_DIR"] = self.temp_dir # Harmonize with mcp_server.py 
         self.db_path = os.path.join(self.temp_dir, "money_rag.db")
         
         self.db: Optional[SQLDatabase] = None
@@ -88,11 +247,16 @@ class MoneyRAG:
         res = q.execute()
         return res.data or []
 
-    def _db_select_in(self, table: str, columns: str, field: str, values_list: list) -> List[dict]:
-        """SELECT rows WHERE field IN (...)."""
+    def _db_select_in(
+        self, table: str, columns: str, field: str, values_list: list, filters: dict = None
+    ) -> List[dict]:
+        """SELECT rows WHERE field IN (...), optionally narrowed by equality filters."""
         if not values_list:
             return []
-        res = self.supabase.table(table).select(columns).in_(field, values_list).execute()
+        q = self.supabase.table(table).select(columns).in_(field, values_list)
+        for k, v in (filters or {}).items():
+            q = q.eq(k, v)
+        res = q.execute()
         return res.data or []
 
     def _db_upsert(self, table: str, records: List[dict], conflict_key: str = None):
@@ -120,32 +284,190 @@ class MoneyRAG:
             q = q.eq(k, v)
         q.execute()
 
+    def _known_merchant_names(self, descriptions: List[str]) -> dict:
+        """Names this user's earlier uploads already gave these descriptions.
+
+        `merchant_name` is generated by the enrichment model, one call per
+        upload, so the same statement line comes back named differently each
+        time — "Credit Card Payment" in one export, "Online Payment" in the
+        next. Nothing downstream expects that: linking, grouping and search all
+        assume one merchant has one name.
+
+        Reusing the stored name makes the mapping stable by construction rather
+        than by hoping the model repeats itself, and skips an LLM call for every
+        description already seen. Only genuinely new descriptions reach the
+        model at all.
+        """
+        if not descriptions:
+            return {}
+
+        rows = []
+        # Chunked smaller than the content-hash lookup below: these go into the
+        # same URL-encoded IN clause, and a statement description is both longer
+        # than a hash and full of characters that encode to three bytes each.
+        # A chunk that fails costs its own descriptions an LLM call, not the
+        # whole file's — one description postgrest cannot quote should not undo
+        # the consistency of every other row in the upload.
+        for i in range(0, len(descriptions), 50):
+            try:
+                rows.extend(self._db_select_in(
+                    "Transaction", "description,merchant_name,enriched_info",
+                    "description", descriptions[i:i + 50],
+                    filters={"user_id": self.user_id},
+                ))
+            except Exception as e:
+                logger.warning("Merchant name lookup failed for one batch: %s", e)
+
+        # A description may already carry several names, from uploads made
+        # before this lookup existed. The most-used one wins, alphabetical on a
+        # tie, so the choice is stable across runs rather than dependent on
+        # whichever row the database happened to return first.
+        tally: dict = {}
+        for row in rows:
+            name = row.get("merchant_name")
+            if not row.get("description") or not name:
+                continue
+            entry = tally.setdefault(row["description"], {})
+            info = row.get("enriched_info") or ""
+            count, best_info = entry.get(name, (0, ""))
+            entry[name] = (count + 1, best_info or info)
+
+        known = {}
+        for description, names in tally.items():
+            name, (_, info) = min(names.items(), key=lambda kv: (-kv[1][0], kv[0]))
+            known[description] = {"merchant_name": name, "enriched_info": info}
+        if known:
+            logger.info("Reusing %d merchant name(s) from earlier uploads", len(known))
+        return known
+
+    def _link_new_csv_transactions(self, csv_id: str) -> List[dict]:
+        """Record the pairings found by `pair_same_purchase` as TransactionLinks.
+
+        Links, never merges or deletes: a bank statement line and a receipt are
+        both durable records of one purchase and neither is safe to discard.
+
+        Returns one summary per link created, so the upload screen can say how
+        many rows of this file already existed elsewhere. Without that the
+        overlap is invisible at upload time: the transactions list quietly
+        collapses each linked pair to a single row, so a statement re-exported
+        with a week of overlap looks like it imported fewer rows than it had.
+        """
+        if not csv_id:
+            return []
+        columns = "id,trans_date,amount,merchant_name,description,enriched_info,source,source_csv_id"
+        rows = self._db_select("Transaction", columns, {"user_id": self.user_id})
+
+        links = []
+        summaries = []
+        for new_row, other in pair_same_purchase(rows, csv_id):
+            left_id, right_id = sorted((str(new_row["id"]), str(other["id"])))
+            match_type = "csv_receipt" if other.get("source") == "bill" else "csv_csv"
+            links.append({
+                "user_id": self.user_id,
+                "transaction_id": left_id,
+                "linked_transaction_id": right_id,
+                "match_type": match_type,
+                "confidence": 1,
+            })
+            # Described from the newly uploaded row: that is the one the user
+            # just handed over and expects to see accounted for.
+            summaries.append({
+                "date": str(new_row.get("trans_date") or ""),
+                "merchant": new_row.get("merchant_name") or new_row.get("description") or "",
+                "amount": new_row.get("amount"),
+                "match_type": match_type,
+            })
+            # CSV enrichment carries a useful merchant description. When it is
+            # linked to a receipt that has not been deep-enriched, hand it over
+            # so the row the UI actually shows is the described one.
+            if (
+                other.get("source") == "bill"
+                and not other.get("enriched_info")
+                and new_row.get("enriched_info")
+            ):
+                self._db_update(
+                    "Transaction",
+                    {"enriched_info": new_row["enriched_info"]},
+                    {"id": other["id"]},
+                )
+        if links:
+            self._db_upsert(
+                "TransactionLink", links,
+                conflict_key="user_id,transaction_id,linked_transaction_id",
+            )
+        return summaries
+
     async def setup_session(self, uploaded_files: List[dict]):
-        """Ingests CSVs and Bills, then sets up DBs."""
+        """Ingest CSVs and extract photo drafts for the user to review.
+
+        Returns (duplicates, review_items, links) where review_items is
+        [{"file_id": ..., "kind": "receipt"|"price_tag"|"unknown"}] — the caller
+        routes each photo to the matching review screen, or to the "which is
+        this?" prompt when the model could not tell.
+
+        `duplicates` and `links` are two different overlaps and are reported
+        separately: a duplicate is the same row arriving again and being merged
+        away, a link is a row that survives alongside an existing record of the
+        same purchase.
+        """
         # uploaded_files format: [{"path": "/temp/file.csv", "file_id": "uuid"}, ...]
         all_duplicates = []
+        all_links = []
+        review_items = []
+        has_committed_transactions = False
+        committed_csv_ids = []
         for file_info in uploaded_files:
             file_path = file_info["path"]
             file_name = os.path.basename(file_path)
-            ext = file_path.lower().split('.')[-1]
             try:
-                if ext in ['png', 'jpg', 'jpeg']:
-                    dups = await self._ingest_bill(file_path, file_info.get("file_id"))
+                # The same routing rule the upload route used to decide which
+                # table this row went in. Anything not an image is handed to the
+                # CSV parser, so the two must agree or a file is filed as one
+                # kind and parsed as the other.
+                if is_image(file_path):
+                    # First value is the draft, not duplicates — a photo cannot
+                    # duplicate anything until it is reviewed, and dedup happens
+                    # at verify time against content_hash.
+                    _, kind = await self._ingest_bill(file_path, file_info.get("file_id"))
+                    dups, links = [], []
+                    if file_info.get("file_id"):
+                        review_items.append({
+                            "file_id": str(file_info["file_id"]),
+                            "kind": kind,
+                        })
                 else:
-                    dups = await self._ingest_csv(file_path, file_info.get("file_id"))
+                    dups, links = await self._ingest_csv(file_path, file_info.get("file_id"))
+                    has_committed_transactions = True
+                    if file_info.get("file_id"):
+                        committed_csv_ids.append(str(file_info["file_id"]))
                 if dups:
                     all_duplicates.extend(dups)
+                if links:
+                    all_links.extend(links)
             except Exception as e:
                 raise RuntimeError(f"Failed to ingest '{file_name}': {e}") from e
 
-        try:
-            self._emit_progress("embedding", 0, 0, "Syncing to vector database...")
-            self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
-            self.vector_store_client = self._sync_to_vectordb()
-            self._emit_progress("embedding", 1, 1, "Vector sync complete")
-        except Exception as e:
-            raise RuntimeError(f"Failed to sync to vector store: {e}") from e
-        return all_duplicates
+        # Receipt data is deliberately not indexed until the user reviews it.
+        # A normal CSV upload indexes only the rows from that file. An empty
+        # file list is used by the settings flow to rebuild all vectors after
+        # an embedding-model change.
+        if committed_csv_ids:
+            try:
+                self._emit_progress("embedding", 0, 0, "Indexing newly uploaded transactions...")
+                self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
+                self.vector_store_client = self._sync_csv_files_to_vectordb(committed_csv_ids)
+                self._emit_progress("embedding", 1, 1, "New transaction vectors complete")
+            except Exception as e:
+                raise RuntimeError(f"Failed to sync to vector store: {e}") from e
+        elif has_committed_transactions or not uploaded_files:
+            try:
+                self._emit_progress("embedding", 0, 0, "Rebuilding vector database...")
+                self.db = SQLDatabase.from_uri(f"sqlite:///{self.db_path}")
+                self.vector_store_client = self._sync_to_vectordb()
+                self._emit_progress("embedding", 1, 1, "Vector rebuild complete")
+            except Exception as e:
+                raise RuntimeError(f"Failed to sync to vector store: {e}") from e
+        return all_duplicates, review_items, all_links
 
     def _emit_progress(self, stage: str, total: int, done: int, detail: str = ""):
         """Emit a progress update as a JSON line to stderr for the parent process to parse."""
@@ -181,7 +503,8 @@ class MoneyRAG:
         Sample Data: {sample}
 
         TASK:
-        1. Map the CSV columns to standard fields: date, description, amount, and category.
+        1. Map the CSV columns to standard fields: date, description, amount, category, and location.
+           - 'location' is optional: map it only if a column clearly holds a place (city, state, or address). Otherwise return null.
         2. Determine the 'sign_convention' for spending.
 
         RULES:
@@ -199,6 +522,7 @@ class MoneyRAG:
         "desc_col": "column_name",
         "amount_col": "column_name",
         "category_col": "column_name or null",
+        "location_col": "column_name or null",
         "sign_convention": "spending_is_negative" | "spending_is_positive"
         }}
         """)
@@ -237,11 +561,22 @@ class MoneyRAG:
         cat_col = mapping.get('category_col')
         standard_df['category'] = df[cat_col] if cat_col and cat_col in df.columns else 'Uncategorized'
 
+        loc_col = mapping.get('location_col')
+        standard_df['location'] = df[loc_col] if loc_col and loc_col in df.columns else None
+
         # --- Async Enrichment Step (batched for speed) ---
         unique_descriptions = standard_df['description'].unique().tolist()
         total_unique = len(unique_descriptions)
+        # Descriptions this user has uploaded before keep the name they were
+        # already given. Seeded into the same per-run cache the batches consult,
+        # so a description found here never reaches the model.
+        self.merchant_cache.update(self._known_merchant_names(unique_descriptions))
         self._emit_progress("enriching", total_unique, 0, f"{total_unique} unique merchants to enrich")
-        print(f"   ✨ Enriching {total_unique} unique descriptions for {filename}...")
+        logger.info(
+            "Enriching %d unique descriptions for %s (%d already named)",
+            total_unique, filename,
+            sum(1 for d in unique_descriptions if d in self.merchant_cache),
+        )
 
         sem = asyncio.Semaphore(15)  # Higher concurrency for faster enrichment
         enriched_count = 0
@@ -249,6 +584,12 @@ class MoneyRAG:
         # Batch enrichment prompt — process up to 10 descriptions at once
         batch_extract_prompt = ChatPromptTemplate.from_template("""
 You are a financial data assistant. For each transaction description below, extract the clean merchant name and a one-sentence description of the business.
+
+Take the merchant name from the words in the description itself — strip store
+numbers, phone numbers, city/state codes and payment-processor prefixes, and do
+not substitute a parent company, a category, or a synonym. Where the description
+names no merchant, describe what it is in the plainest words available. The same
+description must always produce the same name.
 
 Transaction descriptions:
 {descriptions_json}
@@ -314,7 +655,7 @@ Return ONLY a valid JSON array with one object per description, in the same orde
                                 results[desc] = {"merchant_name": desc, "enriched_info": ""}
                                 self.merchant_cache[desc] = results[desc]
                     except Exception as e:
-                        print(f"      ⚠️ Batch enrichment failed: {e}")
+                        logger.warning("Batch enrichment failed, falling back to raw descriptions: %s", e)
                         for desc in uncached:
                             results[desc] = {"merchant_name": desc, "enriched_info": ""}
 
@@ -341,23 +682,27 @@ Return ONLY a valid JSON array with one object per description, in the same orde
             lambda d: desc_map.get(d, {}).get("merchant_name", d)
         )
 
-        print(f"   ✅ Enriched {total_unique} unique merchants.")
+        logger.info("Enriched %d unique merchants", total_unique)
 
         # Save to Supabase transactions table
         self._emit_progress("saving", total_rows, 0, "Saving transactions to database")
         records = json.loads(standard_df.to_json(orient='records'))
 
-        # Calculate content_hash and source for deduplication
-        def generate_hash(row):
-            date_str = str(row['trans_date']).strip()
-            amount_str = str(round(float(row['amount']), 2))
-            merch = str(row.get('merchant_name', row['description'])).lower().strip().split()[0]
-            merch = ''.join(c for c in merch if c.isalnum())
-            hash_input = f"{date_str}{amount_str}{merch}"
-            return hashlib.sha256(hash_input.encode()).hexdigest()
-
+        # content_hash identifies the PURCHASE, and the rule lives in
+        # purchase_match alongside the rest of it — the backfill script has to
+        # reproduce it byte for byte over rows written before it changed, and a
+        # second copy of this formula is precisely how the two would drift.
+        #
+        # The counter is per file, which is what makes it mean "never dedup
+        # within one export, only across them"; see csv_row_hash.
+        occ = {}
         for r in records:
-            r['content_hash'] = generate_hash(r)
+            sig = csv_row_signature(r['trans_date'], r['amount'], r.get('description'))
+            n = occ.get(sig, 0)
+            occ[sig] = n + 1
+            r['content_hash'] = csv_row_hash(
+                r['trans_date'], r['amount'], r.get('description'), n
+            )
             r['source'] = 'csv'
 
         # Detect duplicates before upserting
@@ -365,22 +710,50 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         existing_hashes = set()
         for i in range(0, len(hashes), 100):
             batch_hashes = hashes[i:i+100]
-            existing_rows = self._db_select_in("Transaction", "content_hash", "content_hash", batch_hashes)
+            existing_rows = self._db_select_in(
+                "Transaction", "content_hash", "content_hash", batch_hashes,
+                # Rows are per-user anyway under RLS, but a receipt already
+                # verified for this purchase must not suppress the bank's own
+                # record of it — those two are LINKED, never deduplicated.
+                filters={"user_id": self.user_id, "source": "csv"},
+            )
             existing_hashes.update(row['content_hash'] for row in existing_rows)
 
         duplicates = [
-            {"date": r['trans_date'], "merchant": r.get('merchant_name', r.get('description', '')), "amount": r['amount']}
+            {"date": r['trans_date'],
+             "merchant": r.get('merchant_name') or r.get('description') or "",
+             "amount": r['amount']}
             for r in records if r['content_hash'] in existing_hashes
         ]
 
+        # SKIPPED, not upserted over. Writing the duplicate would carry its
+        # `source_csv_id` onto the row already stored, handing ownership to the
+        # newer file — and `delete_file` removes transactions by source_csv_id,
+        # so deleting the overlapping export would then delete purchases that
+        # arrived with the first one. The stored row is already correct; the
+        # only thing the second copy has to do is not overwrite it.
+        fresh = [r for r in records if r['content_hash'] not in existing_hashes]
+
         batch_size = 100
-        saved_rows = 0
-        for i in range(0, len(records), batch_size):
-            batch = records[i:i + batch_size]
+        # Seeded with the rows being skipped, so the bar still reaches the row
+        # count the user was shown at parse time. Counting only what is written
+        # would leave a half-finished bar on the upload that worked perfectly.
+        saved_rows = len(records) - len(fresh)
+        for i in range(0, len(fresh), batch_size):
+            batch = fresh[i:i + batch_size]
             try:
-                self._db_upsert("Transaction", batch, conflict_key="content_hash")
+                self._db_upsert("Transaction", batch, conflict_key="user_id,content_hash")
             except Exception as e:
-                # Fallback if DB migration hasn't been run yet (no content_hash / merchant_name)
+                # Fallback if DB migration hasn't been run yet (no content_hash /
+                # merchant_name). Loud, because rows saved this way carry no
+                # content_hash and can therefore never be de-duplicated: the same
+                # statement uploaded twice silently doubles the user's spending.
+                logger.error(
+                    "Transaction upsert failed (%s) — retrying without "
+                    "content_hash/merchant_name/source. These %d row(s) will NOT "
+                    "de-duplicate on re-upload; check that migrations are applied.",
+                    e, len(batch),
+                )
                 for r in batch:
                     r.pop('merchant_name', None)
                     r.pop('content_hash', None)
@@ -388,38 +761,194 @@ Return ONLY a valid JSON array with one object per description, in the same orde
                 try:
                     self._db_insert("Transaction", batch)
                 except Exception as ex:
-                    print(f"Failed fallback insert: {ex}")
+                    logger.error("Fallback insert also failed, %d row(s) lost: %s", len(batch), ex)
             saved_rows += len(batch)
             self._emit_progress("saving", total_rows, saved_rows)
 
-        return duplicates
+        links = []
+        try:
+            links = self._link_new_csv_transactions(csv_id)
+        except Exception as e:
+            # Linking is supplementary; never reject a valid CSV upload if the
+            # migration has not yet been applied or matching fails.
+            logger.warning("Transaction linking skipped: %s", e)
+
+        return duplicates, links
 
     async def _ingest_bill(self, file_path, file_id=None):
         import base64
-        import hashlib
         import json
         from langchain_core.messages import HumanMessage
         
         filename = os.path.basename(file_path)
-        self._emit_progress("parsing", 1, 0, f"Reading image: {filename}")
-        
+        # "reading", not "parsing": a photo shares no step with a CSV, and the UI
+        # labels the stage it is given — a picture being sent to the vision model
+        # was announcing itself as "Parsing CSV...".
+        #
+        # total=0 on purpose. There is no measurable progress through a single
+        # vision call, and a determinate bar sitting at 0/1 for ten seconds reads
+        # as a hang; 0 tells the client to run the bar indeterminate instead.
+        self._emit_progress("reading", 0, 0, f"Reading photo: {filename}")
+
         with open(file_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
         
-        ext = file_path.lower().split('.')[-1]
-        mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
+        mime = content_type_for(file_path)
 
         schema = {
             "date": "YYYY-MM-DD",
-            "total_amount": 123.45,
+            "time": "HH:MM in 24-hour local receipt time, or null if not visible",
             "merchant_name": "Merchant",
-            "category": "Dining",
-            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_unit_price": 10.0, "tax_amount": 0.0, "item_total_price": 10.0}]
+            "category": "One of: Groceries, Dining, Shopping, Transportation, Utilities, Healthcare, Entertainment, Travel, Personal Care, or Uncategorized",
+            "location": "Store address or city/state if visible on the receipt, else null",
+            "subtotal": 100.00,
+            "tax_lines": [{"label": "Sales Tax", "rate": 8.25, "amount": 8.25}],
+            "total_amount": 108.25,
+            "discounts": [{"label": "Coupon", "amount": 5.00}],
+            # item_quantity_unit is what item_quantity counts. A bare "2.25" is
+            # ambiguous between 2.25 lb of loose bananas and 2.25 packages, and
+            # the two mean different prices per unit — which is the whole basis
+            # of comparing a shelf price against what was paid before.
+            "line_items": [{"item_description": "Item", "item_quantity": 1, "item_quantity_unit": "each|lb|oz|fl oz|kg|g|ml|l|gal|ct", "size_value": 5, "size_unit": "lb|gal|fl oz|oz|...", "item_unit_price": 10.0, "item_savings": 0.0, "tax_rate": 8.25}]
         }
-        
-        # Vision extraction — single LLM call to extract all structured data
-        self._emit_progress("parsing", 1, 0, "Extracting data from receipt...")
-        prompt = f"Extract structured data from this receipt/bill. Return strictly valid JSON exactly matching this schema: {json.dumps(schema)}"
+
+        # A shelf/price tag is a completely different document: one product, the
+        # price it is being offered at, and no purchase. It must never become a
+        # transaction — see PriceObservation in migration 015.
+        # A LIST, because a shelf photo is usually a shelf: a dairy case shot
+        # holds a tag per product. Returning one tag meant silently discarding
+        # the rest, and the user could not tell which one had been kept.
+        price_tag_schema = {
+            "item_description": "Product name as printed on the tag",
+            "brand_name": "Brand if distinguishable, else null",
+            # Deliberately the same shape as a receipt line, because the two are
+            # compared against each other. "$4.29 / 12 OZ" is quantity 12, unit
+            # 'oz', unit_quantity_subtotal 0.3575, item_subtotal_price 4.29.
+            "size_value": 12,
+            "size_unit": "oz|fl oz|lb|g|kg|ml|l|gal|qt|pt|ct|each — the unit the size is printed in",
+            "unit_quantity_subtotal": "The per-unit price PRINTED on the tag ('$0.36/OZ'), as a number. null if the tag prints none — do NOT compute it.",
+            "unit_price_unit": "The unit that PRINTED per-unit price is quoted in ('$0.36/OZ' -> 'oz'). Often NOT the package unit: a one-gallon milk jug is commonly tagged PER QUART. null if the tag does not say.",
+            "item_subtotal_price": "The shelf price the shopper pays for the package, e.g. 4.29",
+            "merchant_name": "Store name if visible anywhere in the photo, else null",
+            "item_qualitative_description": (
+                "Everything the photo shows about this price that is not a number, "
+                "in the tag's own words. Offers ('2 for $5', 'BOGO', 'with card'), "
+                "sale end wording exactly as printed ('Sale ends 8/15'), any use-by "
+                "or best-before on the product, shelf labels like 'CLEARANCE' or "
+                "'MANAGER'S SPECIAL', and visible condition such as a dented or "
+                "opened package. Quote rather than interpret; do not convert dates "
+                "and do not judge whether the price is good. Null if the tag shows "
+                "only a name and a price."
+            ),
+        }
+
+        # Vision extraction — ONE call that both classifies and extracts. A
+        # separate classification pass would double latency and cost on the
+        # critical path, and the user is standing in a shop waiting.
+        self._emit_progress(
+            "reading", 0, 0, f"Looking at {filename} — this takes a few seconds..."
+        )
+        prompt = (
+            "You are given ONE photo. First decide what it is, then extract accordingly.\n\n"
+            "KIND — choose exactly one:\n"
+            "- 'receipt': a proof of purchase. Multiple line items, a total paid, usually tax, "
+            "a date/time, often a payment method.\n"
+            "- 'price_tag': a shelf label, price sticker, or product tag showing what ONE item "
+            "costs. Nothing has been bought. Often shows a per-unit price and a size.\n"
+            "- 'unknown': anything else, OR a photo you cannot confidently place in either "
+            "category (e.g. a receipt lying on a shelf, a blurred or partial image).\n"
+            "Do NOT guess between receipt and price_tag. 'unknown' is the correct, expected "
+            "answer when the photo is ambiguous — the user will be asked.\n\n"
+            "Return strictly valid JSON of the form: "
+            '{"kind": "receipt|price_tag|unknown", "receipt": <receipt object or null>, '
+            '"price_tags": <ARRAY of price tag objects, or null>}\n'
+            "Populate only the field matching the chosen kind; set the other to null. "
+            "For 'unknown', set both to null.\n\n"
+            f"PRICE TAG schema — 'price_tags' is an ARRAY of objects shaped like: {json.dumps(price_tag_schema)}\n"
+            "- Return EVERY price tag you can read, ordered as they appear left-to-right, "
+            "top-to-bottom. A photo of a shelf normally shows several, and returning only "
+            "one silently loses the others.\n"
+            "- Only include a tag whose product name AND price you can actually read. Skip "
+            "any that is cut off, blurred, or angled past legibility rather than guessing: "
+            "a misread price is stored as fact and compared against for months, while a "
+            "skipped tag costs one more photo.\n"
+            "- Do not invent a tag for a product that is merely visible on the shelf. A tag "
+            "is a printed label showing a price.\n"
+            "- 'item_subtotal_price' is what the shopper pays right now for the package "
+            "(the large/highlighted figure). If a member/loyalty price and a regular price are "
+            "both shown, use the member price and record the regular one in "
+            "'item_qualitative_description'.\n"
+            "- 'unit_quantity_subtotal': copy the per-unit price the tag PRINTS ('$0.36/OZ') as "
+            "a number. Do NOT compute it — the store already did the pack-size arithmetic for "
+            "the exact package on the shelf, and its figure is authoritative. Null if none is "
+            "printed.\n"
+            "- 'unit_price_unit': what that printed figure is PER, copied from the tag. Stores "
+            "very often quote a unit different from the package — a one-gallon milk jug tagged "
+            "'UNIT PRICE PER QUART 0.87' is 'qt', not 'gal'. Getting this wrong labels $0.87 as "
+            "the price of a whole gallon that costs $3.49. Null if the tag does not say.\n"
+            "- 'size_value' / 'size_unit': the package size AS PRINTED, split into a number and "
+            "its unit ('12 OZ' -> 12 and 'oz'). Do NOT convert: a tag reading 'Gallon' is 1 "
+            "'gal', never 128 'oz'. Converting is done later, exactly, by code — your job is "
+            "to record what the label says and to decide WHICH unit it is.\n"
+            "- That decision is yours alone and code cannot make it: 'oz' is a WEIGHT and "
+            "'fl oz' is a VOLUME, and the two never compare. You can see what the product is, "
+            "so use 'fl oz' for anything poured — milk, juice, soda, oil, sauce — and plain "
+            "'oz' only for something weighed, like cheese or nuts. Getting this wrong files a "
+            "gallon of milk as a weight, and it can then never be compared to another gallon.\n"
+            "- 'item_qualitative_description': quote what the tag says, do not interpret it. Copy sale end "
+            "wording as printed ('Sale ends 8/15', 'Prices good thru Sunday') rather than "
+            "converting to a date — resolving 'Sunday' without a year is guesswork, and a wrong "
+            "end date silently turns a limited offer into what the item normally costs. Include "
+            "any use-by / best-before printed on the PRODUCT: a markdown is often cheap "
+            "precisely because the item expires imminently, and that has to be sayable rather "
+            "than read as a bargain. Also include clearance or manager's-special labelling and "
+            "visible package damage.\n\n"
+            f"RECEIPT schema: {json.dumps(schema)}.\n"
+            "- 'total_amount' is the final amount actually charged (the balance/total paid).\n"
+            "- 'subtotal' is the pre-tax sum of what was paid, AFTER any item markdowns.\n"
+            "- Extract the receipt's purchase time when shown, normalized to 24-hour HH:MM. "
+            "Use null when the time is not visible.\n"
+            "- Choose category only from the category list in the schema; use Uncategorized if unsure.\n"
+            "- 'size_value' / 'size_unit' describe how much is in ONE unit, and are NOT the same "
+            "as item_quantity: a 5 lb bag of potatoes is item_quantity 1 'each' with size_value 5 "
+            "and size_unit 'lb'. Receipts abbreviate this badly ('+RED POTA 5L US#' is five POUNDS, "
+            "not five litres), so read the size from the product name and use null when it is "
+            "genuinely unclear rather than guessing.\n"
+            "- A NUMBER SITTING NEXT TO A UNIT IS OFTEN A VARIANT, NOT A SIZE. 'GV LF 2 GAL' is "
+            "Great Value LOW FAT 2% milk in a ONE gallon jug — size_value 1, size_unit 'gal' — not "
+            "two gallons; the same receipt lists 'GV FF GAL' with no number at all. '1% MILK', "
+            "'2 PCT', '100 CALORIE' and grades like 'AA' behave the same way. You know what the "
+            "product IS, which is the only way to tell: ask whether the number describes the "
+            "CONTENTS or the CONTAINER, and use null if you cannot tell. Reading a fat percentage "
+            "as a pack size halves the unit price and makes an ordinary shelf price look like a "
+            "rip-off.\n"
+            "- 'item_quantity_unit' is what 'item_quantity' counts. Weighed items show a "
+            "fractional quantity with a per-weight price ('2.25 lb @ $0.50/lb') — use 'lb' "
+            "(or kg/oz/g as printed). Packaged items are counted, so use 'each'. This is not "
+            "the package size: a single 30-count bag of cilantro is quantity 1 'each', not 30 "
+            "'ct'. Use null when the receipt genuinely does not say.\n"
+            "- 'tax_lines': one entry per DISTINCT tax rate shown. Receipts may have several "
+            "(e.g. 0% for groceries and 8.25% for general goods). Use [] if no tax is shown.\n"
+            "- Different item TYPES can carry different tax rates (e.g. groceries are often "
+            "exempt at 0% while general goods are taxed, and this varies by locale). Set each "
+            "line item's 'tax_rate' to the percentage applied to THAT item (0 if not taxed).\n"
+            "DISCOUNTS AND SAVINGS — read carefully, they are commonly misread:\n"
+            "- 'item_unit_price' MUST be the price ACTUALLY PAID per unit. When an item shows a "
+            "markdown (a 'SAVINGS x.xx-' line and/or a 'PRICE YOU PAY' amount below its regular "
+            "price), use the reduced/'PRICE YOU PAY' figure, NOT the higher struck/regular price.\n"
+            "- 'item_savings': when a line shows a markdown — a 'SAVINGS x.xx-' amount printed under "
+            "it and/or a struck regular price above its 'PRICE YOU PAY' — set item_savings to that "
+            "printed SAVINGS figure as a POSITIVE number (e.g. 'SAVINGS 1.95-' -> 1.95). Copy the "
+            "number shown on the receipt; do not compute it. Use 0 only when no savings/markdown is "
+            "printed for that line. It is informational only — the price is already net, so never "
+            "subtract item_savings from any total.\n"
+            "- 'discounts': ONLY order-level coupons that reduce the whole basket (e.g. '$5 off $50', "
+            "a store coupon applied at the end). These ARE subtracted from the total. Use [] if none. "
+            "Do NOT put per-item markdowns here.\n"
+            "- IGNORE the summary recap block ('SAVINGS SUMMARY', 'Card Savings', 'Your Total "
+            "Savings', 'CARD SAVINGS', loyalty points). It only restates savings already applied to "
+            "the item prices — it is NOT a line item, tax, or discount and must never be subtracted."
+        )
         message = HumanMessage(
             content=[
                  {"type": "text", "text": prompt},
@@ -429,151 +958,119 @@ Return ONLY a valid JSON array with one object per description, in the same orde
         
         extract_chain = self.llm | JsonOutputParser()
         try:
-            extracted = await extract_chain.ainvoke([message])
+            classified = await extract_chain.ainvoke([message])
         except Exception as e:
-            print(f"   ❌ Vision extraction failed: {e}")
-            return
-            
-        self._emit_progress("parsing", 1, 1, f"Extracted: {extracted.get('merchant_name')}")
-        
-        # Save the raw OCR JSON back to the BillFile record
+            logger.error("Vision extraction failed for %s: %s", filename, e)
+            return {}, "unknown"
+
+        kind, extracted = self._split_classified_photo(classified)
+
+        # The draft stored for review is the branch that matched, so the review
+        # screens keep receiving the same flat shape they always have.
+        if kind == "price_tag":
+            tags = extracted.get("tags") or []
+            first = (tags[0].get("item_description") if tags else None) or "item"
+            label = f"{first} +{len(tags) - 1} more" if len(tags) > 1 else first
+        else:
+            label = extracted.get("merchant_name") or "photo"
+        self._emit_progress("reading", 1, 1, f"Read {kind.replace('_', ' ')}: {label}")
+
+        # Save the extracted draft and what kind of photo this is.
         if file_id:
             try:
-                self._db_update("BillFile", {"raw_ocr_string": json.dumps(extracted)}, {"id": file_id})
+                self._db_update("BillFile", {
+                    "raw_ocr_string": json.dumps(extracted),
+                    "kind": kind,
+                    # Only the display name changes; s3_key remains stable for previews.
+                    "filename": self._photo_filename(filename, kind, extracted),
+                }, {"id": file_id})
             except Exception as e:
-                print(f"   ⚠️ Failed to save raw_ocr_string to BillFile: {e}")
-        
-        # Enrich merchant + all line items in a single LLM call
-        raw_merchant = extracted.get('merchant_name', 'Unknown')
-        line_items = extracted.get('line_items', [])
-        all_names = [raw_merchant] + [item.get('item_description', '') for item in line_items]
-        total_to_enrich = len(all_names)
-        self._emit_progress("enriching", total_to_enrich, 0, f"Enriching {total_to_enrich} items...")
+                logger.error("Failed to save extracted photo data for file_id=%s: %s", file_id, e)
 
-        # Deep enrichment: web search for richer context
-        search_context = ""
-        if self.deep_enrichment:
-            search_results = {}
-            for name in all_names:
-                try:
-                    sr = await self.search_tool.ainvoke(f"What type of product or business is '{name}'?")
-                    search_results[name] = sr[:200]
-                except Exception:
-                    search_results[name] = ""
-            if any(search_results.values()):
-                search_context = "\n\nWeb search context:\n" + "\n".join(
-                    f"- {n}: {s}" for n, s in search_results.items() if s
-                )
+        # Nothing is committed from OCR automatically — for either kind. The app
+        # shows the draft and the user corrects it before anything is written.
+        #
+        # The draft is RETURNED as well as stored, because `file_id` is optional:
+        # a chat capture has no row yet — a shelf price gets one only if the user
+        # confirms it — so the caller needs the draft handed back directly.
+        self._emit_progress("review", 1, 1, f"{kind.replace('_', ' ').title()} read — waiting for review")
+        return extracted, kind
 
-        enrich_prompt = ChatPromptTemplate.from_template("""
-You are a financial data assistant. For each item description below, provide a clean name and a one-sentence description.
-The first item is the merchant/store. The rest are line items from a receipt.
+    @staticmethod
+    def _split_classified_photo(classified: dict) -> tuple[str, dict]:
+        """Pull (kind, draft) out of the vision response.
 
-Item descriptions:
-{descriptions_json}
+        Tolerates a model that ignores the envelope and returns a bare receipt
+        object, which is what the previous single-purpose prompt always produced
+        — treating that as a receipt keeps older behaviour working.
+        """
+        if not isinstance(classified, dict):
+            return "unknown", {}
 
-Return ONLY a valid JSON array with one object per item, in the same order:
-[
-  {{"description": "<original>", "clean_name": "<clean 1-4 word name>", "enriched_info": "<one sentence>"}},
-  ...
-]
-""")
-        enrich_chain = enrich_prompt | self.llm | JsonOutputParser()
-        
-        try:
-            enriched_list = await enrich_chain.ainvoke({"descriptions_json": json.dumps(all_names) + search_context})
-            # First result is the merchant
-            if isinstance(enriched_list, list) and len(enriched_list) > 0:
-                merchant_info = enriched_list[0]
-                clean_merchant = merchant_info.get("clean_name", raw_merchant)
-                enriched_info = merchant_info.get("enriched_info", "")
-                # Remaining results are line items
-                for idx, item in enumerate(line_items):
-                    if idx + 1 < len(enriched_list):
-                        item['enriched_info'] = enriched_list[idx + 1].get("enriched_info", "")
-                    else:
-                        item['enriched_info'] = ""
-            else:
-                clean_merchant = raw_merchant
-                enriched_info = ""
-        except Exception as e:
-            print(f"   ⚠️ Batch enrichment failed: {e}")
-            clean_merchant = raw_merchant
-            enriched_info = ""
-            for item in line_items:
-                item['enriched_info'] = ""
+        kind = str(classified.get("kind") or "").strip().lower()
+        if kind == "price_tag":
+            # Accepts the array, and a lone object from a model that ignored the
+            # instruction — one tag read is still worth keeping.
+            payload = classified.get("price_tags")
+            if payload is None:
+                payload = classified.get("price_tag")
+            tags = MoneyRAG._as_tag_list(payload)
+            return ("price_tag", {"tags": tags}) if tags else ("unknown", {})
 
-        self._emit_progress("enriching", total_to_enrich, total_to_enrich, "Enrichment complete")
+        if kind in ("receipt", "unknown"):
+            payload = classified.get(kind) if kind != "unknown" else None
+            if isinstance(payload, dict) and payload:
+                return kind, payload
+            # A declared kind with an empty body gives the review screen nothing
+            # to show, so it is treated as undecided and the user is asked —
+            # the same rule as an ambiguous photo, rather than opening a blank
+            # form and inviting a confirmed-but-empty record.
+            return "unknown", {}
 
-        # Calculate content_hash
-        date_str = str(extracted.get('date', '')).strip()
-        amount_str = str(round(float(extracted.get('total_amount', 0)), 2))
-        merch_hash = str(clean_merchant).lower().strip().split()[0] if clean_merchant else ""
-        merch_hash = ''.join(c for c in merch_hash if c.isalnum())
-        hash_input = f"{date_str}{amount_str}{merch_hash}"
-        content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
-        
-        # Build transaction record
-        tx_record = {
-            "user_id": self.user_id,
-            "trans_date": date_str,
-            "amount": abs(float(extracted.get('total_amount', 0))), 
-            "description": raw_merchant,
-            "merchant_name": clean_merchant,
-            "category": extracted.get('category', 'Uncategorized'),
-            "content_hash": content_hash,
-            "source": 'bill',
-            "enriched_info": enriched_info
-        }
-        if file_id:
-            tx_record["source_bill_file_id"] = file_id
-            
-        # Check duplicate before upserting
-        existing_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
-        is_duplicate = len(existing_rows) > 0
-        duplicates = [{"date": tx_record['trans_date'], "merchant": tx_record['merchant_name'], "amount": tx_record['amount']}] if is_duplicate else []
+        # No envelope: infer from the keys present rather than discarding it.
+        if "line_items" in classified or "total_amount" in classified:
+            return "receipt", classified
+        if "price_tags" in classified:
+            tags = MoneyRAG._as_tag_list(classified.get("price_tags"))
+            return ("price_tag", {"tags": tags}) if tags else ("unknown", {})
+        if "item_subtotal_price" in classified or "unit_quantity_subtotal" in classified:
+            return "price_tag", {"tags": [classified]}
+        return "unknown", classified
 
-        # Save transaction
-        self._emit_progress("saving", 1, 0, "Saving transaction...")
-        try:
-            self._db_upsert("Transaction", [tx_record], conflict_key="content_hash")
-        except Exception as e:
-            tx_record.pop('merchant_name', None)
-            tx_record.pop('content_hash', None)
-            tx_record.pop('source', None)
-            try:
-                self._db_insert("Transaction", [tx_record])
-            except Exception as e2:
-                print(f"   ❌ Fallback insert failed: {e2}")
+    @staticmethod
+    def _as_tag_list(payload) -> list:
+        """Normalise a price-tag payload to a list of non-empty tag objects."""
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+        return [tag for tag in payload if isinstance(tag, dict) and tag]
 
-        # Get the transaction ID to link details
-        try:
-            fetch_rows = self._db_select("Transaction", "id", {"content_hash": content_hash, "user_id": self.user_id})
-            tx_id = fetch_rows[0]['id'] if fetch_rows else None
-        except Exception:
-            tx_id = None
+    @staticmethod
+    def _photo_filename(original: str, kind: str, extracted: dict) -> str:
+        """A recognisable display name, so a stored photo is findable later."""
+        import re
 
-        if tx_id and line_items:
-            details = []
-            for item in line_items:
-                details.append({
-                    "transaction_id": tx_id,
-                    "user_id": self.user_id,
-                    "bill_file_id": file_id,
-                    "item_description": item.get('item_description', ''),
-                    "item_quantity": item.get('item_quantity', 1),
-                    "item_unit_price": item.get('item_unit_price', item.get('item_total_price', 0)),
-                    "tax_amount": item.get('tax_amount', 0),
-                    "item_total_price": item.get('item_total_price', 0),
-                    "enriched_info": item.get('enriched_info', '')
-                })
-            try:
-                self._db_insert("TransactionDetail", details)
-            except Exception as e:
-                print(f"   ⚠️ Failed to insert details (table might not exist): {e}")
+        extension = photo_extension(original)
 
-        self._emit_progress("saving", 1, 1, "Complete")
-        return duplicates
+        if kind == "price_tag":
+            # Named after the first tag; a shelf photo holding several is still
+            # one file, and listing them all would blow past any sane filename.
+            tags = extracted.get("tags") or [extracted]
+            first = tags[0] if isinstance(tags[0], dict) else {}
+            item = slugify(first.get("item_description"), "item")
+            if len(tags) > 1:
+                item = f"{item}_and_{len(tags) - 1}_more"
+            store = slugify(first.get("merchant_name"))
+            # A tag carries no date of its own; when it was seen is the date.
+            date_slug = pd.Timestamp.now().strftime("%Y%m%d")
+            parts = [p for p in ("pricetag", item, store, date_slug) if p]
+            return "_".join(parts)[:120] + extension
+
+        merchant = slugify(extracted.get("merchant_name"), "receipt")
+        date_slug = str(extracted.get("date") or "nodate").replace("-", "")
+        time_slug = re.sub(r"[^0-9]", "", str(extracted.get("time") or ""))
+        return f"{merchant}_{date_slug}{f'_{time_slug}' if time_slug else ''}{extension}"
 
     def _sync_to_vectordb(self):
         # Fetch only THIS USER'S transactions to sync into VectorDB
@@ -595,6 +1092,24 @@ Return ONLY a valid JSON array with one object per item, in the same order:
         vdb = get_vector_client()
         return vdb.sync_transactions(df, details_df, self.user_id, self.embeddings, progress_callback=_progress)
 
+    def _sync_csv_files_to_vectordb(self, csv_ids: List[str]):
+        """Incrementally embed only transactions belonging to newly uploaded CSVs."""
+        rows = self._db_select("Transaction", "*", {"user_id": self.user_id})
+        csv_id_set = {str(csv_id) for csv_id in csv_ids}
+        new_rows = [row for row in rows if str(row.get("source_csv_id") or "") in csv_id_set]
+        df = pd.DataFrame(new_rows)
+        if df.empty:
+            return None
+
+        def _progress(detail, total, done):
+            self._emit_progress("embedding", total, done, detail)
+
+        # CSV transactions do not have receipt line items, so there is no need
+        # to fetch or re-embed the user's entire TransactionDetail table.
+        return get_vector_client().sync_transactions(
+            df, pd.DataFrame(), self.user_id, self.embeddings, progress_callback=_progress
+        )
+
     async def delete_file(self, file_id: str, file_type: str = 'csv'):
         """Force delete a file and all its transactions from the database and vector store."""
         try:
@@ -609,10 +1124,19 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             vdb = get_vector_client()
             vdb.delete_file_vectors(file_id, file_type)
         except Exception as e:
-            print(f"Error purging file data: {e}")
+            # Raised, not swallowed. Reporting success on a failed delete is
+            # exactly how a "Discarded" card ended up sitting next to a file that
+            # was still there — the caller has to be able to say so.
+            logger.error("Error purging file data for %s (%s): %s", file_id, file_type, e)
+            raise
 
-    async def chat(self, query: str):
-        """Async generator that yields status events + final response."""
+    async def chat(self, query: str, history: Optional[list] = None):
+        """Async generator that yields status events + final response.
+
+        `history` is a list of prior {role, content} turns (from the DB) that give
+        the agent conversation context. Passed explicitly so memory survives
+        restarts rather than living only in the in-process checkpointer.
+        """
         server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
         
         mcp_client = MultiServerMCPClient(
@@ -621,7 +1145,20 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                     "transport": "stdio",
                     "command": sys.executable,
                     "args": [server_path],
-                    "env": {**os.environ.copy(), "CURRENT_USER_ID": self.user_id},
+                    "env": {
+                        **os.environ.copy(),
+                        "CURRENT_USER_ID": self.user_id,
+                        "CURRENT_EMBEDDING_PROVIDER": self.llm_provider,
+                        "CURRENT_EMBEDDING_MODEL": self.embedding_model_name,
+                        # This user's own key, so the MCP server never depends on
+                        # a process-wide GOOGLE_API_KEY/OPENAI_API_KEY.
+                        "CURRENT_LLM_API_KEY": self.api_key or "",
+                        # So MCP tools can sign private-bucket storage URLs as this user.
+                        "CURRENT_ACCESS_TOKEN": self.access_token or "",
+                        # Chart/image handoff directory, unique to this instance —
+                        # otherwise concurrent users overwrite each other's output.
+                        "DATA_DIR": self.temp_dir,
+                    },
                 }
             }
         )
@@ -634,7 +1171,7 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                 "and perform semantic searches. Spending is POSITIVE (>0). "
                 "IMPORTANT: Whenever possible and relevant (e.g. when discussing trends, comparing categories, or showing breakdowns), "
                 "you MUST proactively use the 'generate_interactive_chart' tool to generate visual plots (bar, pie, or line charts) to accompany your analysis. "
-                "CRITICAL RULE FOR RESPONSES: After calling any chart or data tool, you MUST write a detailed text analysis "
+                "CRITICAL RULE FOR RESPONSES (spending analysis and charts ONLY — NOT price checks, see below): After calling any chart or data tool, you MUST write a detailed text analysis "
                 "that includes: (1) a summary of the key numbers, (2) the top and bottom items, (3) any notable patterns or insights. "
                 "The chart appears below your text automatically — your text analysis is the PRIMARY response the user reads. "
                 "Never respond with just a single sentence when data is available. "
@@ -643,8 +1180,54 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                 "'I spent $50 at Target', 'paid rent $1200'), you MUST use the 'propose_transaction' tool. "
                 "Extract the amount, description, date (default today), category, and merchant name from the user's message. "
                 "Do NOT insert transactions directly — always let the user confirm via the UI card. "
-                "CRITICAL: You MUST include the ===CONFIRM_TX=== marker output from the tool in your response EXACTLY as returned. "
-                "Do not remove or modify the marker content."
+                f"CRITICAL: You MUST include the {markers.CONFIRM_TX} marker output from the tool in your response EXACTLY as returned. "
+                "Do not remove or modify the marker content.\n"
+                "FINDING PRODUCTS: receipt line items are printed abbreviated past recognition "
+                "('GV LF 2 GAL' is Great Value low-fat milk, 'BB GRND TRKY1LB' is ground turkey), "
+                "so a SQL LIKE on a product name finds nothing. Use 'semantic_search' for anything "
+                "about a product, and pass its 'scope' argument deliberately: 'transactions' for "
+                "spending themes, 'line_items' for products actually bought, 'price_observations' "
+                "for shelf prices the user photographed.\n"
+                "SHELF PRICES ARE NOT SPENDING: a price observation is a photo of a price tag. "
+                "Nothing was bought and no money left the user's account, so NEVER add one to a "
+                "spending total, an average spend, or a category breakdown. They live in the "
+                '"PriceObservation" table and are labelled [SHELF PRICE] in search results.\n'
+                "ONE PURCHASE, TWO ROWS: a photographed receipt and the bank-statement "
+                "line for the same purchase are stored as two rows and reconciled in "
+                '"TransactionLink" — neither is thrown away, because the statement is what '
+                "the bank says and the receipt is what was actually bought. Adding both counts "
+                "that money twice. So for EVERY total, average, count or category breakdown, "
+                'query the "TransactionDeduped" view instead of "Transaction": same columns, '
+                'duplicates already removed. Use "Transaction" itself only when you deliberately '
+                "want a row the view drops, such as showing both records of one purchase.\n"
+                "IS THIS A GOOD PRICE: lead with ONE SHORT SENTENCE of verdict, then list the 2-3 most comparable prices you actually have, one per line, in the shortest form that is still clear: date - price per unit - shop. Showing several is the point: one number reads like a rule, three show the range the user is really choosing within and whether this shelf price is an outlier or ordinary. Add a caveat line only if it would change their decision.\n""Keep it to that. No headings, no 'Price Analysis' / 'Insights' sections, no restating the tag back to them, no paragraph of reasoning around each line — someone standing in a shop needs an answer, not a report. The detailed-analysis rule above does NOT apply here. List ONLY prices for the same product: a near-miss with a similar name is worse than a short list.\n""Use the 'check_price' tool. When the user says the sighting is ALREADY RECORDED, pass record=false — the confirm card saved it before asking you, and saving again stores one sighting twice. Otherwise it records the sighting, "
+                "researches the product, RANKS past purchases by similarity without filtering them, "
+                "converts both sides to the same unit and weights recent evidence more heavily. "
+                "Do NOT hand-roll this with SQL — the per-unit conversion and the recency "
+                "weighting are the parts that are easy to get wrong.\n"
+                "NEVER report a per-unit price as a total, and never drop its unit: '$1.00/l' and 'paid $4.99' are different facts. If a unit looks wrong for the product ('5L' on a bag of potatoes is five POUNDS, not litres), say the size is uncertain rather than reasoning from it.\n""FIXING A WRONG VALUE: when the user says something stored is wrong — a misread size, a unit "
+                "that makes no sense for the product, a mangled name, the wrong shop — use 'propose_correction'. "
+                "It only PROPOSES: the user sees a card and confirms, and nothing is written until they do. "
+                f"You MUST include the {markers.CONFIRM_FIX} marker in your reply EXACTLY as returned. "
+                "It cannot delete anything and it cannot touch money on a receipt — amounts, totals and tax "
+                "are corrected on the receipt review screen because they have to stay consistent with each "
+                "other. A shelf price in PriceObservation IS correctable. Never invent a row id: take it from "
+                "a tool result.\n""SHOWING PROOF: when the user asks to see a receipt behind a price you quoted, pass the 'receipt=<id>' value check_price gave you for THAT line to get_bill_images as bill_file_ids. Never re-find a receipt by searching item text — receipt lines are abbreviated past recognition, so the search matches a different purchase and you attach someone else's receipt as evidence. If a line has no receipt id, say the receipt is not available rather than showing a substitute.\n""PRICES ARE LOCAL: check WHERE each past purchase happened before quoting it. A price from another city or state is not the going rate where the user is shopping now — they may have moved — so say so plainly rather than calling the current price a rip-off, and prefer a nearer purchase even if it scores slightly lower.\n""ALWAYS compare PER UNIT. A $3.49 gallon versus a $3.38 two-gallon jug is $3.49/gal versus "
+                "$1.69/gal, not 'about the same'; the tool normalises both sides for you and marks "
+                "anything it could not normalise. Compare against BOTH what the user PAID and prices "
+                "they have SEEN before, and never describe a sighting as something they paid.\n"
+                "check_price RANKS candidates rather than filtering them: rows marked '~' are the "
+                "closest things found, not confirmed matches. Read each description and decide "
+                "whether it is really the same product before using it - low-fat vs whole milk, "
+                "organic vs conventional, and a 2-gallon vs a 1-gallon jug all rank high on "
+                "wording while costing different amounts.\n"
+                "check_price returns EVIDENCE, never a verdict: the judgement is yours. ALWAYS "
+                "read what the tag said before judging — a price well under the usual one is very "
+                "often a clearance on something expiring within days, a multi-buy needing several, "
+                "or a loyalty-card rate, and you must say what the catch is. Never present a "
+                "purchase marked ON OFFER as what the user normally pays. When there is no "
+                "purchase history for the item, say so plainly instead of guessing. When the size "
+                "is unknown, say you are comparing package to package rather than per unit."
             )
             
             agent = create_agent(
@@ -654,7 +1237,20 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                 checkpointer=self.memory,
             )
 
-            config = {"configurable": {"thread_id": "session_1"}}
+            import uuid
+            # Fresh thread per call — conversation memory comes from the passed
+            # `history`, so we don't double-accumulate in the checkpointer.
+            # LangGraph defaults to 25 steps, and a comparison question spends
+            # several before it starts: the schema lookup, a rejected query that
+            # forgot the user_id filter, a retry for an unquoted table name. A
+            # question across two cities then runs out mid-answer and fails
+            # outright. 40 leaves room without letting a genuinely stuck agent
+            # spin indefinitely.
+            config = {
+                "configurable": {"thread_id": uuid.uuid4().hex},
+                "recursion_limit": 40,
+            }
+            input_messages = list(history or []) + [{"role": "user", "content": query}]
             
             chart_path = os.path.join(self.temp_dir, "latest_chart.json")
             if os.path.exists(chart_path):
@@ -664,17 +1260,45 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             if os.path.exists(images_path):
                 os.remove(images_path)
 
-            # Stream events so we can yield live tool-call updates
-            # Accumulate all AI text tokens across the full agent run
+            # Stream events so we can yield live tool-call updates.
+            #
+            # Text is accumulated PER MODEL TURN, not across the whole run. A
+            # ReAct agent calls the model repeatedly, and the turns that decide
+            # which tool to use often think out loud first ("Let me look that
+            # up..."). That is working-out, not an answer: it used to be
+            # concatenated into the reply, and streaming would put it on screen.
+            # A turn that calls a tool has its text discarded.
             ai_text_chunks: list[str] = []
+            turn_text: list[str] = []
+            turn_calls_tool = False
+            # astream_events surfaces NESTED events too, and several tools here
+            # call an LLM of their own (merchant enrichment, price comparison).
+            # Their tokens are indistinguishable from the agent's own at this
+            # level, so without this the user would watch a tool's internal
+            # monologue stream into the answer.
+            tool_depth = 0
+
             async for event in agent.astream_events(
-                {"messages": [{"role": "user", "content": query}]},
+                {"messages": input_messages},
                 config,
                 version="v2",
             ):
                 kind = event.get("event")
 
+                if kind == "on_chat_model_start":
+                    if tool_depth == 0:
+                        turn_text = []
+                        turn_calls_tool = False
+                    continue
+
+                if kind == "on_chat_model_end":
+                    if tool_depth == 0 and not turn_calls_tool:
+                        ai_text_chunks.extend(turn_text)
+                        turn_text = []
+                    continue
+
                 if kind == "on_tool_start":
+                    tool_depth += 1
                     tool_name = event.get("name", "tool")
                     tool_input = event.get("data", {}).get("input", {})
                     # Summarise long inputs
@@ -685,22 +1309,42 @@ Return ONLY a valid JSON array with one object per item, in the same order:
                     yield {"type": "tool_start", "name": tool_name, "input": snippet}
 
                 elif kind == "on_tool_end":
+                    tool_depth = max(0, tool_depth - 1)
                     tool_name = event.get("name", "tool")
                     output = event.get("data", {}).get("output", "")
                     snippet = str(output)[:200].replace("\n", " ")
                     yield {"type": "tool_end", "name": tool_name, "snippet": snippet}
 
                 elif kind == "on_chat_model_stream":
-                    # Collect streamed AI text tokens
+                    # A model running inside a tool is not answering the user.
+                    if tool_depth > 0:
+                        continue
                     chunk = event.get("data", {}).get("chunk")
-                    if chunk and hasattr(chunk, "content"):
-                        raw = chunk.content
-                        if isinstance(raw, str) and raw:
-                            ai_text_chunks.append(raw)
-                        elif isinstance(raw, list):
-                            for block in raw:
-                                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                                    ai_text_chunks.append(block["text"])
+                    if not chunk:
+                        continue
+
+                    # A turn that emits tool-call chunks is choosing a tool, so
+                    # whatever prose came with it is working-out. Stop emitting
+                    # from this turn and drop what it produced.
+                    if _chunk_calls_tool(chunk):
+                        turn_calls_tool = True
+                        turn_text = []
+                        continue
+                    if turn_calls_tool:
+                        continue
+
+                    text = _chunk_text(chunk)
+                    if text:
+                        turn_text.append(text)
+                        # Raw. The caller gates it — knowledge of the ===MARKER===
+                        # blocks lives in one place, in the router that strips
+                        # them from the final content.
+                        yield {"type": "token", "text": text}
+
+            # A run cut short (no on_chat_model_end for the last turn) still has
+            # its answer in turn_text; losing it would blank the reply.
+            if turn_text and not turn_calls_tool:
+                ai_text_chunks.extend(turn_text)
 
             final_content = "".join(ai_text_chunks).strip()
 
@@ -708,12 +1352,12 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             if os.path.exists(chart_path):
                 with open(chart_path, "r") as f:
                     chart_json = f.read()
-                final_content = f"{final_content}\n\n===CHART===\n{chart_json}\n===ENDCHART==="
-                
+                final_content = f"{final_content}\n\n{markers.wrap(markers.CHART, chart_json)}"
+
             if os.path.exists(images_path):
                 with open(images_path, "r") as f:
                     images_json = f.read()
-                final_content = f"{final_content}\n\n===IMAGES===\n{images_json}\n===ENDIMAGES==="
+                final_content = f"{final_content}\n\n{markers.wrap(markers.IMAGES, images_json)}"
                 
             yield {"type": "final", "content": final_content}
             
@@ -721,7 +1365,7 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             try:
                 await mcp_client.__aexit__(None, None, None)
             except Exception as close_e:
-                print(f"Warning on closing MCP Client: {close_e}")
+                logger.warning("Error closing MCP client: %s", close_e)
 
     async def cleanup(self):
         """Delete temporary session files and close MCP client."""
@@ -729,4 +1373,4 @@ Return ONLY a valid JSON array with one object per item, in the same order:
             try:
                 shutil.rmtree(self.temp_dir)
             except Exception as e:
-                print(f"Warning: Failed to remove temp directory: {e}")
+                logger.warning("Failed to remove temp directory %s: %s", self.temp_dir, e)

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R2R — Terms of Service</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1a1a1a; --muted:#5c5c6b; --bg:#faf9f7; --card:#fff; --line:#e4e2dd; --accent:#6366f1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#ececf1; --muted:#a1a1b0; --bg:#141416; --card:#1c1c20; --line:#2c2c33; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 20px 64px; background:var(--bg); color:var(--fg);
+         font:16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:720px; margin:0 auto; }
+  h1 { font-size:1.7rem; margin:0 0 4px; letter-spacing:-0.02em; }
+  h2 { font-size:1.15rem; margin:36px 0 8px; letter-spacing:-0.01em; }
+  .sub { color:var(--muted); margin:0 0 8px; }
+  .updated { color:var(--muted); font-size:.9rem; margin:0 0 32px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:4px 24px 20px; margin:20px 0; }
+  ul { padding-left:22px; } li { margin:5px 0; }
+  a { color:var(--accent); }
+  .note { color:var(--muted); font-size:.9rem; margin-top:36px; padding-top:16px; border-top:1px solid var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Terms of Service</h1>
+  <p class="sub">R2R &mdash; personal finance transaction analysis</p>
+  <p class="updated">Last updated: 29 August 2026</p>
+
+  <p>
+    These terms are an agreement between you and <strong>{{PUBLISHER_NAME}}</strong>
+    (&ldquo;we&rdquo;), covering your use of the R2R app. By creating an account
+    or using the app you accept them. If you do not accept them, do not use R2R.
+  </p>
+
+  <div class="card">
+    <h2 style="margin-top:16px">The two things that matter most</h2>
+    <ul>
+      <li><strong>R2R reads your documents using AI, and AI misreads things.</strong> Every figure it shows you is a machine&rsquo;s best reading of a photograph or a file. Check anything you intend to rely on.</li>
+      <li><strong>R2R is not financial advice.</strong> It describes what you have spent. It does not tell you what to do about it.</li>
+    </ul>
+  </div>
+
+  <h2>1. What R2R does</h2>
+  <p>
+    R2R lets you upload bank statement exports and photograph receipts and price
+    tags, reads them using an AI provider that you connect, and lets you search
+    and ask questions about the result. It is a record-keeping and analysis tool.
+  </p>
+
+  <h2>2. Eligibility</h2>
+  <p>
+    You must be at least 16 years old and able to form a binding contract. R2R is
+    for personal, non-commercial use.
+  </p>
+
+  <h2>3. Your account</h2>
+  <p>
+    You are responsible for keeping your password secure and for activity under
+    your account. Tell us promptly at
+    <a href="mailto:{{SUPPORT_EMAIL}}">{{SUPPORT_EMAIL}}</a> if you believe it has
+    been compromised. One account per email address.
+  </p>
+  <p>
+    You may delete your account at any time from Settings &rarr; Delete account.
+    Deletion is immediate and permanent &mdash; see
+    <a href="/account-deletion">/account-deletion</a>.
+  </p>
+
+  <h2>4. Your AI provider key and its costs</h2>
+  <p>
+    R2R does not include AI capacity. You supply an API key for your own account
+    with an AI provider, and the app makes requests using it. That means:
+  </p>
+  <ul>
+    <li><strong>You pay your provider</strong> for the requests R2R makes on your behalf, under whatever pricing and free-tier limits they set. We do not control, mark up, or receive any part of those charges.</li>
+    <li><strong>Your provider&rsquo;s terms apply</strong> to that usage and to whatever they do with the content sent to them. See section 2 of the <a href="/privacy">Privacy Policy</a>.</li>
+    <li><strong>You are responsible for keeping your key within its limits.</strong> Reading a receipt or answering a question costs a request; a large upload costs many. If your key is rate-limited, exhausted, revoked or invalid, those parts of the app will stop working until you fix it.</li>
+    <li>We store the key encrypted and use it only to serve your own requests.</li>
+  </ul>
+
+  <h2>5. Accuracy &mdash; what the app can and cannot promise</h2>
+  <p>
+    R2R reads photographs and files using automated extraction and AI models.
+    <strong>This process is imperfect and will sometimes be wrong.</strong> In
+    ordinary use it may misread a total, a date, a quantity or a unit; mistake a
+    product variant for a package size; assign the wrong category; or attach the
+    wrong description to an item.
+  </p>
+  <p>
+    So: the figures R2R shows are <strong>a convenience, not a record of
+    account</strong>. Your bank statement and the paper receipt remain the
+    authoritative documents. Before relying on anything from R2R &mdash; for
+    taxes, expenses, a reimbursement claim, a budget, a dispute, or any decision
+    that matters &mdash; check it against the original. R2R keeps the original
+    file and photo so you can.
+  </p>
+
+  <h2>6. Not financial advice</h2>
+  <p>
+    R2R is not a financial adviser, accountant, tax adviser, bank, or broker, and
+    nothing in it is financial, investment, tax or legal advice. Its price
+    comparisons and summaries are descriptions of your own past records, not
+    recommendations. Decisions you take are yours. Consult a qualified
+    professional where it matters.
+  </p>
+
+  <h2>7. Acceptable use</h2>
+  <p>You agree not to:</p>
+  <ul>
+    <li>upload material you have no right to upload, or another person&rsquo;s financial records without their permission;</li>
+    <li>attempt to access data belonging to another user, or to circumvent the app&rsquo;s access controls;</li>
+    <li>probe, overload, or disrupt the service, or use it to send automated bulk traffic;</li>
+    <li>use the app to break the law, or in breach of your AI provider&rsquo;s terms;</li>
+    <li>reverse engineer, resell, or redistribute the service.</li>
+  </ul>
+
+  <h2>8. Your content</h2>
+  <p>
+    What you upload stays yours. You grant us only the permission needed to run
+    the service for you &mdash; storing your files, processing them, and sending
+    the relevant parts to your chosen AI provider so it can read them. We claim no
+    ownership and make no other use of it. This permission ends when you delete
+    the content or your account.
+  </p>
+
+  <h2>9. Availability</h2>
+  <p>
+    R2R is provided as-is and may be unavailable, interrupted, or changed at any
+    time. We do not guarantee uptime and may modify or discontinue features. We
+    will give reasonable notice before discontinuing the service entirely, so you
+    can export or delete your data.
+  </p>
+
+  <h2>10. Disclaimer of warranties</h2>
+  <p>
+    To the fullest extent permitted by law, R2R is provided <strong>&ldquo;as is&rdquo;
+    and &ldquo;as available&rdquo;</strong>, without warranties of any kind,
+    express or implied, including merchantability, fitness for a particular
+    purpose, non-infringement, and any warranty that the app&rsquo;s output will
+    be accurate, complete, or uninterrupted.
+  </p>
+
+  <h2>11. Limitation of liability</h2>
+  <p>
+    To the fullest extent permitted by law, we are not liable for indirect,
+    incidental, special, consequential or punitive damages, nor for lost profits,
+    lost data, or costs arising from decisions made in reliance on the app&rsquo;s
+    output, or from charges incurred with your AI provider.
+  </p>
+  <p>
+    Nothing in these terms excludes liability that cannot lawfully be excluded
+    &mdash; including for death or personal injury caused by negligence, or for
+    fraud &mdash; and if you are a consumer, your statutory rights are unaffected.
+  </p>
+
+  <h2>12. Termination</h2>
+  <p>
+    You may stop using R2R and delete your account at any time. We may suspend or
+    terminate an account that breaches these terms, or where required by law,
+    giving notice where it is reasonable to do so.
+  </p>
+
+  <h2>13. Changes to these terms</h2>
+  <p>
+    We may update these terms. The date at the top will change, and for material
+    changes we will notify you in the app before they take effect. Continuing to
+    use R2R afterwards means you accept the revised terms.
+  </p>
+
+  <h2>14. Governing law</h2>
+  <p>
+    These terms are governed by the laws of
+    the State of Connecticut, USA,
+    and the courts there have non-exclusive jurisdiction. If you are a consumer,
+    you keep the protection of the mandatory laws of the country where you live.
+  </p>
+
+  <h2>15. Contact</h2>
+  <p>
+    {{PUBLISHER_NAME}} &mdash;
+    <a href="mailto:{{SUPPORT_EMAIL}}">{{SUPPORT_EMAIL}}</a>
+  </p>
+
+  <p class="note">
+    See also the <a href="/privacy">Privacy Policy</a> and the
+    <a href="/account-deletion">account deletion instructions</a>.
+  </p>
+</main>
+</body>
+</html>

@@ -1,56 +1,20 @@
-import { Platform } from "react-native";
-import Constants from "expo-constants";
 import { getSupabase } from "../lib/supabase";
 import { createLogger } from "../lib/logger";
+import { API_URL } from "../lib/apiUrl";
 
 const log = createLogger("API");
 
-function getApiUrl(): string {
-  const envUrl = process.env.EXPO_PUBLIC_API_URL;
-  log.debug("getApiUrl called", { envUrl, platform: Platform.OS });
-
-  if (Platform.OS === "web") {
-    // If an explicit API URL is set (local dev or separate Docker containers), use it.
-    // Otherwise fall back to a relative path (single-container / HF Spaces).
-    const url = envUrl || "/api/v1";
-    log.info("Web platform API URL", { url });
-    return url;
-  }
-
-  // Native: if explicitly set to a non-localhost URL, use it as-is
-  if (envUrl && !envUrl.includes("localhost")) {
-    log.info("Using env API URL (non-localhost)", { url: envUrl });
-    return envUrl;
-  }
-
-  if (Platform.OS === "android") {
-    // Android emulator uses 10.0.2.2 to reach the host machine
-    const url = "http://10.0.2.2:8000/api/v1";
-    log.info("Android emulator API URL", { url });
-    return url;
-  }
-
-  // iOS: extract LAN IP from Expo's dev server hostUri
-  const debuggerHost = Constants.expoConfig?.hostUri?.split(":")[0];
-  if (debuggerHost) {
-    const url = `http://${debuggerHost}:8000/api/v1`;
-    log.info("iOS API URL from hostUri", { debuggerHost, url });
-    return url;
-  }
-
-  const url = envUrl || "http://localhost:8000/api/v1";
-  log.info("Fallback API URL", { url });
-  return url;
-}
-
-export const API_URL = getApiUrl();
+// Re-exported so the many `import { API_URL } from "./api"` call sites keep
+// working; the value itself is resolved in lib/apiUrl.ts, which imports nothing
+// from here so that supabase.ts can use it without creating a require cycle.
+export { API_URL };
 
 /**
  * Get the current access token from the Supabase session.
  * Uses getSession() for the local cache, or refreshSession() to force
  * a server-side refresh when the cached token has been rejected.
  */
-async function getAccessToken(forceRefresh = false): Promise<string | null> {
+export async function getAccessToken(forceRefresh = false): Promise<string | null> {
   try {
     const supabase = await getSupabase();
     if (forceRefresh) {
@@ -87,12 +51,14 @@ export async function apiFetch(
     isFormData: options.body instanceof FormData,
   });
 
+  const isFormData = options.body instanceof FormData;
+
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string>),
   };
 
-  // Don't set Content-Type for FormData (browser sets boundary automatically)
-  if (!(options.body instanceof FormData)) {
+  // Don't set Content-Type for FormData (the runtime sets the multipart boundary)
+  if (!isFormData) {
     headers["Content-Type"] = "application/json";
   }
 
@@ -103,15 +69,21 @@ export async function apiFetch(
   const url = `${API_URL}${path}`;
   log.debug("Full request URL", { url });
 
-  const controller = new AbortController();
+  // React Native's fetch aborts multipart file uploads when an AbortSignal is
+  // attached — it fails immediately with "Network request failed". So we only
+  // wire up the timeout/abort for non-FormData requests; uploads run untimed.
   const timeoutMs = options.timeout || 5000;
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const controller = isFormData ? null : new AbortController();
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  const signal = controller?.signal;
 
   try {
     const res = await fetch(url, {
       ...options,
       headers,
-      signal: controller.signal,
+      signal,
     });
 
     log.info(`${method} ${path} -> ${res.status}`, {
@@ -120,7 +92,7 @@ export async function apiFetch(
       ok: res.ok,
     });
 
-    clearTimeout(timeoutId);
+    if (timeoutId) clearTimeout(timeoutId);
 
     // On 401, try once with a refreshed token before giving up
     if (res.status === 401 && token) {
@@ -129,7 +101,7 @@ export async function apiFetch(
       if (freshToken && freshToken !== token) {
         log.info("Got fresh token - retrying request");
         const retryHeaders = { ...headers, Authorization: `Bearer ${freshToken}` };
-        const retryRes = await fetch(url, { ...options, headers: retryHeaders, signal: controller.signal });
+        const retryRes = await fetch(url, { ...options, headers: retryHeaders, signal });
         log.info(`${method} ${path} retry -> ${retryRes.status}`);
         return retryRes;
       }
@@ -138,7 +110,7 @@ export async function apiFetch(
 
     return res;
   } catch (error: any) {
-    clearTimeout(timeoutId);
+    if (timeoutId) clearTimeout(timeoutId);
     if (error.name === "AbortError") {
       log.error(`${method} ${path} TIMEOUT (${timeoutMs}ms)`);
       throw new Error("Request timed out — is the backend server running?");
