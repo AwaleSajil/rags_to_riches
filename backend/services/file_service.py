@@ -8,7 +8,7 @@ from typing import List
 from backend.dependencies import client_for, get_supabase
 from backend.db_client import get_db_client
 from backend.services.rag_manager import rag_manager
-from backend.services.upload_utils import content_type_for, file_sha256, is_image
+from backend.services.upload_utils import content_type_for, file_sha256, is_image, storage_key
 from backend.services import background, config_service
 
 logger = logging.getLogger("moneyrag.services.file_service")
@@ -101,7 +101,6 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
             filename = file_info["filename"]
             image = is_image(filename)
             folder = "bills" if image else "csvs"
-            s3_key = f"{user['id']}/{folder}/{filename}"
 
             # Both kinds. A duplicate CSV writes every transaction a second
             # time; a duplicate photo pays for a second vision extraction and
@@ -131,6 +130,10 @@ def _upload_to_storage_sync(user: dict, saved_files: List[dict]) -> tuple[list, 
                 continue
 
             content_type = content_type_for(filename)
+            # Keyed on the bytes as well as the name — see storage_key. Built
+            # here rather than above because it needs the hash, which the
+            # duplicate check above computes.
+            s3_key = storage_key(user["id"], folder, filename, content_hash)
 
             logger.debug(
                 "Uploading '%s' to storage — s3_key=%s, content_type=%s",

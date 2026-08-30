@@ -28,17 +28,44 @@ interface Props {
   place?: string | null;
 }
 
-/** "12 OZ" -> { size_value: 12, size_unit: "oz" }. Returns {} when
- *  the text holds no usable number, so a blank field clears nothing. */
-function splitSize(text: string): {
-  size_value?: number | null;
-  size_unit?: string | null;
-} {
-  const match = text.trim().match(/^([\d.]+)\s*([a-zA-Z]+)?$/);
-  if (!match) return {};
+/**
+ * "12 OZ" -> { size_value: 12, size_unit: "oz" }.
+ *
+ * The unit may be several words. A single-word pattern refused "12 fl oz" and
+ * the old caller answered a refusal by keeping whatever the tag had been read
+ * as — so correcting a milk tag from a WEIGHT to a VOLUME looked accepted and
+ * changed nothing. Mass and volume are exactly the pair units.py will never
+ * convert between, which makes that the one correction that most needed to
+ * land.
+ *
+ * Three outcomes, kept apart because the caller must treat them differently:
+ * an empty box is a deliberate "no size" and clears the field; text that does
+ * not parse is a typo the user has to see, not something to silently discard.
+ */
+type SizeEdit =
+  | { kind: "cleared" }
+  | { kind: "parsed"; size_value: number; size_unit: string | null }
+  | { kind: "unreadable" };
+
+function splitSize(text: string): SizeEdit {
+  const trimmed = text.trim();
+  if (!trimmed) return { kind: "cleared" };
+  const match = trimmed.match(/^([\d.]+)\s*([a-zA-Z][a-zA-Z\s.]*)?$/);
+  if (!match) return { kind: "unreadable" };
   const quantity = parseFloat(match[1]);
-  if (!isFinite(quantity) || quantity <= 0) return {};
-  return { size_value: quantity, size_unit: match[2]?.toLowerCase() ?? null };
+  if (!isFinite(quantity) || quantity <= 0) return { kind: "unreadable" };
+  // "FL  OZ" and "fl oz" are one unit; units.py keys on the collapsed form.
+  const unit = match[2]?.trim().replace(/\s+/g, " ").toLowerCase() || null;
+  return { kind: "parsed", size_value: quantity, size_unit: unit };
+}
+
+/** The size fields to send, or null when the text is not usable. */
+function sizeFields(text: string) {
+  const edit = splitSize(text);
+  if (edit.kind === "unreadable") return null;
+  return edit.kind === "cleared"
+    ? { size_value: null, size_unit: null }
+    : { size_value: edit.size_value, size_unit: edit.size_unit };
 }
 
 /** One tag's editable state. */
@@ -120,6 +147,15 @@ export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk,
         setError(`Tag ${index + 1} needs the price shown on the tag.`);
         return;
       }
+      // Said out loud rather than dropped. An unparseable size used to leave
+      // the OCR's own reading in place, so the box showed one thing and the
+      // row saved another.
+      if (sizeFields(row.size) === null) {
+        setError(
+          `Tag ${index + 1}: write the size as a number and a unit, like "12 oz" or "1 gal". Leave it empty if the tag shows none.`
+        );
+        return;
+      }
     }
 
     setStatus("saving");
@@ -140,8 +176,8 @@ export function PriceTagConfirmCard({ fileId, tags, onConfirm, onDiscard, onAsk,
           item_subtotal_price: parseFloat(row.price),
           // Split back into a number and its unit: the tag printed them together
           // ("12 OZ") and the row stores them apart so a shelf tag and a receipt
-          // line hold the same shape.
-          ...splitSize(row.size),
+          // line hold the same shape. Validated above, so this cannot be null.
+          ...(sizeFields(row.size) ?? {}),
           merchant_name: row.merchant.trim() || null,
           location: place || null,
         };

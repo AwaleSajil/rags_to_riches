@@ -461,9 +461,15 @@ def price_weight(
 ) -> float:
     """How much a record from `observed_on` should count, in [0, 1].
 
-    Exponential decay: 1.0 today, 0.5 at one half-life, 0.25 at two. Records
-    with an unreadable or missing date get the floor rather than being dropped —
-    they are still evidence, just the weakest kind.
+    Exponential decay: 1.0 today, 0.5 at one half-life, 0.25 at two.
+
+    A record with an unreadable or missing date weighs 0, which
+    `weighted_baseline` treats as "leave it out". That is deliberate and the
+    docstring used to claim the opposite: recency weighting is the whole
+    mechanism here, and a record that cannot be placed in time cannot be
+    discounted for age — including it at some invented floor would let an
+    undated row shape "what you typically pay" while pretending to have been
+    weighed. It is still SHOWN as evidence; it just does not vote.
     """
     when = _as_date(observed_on)
     if when is None:

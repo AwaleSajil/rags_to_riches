@@ -54,6 +54,13 @@ async def create_capture(
     except ValueError as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        # Anything else — a failed config read, a storage error — means no
+        # background task was ever spawned, so nobody is left holding these
+        # bytes and they would otherwise sit on disk until the container
+        # restarted. Re-raised so the global handler still logs and formats it.
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     # No cleanup on the success path: reading the photo now happens AFTER this
     # response, and the background task still needs these bytes. It removes the
     # directory itself when it finishes.

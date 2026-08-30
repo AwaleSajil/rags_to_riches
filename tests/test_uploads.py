@@ -10,7 +10,7 @@ import io
 import pytest
 
 from backend.routers.files import ALLOWED_EXTENSIONS, MAX_UPLOAD_BYTES, _safe_filename
-from backend.services.upload_utils import content_type_for, is_image
+from backend.services.upload_utils import content_type_for, is_image, storage_key
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -375,3 +375,47 @@ def test_the_lookup_is_scoped_to_the_right_table():
 
     assert DatabaseClient.file_by_content_hash(object(), "BillFile", "u", "") is None
     assert DatabaseClient.file_by_content_hash(object(), "CSVFile", "u", "") is None
+
+
+# --- where the bytes go -------------------------------------------------------
+#
+# The display name was the whole storage key, and the upload uses upsert. Two
+# different files sharing a name therefore overwrote each other's BYTES while
+# each got its own row — and both rows then named one object, so deleting either
+# took the other's file with it. Byte-identical uploads never reach this (they
+# are turned away by content hash first), so every collision here was two
+# genuinely different files.
+
+USER = "11111111-2222-3333-4444-555555555555"
+HASH_A = "a" * 64
+HASH_B = "b" * 64
+
+
+def test_same_name_different_bytes_get_different_keys():
+    """Two receipts both called IMG_0001.jpg, or two banks both exporting
+    activity.csv — the common case, and the one that used to destroy data."""
+    assert storage_key(USER, "bills", "IMG_0001.jpg", HASH_A) != storage_key(
+        USER, "bills", "IMG_0001.jpg", HASH_B
+    )
+
+
+def test_the_same_file_keeps_the_same_key():
+    """Identical bytes are the one case where sharing an object is correct."""
+    assert storage_key(USER, "bills", "IMG_0001.jpg", HASH_A) == storage_key(
+        USER, "bills", "IMG_0001.jpg", HASH_A
+    )
+
+
+def test_keys_stay_scoped_to_the_user_and_folder():
+    key = storage_key(USER, "csvs", "statement.csv", HASH_A)
+    assert key.startswith(f"{USER}/csvs/")
+    # The name survives in the key, so an object is still recognisable in the
+    # bucket without joining back to the row.
+    assert key.endswith("statement.csv")
+
+
+def test_two_users_uploading_the_same_file_do_not_share_an_object():
+    other = "99999999-8888-7777-6666-555555555555"
+    assert storage_key(USER, "bills", "r.jpg", HASH_A) != storage_key(
+        other, "bills", "r.jpg", HASH_A
+    )

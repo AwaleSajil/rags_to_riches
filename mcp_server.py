@@ -781,8 +781,14 @@ def check_price(
                 {
                     "item_description": item_description,
                     "brand_name": brand_name,
-                    "item_quantity": quantity,
-                    "item_quantity_unit": quantity_unit,
+                    # The names migration 034 gave these. They were still
+                    # spelled item_quantity/item_quantity_unit here, which
+                    # record_observation does not read, so every price the agent
+                    # recorded was stored with no size AND embedded without one —
+                    # the exact 12oz-jar-equals-64oz-jar collapse the confirm
+                    # card path was fixed for.
+                    "size_value": quantity,
+                    "size_unit": quantity_unit,
                     "item_subtotal_price": shelf_price,
                     "merchant_name": merchant_name,
                     "item_qualitative_description": tag_says,

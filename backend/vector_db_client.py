@@ -133,6 +133,47 @@ def observation_document(row: Dict[str, Any]) -> str:
     )
 
 
+def observation_metadata(row: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """The metadata a retrieved shelf price travels with.
+
+    Named rather than inlined because its READER is in another module —
+    price_service.compare_price and _is_the_same_sighting — and the two drifted
+    silently: the guard that stops a sighting being quoted back as evidence
+    about itself keys on "description", which this never emitted, so it compared
+    "" against a real name and answered False every single time. A dict literal
+    buried in a SQL loop cannot be tested against its consumer; this can.
+    """
+    return {
+        "id": str(row["id"]),
+        "user_id": user_id,
+        "vector_type": "price_observation",
+        # The item as recorded — see above.
+        "description": row["item_description"],
+        # The shelf price, NOT money spent. Named apart from "amount" on
+        # purpose: a caller that sums `amount` across results must not pick
+        # this up and call it spending.
+        "shelf_price": (
+            float(row["item_subtotal_price"])
+            if row["item_subtotal_price"] is not None else None
+        ),
+        "merchant_name": row["merchant_name"],
+        "location": row["location"],
+        "observed_on": str(row["created_at"]),
+        "size_value": float(row["size_value"]) if row["size_value"] is not None else None,
+        "size_unit": row["size_unit"],
+        "unit_price": (
+            float(row["unit_quantity_subtotal"])
+            if row["unit_quantity_subtotal"] is not None else None
+        ),
+        # The tag's own words — offers, sale end dates, damage. Carried through
+        # because a price without them is routinely misread as what the item
+        # normally costs.
+        "tag_says": row["item_qualitative_description"],
+        "note": row["note"],
+        "score": float(row["score"]),
+    }
+
+
 # What a search may look in. Three separate corpora because they answer
 # different questions and mixing them silently is how a shelf price ends up
 # quoted as something the user bought.
@@ -373,33 +414,7 @@ class VectorDBClient:
             ).mappings():
                 results.append({
                     "page_content": observation_document(dict(row)),
-                    "metadata": {
-                        "id": str(row["id"]),
-                        "user_id": user_id,
-                        "vector_type": "price_observation",
-                        # The shelf price, NOT money spent. Named apart from
-                        # "amount" on purpose: a caller that sums `amount` across
-                        # results must not pick this up and call it spending.
-                        "shelf_price": (
-                            float(row["item_subtotal_price"])
-                            if row["item_subtotal_price"] is not None else None
-                        ),
-                        "merchant_name": row["merchant_name"],
-                        "location": row["location"],
-                        "observed_on": str(row["created_at"]),
-                        "size_value": float(row["size_value"]) if row["size_value"] is not None else None,
-                        "size_unit": row["size_unit"],
-                        "unit_price": (
-                            float(row["unit_quantity_subtotal"])
-                            if row["unit_quantity_subtotal"] is not None else None
-                        ),
-                        # The tag's own words — offers, sale end dates, damage.
-                        # Carried through because a price without them is
-                        # routinely misread as what the item normally costs.
-                        "tag_says": row["item_qualitative_description"],
-                        "note": row["note"],
-                        "score": float(row["score"]),
-                    },
+                    "metadata": observation_metadata(dict(row), user_id),
                 })
 
         results.sort(key=lambda r: r["metadata"]["score"], reverse=True)

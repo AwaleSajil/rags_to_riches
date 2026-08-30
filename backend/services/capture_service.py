@@ -32,7 +32,7 @@ from typing import Optional
 
 from backend.dependencies import client_for, get_supabase
 from backend.services import background, config_service
-from backend.services.upload_utils import content_type_for, file_sha256
+from backend.services.upload_utils import content_type_for, file_sha256, storage_key
 
 logger = logging.getLogger("moneyrag.services.capture")
 
@@ -172,7 +172,11 @@ def _billfile_by_hash_sync(user: dict, content_hash: str) -> Optional[dict]:
 def _upload_photo_sync(user: dict, local_path: str, filename: str) -> str:
     """Put the photo in storage and create its BillFile row. Returns file_id."""
     client = client_for(user)
-    s3_key = f"{user['id']}/bills/{filename}"
+    # Hashed once and used twice: the key it goes under and the fingerprint that
+    # stops it being uploaded again. Two photos named alike used to share a key
+    # and overwrite each other — see upload_utils.storage_key.
+    content_hash = file_sha256(local_path)
+    s3_key = storage_key(user["id"], "bills", filename, content_hash)
 
     client.storage.from_("money-rag-files").upload(
         file=local_path,
@@ -187,7 +191,7 @@ def _upload_photo_sync(user: dict, local_path: str, filename: str) -> str:
         # Fingerprint of the bytes, so this photo cannot be uploaded again. The
         # batch path records it too; without it here, a photo captured in chat
         # would never be recognised on a second attempt.
-        "content_hash": file_sha256(local_path),
+        "content_hash": content_hash,
         # Set once the vision model has looked at it; 'unknown' until then so a
         # crash mid-classification leaves a row that prompts rather than one
         # that silently claims to be a receipt.

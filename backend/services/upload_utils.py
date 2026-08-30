@@ -123,6 +123,28 @@ async def save_within_limit(upload: UploadFile, destination: str) -> int:
     return total
 
 
+def storage_key(user_id: str, folder: str, filename: str, content_hash: str) -> str:
+    """Where this file's bytes live in the bucket.
+
+    The content hash is in the KEY, not just the row, because the display name
+    is not unique and was being used as the key on its own. Two different files
+    sharing a name — `IMG_0001.jpg` picked from a gallery twice, a bank that
+    always exports `activity.csv` — collided, and the upload uses upsert, so the
+    second one overwrote the first one's BYTES while creating a second row
+    pointing at the same object. The first receipt then showed the second
+    receipt's photo, and deleting either row removed the object both rows named.
+
+    Byte-identical uploads are turned away before this is reached
+    (`file_by_content_hash`), so an identical hash here cannot be a collision
+    between two different files — it is the same file, and sharing one object is
+    then correct.
+
+    Rows written before this keep whatever key they were given: every read goes
+    through the stored `s3_key`, so old and new coexist without a migration.
+    """
+    return f"{user_id}/{folder}/{content_hash[:16]}_{filename}"
+
+
 def file_sha256(path: str) -> str:
     """Fingerprint a saved upload by its bytes.
 
