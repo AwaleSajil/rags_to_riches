@@ -80,22 +80,32 @@ jobs:
       cancel-in-progress: false
 
     env:
-      APP_DIR: ${{ vars.DEPLOY_APP_DIR }}
       IMAGE: rags2riches
       CONTAINER: rags2riches
       PORT_BIND: 127.0.0.1:7860:7860
+      # Absolute path to the production .env ON THE VM, outside any checkout.
+      # It holds APP_ENCRYPTION_KEY and SUPABASE_SERVICE_KEY, so it lives where
+      # only the runner user can read it and is never committed.
+      ENV_FILE: ${{ vars.DEPLOY_ENV_FILE }}
 
     steps:
-      - name: Build and start the pushed commit
+      # Builds from the runner's own workspace rather than a checkout shared
+      # with a human user. That avoids the permission problem entirely — a repo
+      # under /home/<someone> is unreadable to the runner because Ubuntu ships
+      # home directories at 750 — and it keeps working if this repository is
+      # ever made private, because the action authenticates and a bare
+      # `git fetch` in a foreign checkout would not.
+      - uses: actions/checkout@v5
+
+      - name: Build and start this commit
         run: |
           set -euo pipefail
-          cd "$APP_DIR"
 
-          # Deploy the exact commit that triggered this run, not whatever main
-          # happens to be by the time the runner gets here.
-          git fetch --prune origin
-          git checkout -q main
-          git reset --hard "$GITHUB_SHA"
+          # Fail here rather than three minutes later after a pointless build.
+          if [ -z "${ENV_FILE:-}" ] || [ ! -r "$ENV_FILE" ]; then
+            echo "DEPLOY_ENV_FILE is unset or unreadable by this runner: '${ENV_FILE:-}'"
+            exit 1
+          fi
 
           # Tag what is live now, before it is overwritten. This is the only
           # thing that makes the rollback step below possible.
@@ -106,15 +116,15 @@ jobs:
             echo "Tagged current image as $ROLLBACK"
           fi
 
-          # --no-cache because stage 1 runs `expo export`: a cached layer here
-          # ships a stale web bundle with a fresh backend, which is precisely
-          # the failure that broke signup in production once already.
+          # --no-cache because stage 1 runs `expo export`: a cached layer ships
+          # a stale web bundle behind a fresh backend, which is precisely the
+          # failure that broke signup in production once already.
           docker build --no-cache -t "$IMAGE:latest" .
 
           docker stop "$CONTAINER" || true
           docker rm "$CONTAINER" || true
           docker run -d --name "$CONTAINER" --restart unless-stopped \
-            --env-file .env -p "$PORT_BIND" "$IMAGE:latest"
+            --env-file "$ENV_FILE" -p "$PORT_BIND" "$IMAGE:latest"
 
       - name: Wait for readiness
         run: |
@@ -141,7 +151,7 @@ jobs:
           docker stop "$CONTAINER" || true
           docker rm "$CONTAINER" || true
           docker run -d --name "$CONTAINER" --restart unless-stopped \
-            --env-file .env -p "$PORT_BIND" "$ROLLBACK_TAG"
+            --env-file "$ENV_FILE" -p "$PORT_BIND" "$ROLLBACK_TAG"
           # Deliberately not gated on readiness: this image was serving traffic
           # a few minutes ago, and a failed rollback needs a human either way.
 
