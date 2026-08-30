@@ -1,3 +1,4 @@
+import * as Linking from "expo-linking";
 import { getSupabase } from "../lib/supabase";
 import { apiJson } from "./api";
 import { createLogger } from "../lib/logger";
@@ -66,9 +67,13 @@ export async function register(
     email: normalizedEmail,
     password,
     options: {
-      // The standalone Android app owns this scheme (declared in app.config.js).
-      // Supabase must allow r2r://** as an Auth redirect URL before release.
-      emailRedirectTo: "r2r://auth/callback",
+      // Resolves per platform rather than being hardcoded: r2r://auth/callback
+      // in a standalone build (the scheme is declared in app.config.js), and the
+      // dev-server or deployed origin on web, where a r2r:// link is something
+      // the browser cannot open at all. Every form this returns has to be on
+      // Supabase's Auth redirect allow-list, or the link silently falls back to
+      // site_url and the app never sees the tokens.
+      emailRedirectTo: Linking.createURL("auth/callback"),
     },
   });
 
@@ -85,6 +90,21 @@ export async function register(
     userId: data.user.id,
     email: data.user.email,
   });
+
+  // Supabase deliberately answers a signup for an existing address with a
+  // success response and no email, so that nobody can probe this endpoint to
+  // discover which addresses have accounts. The tell is an empty identities
+  // array, which never happens on a genuine new signup. Without this branch the
+  // caller is told to check an inbox that will never receive anything, and the
+  // only way to find out otherwise is to read the auth logs.
+  if (data.user.identities?.length === 0) {
+    log.info("Signup for an address that already has an account", {
+      email: normalizedEmail,
+    });
+    return {
+      message: "An account already exists for this email. Try signing in instead.",
+    };
+  }
 
   // With Confirm Email enabled, Supabase deliberately returns no session until
   // the recipient follows the verification link. There is no Bearer token yet,
