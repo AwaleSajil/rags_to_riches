@@ -22,6 +22,10 @@ module.exports = {
   expo: {
     name: "R2R",
     slug: "r2r",
+    // The EAS account that owns the project named below. Explicit so a build
+    // from CI, or from a machine logged in as someone else, resolves to the
+    // same project instead of silently creating another one.
+    owner: "sajilawale",
     version: "1.0.0",
     orientation: "portrait",
     icon: "./assets/icon.png",
@@ -61,6 +65,20 @@ module.exports = {
       // in API 28, but being explicit means a manifest merge from some library
       // cannot quietly turn it back on.
       usesCleartextTraffic: allowCleartext,
+    },
+    // Links this repo to the EAS project that builds it. Without it, `eas build`
+    // has to ask which project it belongs to, which makes a non-interactive or
+    // CI-run build impossible. It is an identifier, not a secret — it names a
+    // project, and building against it still requires an authenticated account
+    // with access.
+    //
+    // Set by hand rather than by `eas init`: that command writes into app.json,
+    // and this project uses app.config.js so the cleartext-HTTP switch above can
+    // be conditional.
+    extra: {
+      eas: {
+        projectId: "fd0cf30d-5b69-432c-811c-24f30b340342",
+      },
     },
     web: {
       favicon: "./assets/favicon.png",
