@@ -96,6 +96,14 @@ jobs:
       # ever made private, because the action authenticates and a bare
       # `git fetch` in a foreign checkout would not.
       - uses: actions/checkout@v5
+        with:
+          # .gitattributes puts *.png in Git LFS, and checkout does not fetch
+          # LFS objects unless asked. Without this the runner gets pointer text
+          # files where the app icons should be, and `expo export` dies inside
+          # Jimp with "Could not find MIME for Buffer <null>" — a message that
+          # says nothing about LFS. Manual builds on the VM never hit it,
+          # because that clone has the real files.
+          lfs: true
 
       - name: Build and start this commit
         run: |
