@@ -105,6 +105,30 @@ jobs:
           # because that clone has the real files.
           lfs: true
 
+      # `lfs: true` fetches the objects into .git/lfs, which is not the same as
+      # writing them into the working tree. This runner reuses its workspace,
+      # and the first run cloned before LFS was configured — so the PNGs were
+      # written as pointer stubs, and no later checkout rewrote them because
+      # their content had not changed between commits. Fetched objects, stub
+      # files, and `expo export` dying inside Jimp on a text file it was told
+      # was an image.
+      #
+      # `git lfs pull` is fetch plus checkout, and is idempotent, so it costs
+      # nothing on a workspace that is already correct.
+      - name: Materialise LFS files
+        run: |
+          set -euo pipefail
+          git lfs pull
+          # Fail here, loudly, rather than three minutes later inside a Docker
+          # build with an error message that never mentions LFS.
+          if ! file frontend/assets/favicon.png | grep -q 'PNG image'; then
+            echo "LFS files are still pointer stubs after git lfs pull:"
+            file frontend/assets/*.png
+            exit 1
+          fi
+          echo "LFS assets materialised:"
+          file frontend/assets/*.png
+
       - name: Build and start this commit
         run: |
           set -euo pipefail
