@@ -62,6 +62,20 @@ module.exports = {
       // cannot quietly turn it back on.
       usesCleartextTraffic: allowCleartext,
     },
+    // Links this repo to the EAS project that builds it. Without it, `eas build`
+    // has to ask which project it belongs to, which makes a non-interactive or
+    // CI-run build impossible. It is an identifier, not a secret — it names a
+    // project, and building against it still requires an authenticated account
+    // with access.
+    //
+    // Set by hand rather than by `eas init`: that command writes into app.json,
+    // and this project uses app.config.js so the cleartext-HTTP switch above can
+    // be conditional.
+    extra: {
+      eas: {
+        projectId: "5ec4b998-835a-4964-9f21-523f6a45e41a",
+      },
+    },
     web: {
       favicon: "./assets/favicon.png",
       bundler: "metro",
