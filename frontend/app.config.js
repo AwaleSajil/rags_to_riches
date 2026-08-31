@@ -73,6 +73,14 @@ module.exports = {
         {
           cameraPermission:
             "Allow R2R to access your camera to capture receipts and documents.",
+          // expo-camera adds RECORD_AUDIO on Android by default, for video
+          // capture this app does not do — it photographs receipts. Shipping it
+          // would put a microphone permission on the Play listing of a personal
+          // finance app, and require declaring microphone access on the Data
+          // Safety form for a capability that is never used. Both are real costs
+          // for nothing, and "why does my receipt scanner want my microphone"
+          // is a fair question with no good answer.
+          recordAudioAndroidPermission: false,
         },
       ],
       [
