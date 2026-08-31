@@ -22,6 +22,10 @@ module.exports = {
   expo: {
     name: "R2R",
     slug: "r2r",
+    // The EAS account that owns the project named below. Explicit so a build
+    // from CI, or from a machine logged in as someone else, resolves to the
+    // same project instead of silently creating another one.
+    owner: "sajilawale",
     version: "1.0.0",
     orientation: "portrait",
     icon: "./assets/icon.png",
@@ -73,7 +77,7 @@ module.exports = {
     // be conditional.
     extra: {
       eas: {
-        projectId: "5ec4b998-835a-4964-9f21-523f6a45e41a",
+        projectId: "fd0cf30d-5b69-432c-811c-24f30b340342",
       },
     },
     web: {
