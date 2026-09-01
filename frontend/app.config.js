@@ -61,6 +61,18 @@ module.exports = {
       },
       softwareKeyboardLayoutMode: "pan",
       package: "com.r2r.app",
+      // expo-camera declares RECORD_AUDIO in its OWN library manifest, and
+      // Gradle's manifest merger pulls that into the app no matter what the
+      // config plugin does — recordAudioAndroid: false below only stops the
+      // plugin ADDING it, which is a different layer. blockedPermissions emits
+      // tools:node="remove", which is what actually strips a permission a
+      // dependency contributed.
+      //
+      // Verified by reading the built bundle, not the config:
+      //   unzip -p build.aab base/manifest/AndroidManifest.xml \
+      //     | strings | grep RECORD_AUDIO
+      // Two earlier attempts looked correct and shipped the permission anyway.
+      blockedPermissions: ["android.permission.RECORD_AUDIO"],
       // Explicitly false rather than omitted: Android's default flipped to false
       // in API 28, but being explicit means a manifest merge from some library
       // cannot quietly turn it back on.
