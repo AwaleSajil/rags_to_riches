@@ -57,6 +57,58 @@ export function CameraCapture({
     };
   }, [visible]);
 
+  // Web has no viewfinder here, and building one with getUserMedia would mean a
+  // second permission prompt, a second capture UI to maintain, and Safari's long
+  // tail of quirks. The browser's own file input already does the job: on a
+  // phone, capture="environment" opens the rear camera directly; on a desktop,
+  // which has nothing to capture with, it falls back to the file picker.
+  //
+  // That distinction matters because Platform.OS === "web" covers both a phone
+  // in Safari and a laptop, and they want different things. Declaring the intent
+  // and letting the browser decide is what gets both right without sniffing the
+  // user agent.
+  useEffect(() => {
+    if (Platform.OS !== "web" || !visible) return;
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.setAttribute("capture", "environment");
+    input.style.display = "none";
+
+    const finish = () => {
+      input.remove();
+      onClose();
+    };
+
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return finish();
+      onCapture(
+        {
+          // A blob URL, which compressImage already reads on web — byteSize
+          // fetches it directly rather than going through FileSystem.
+          uri: URL.createObjectURL(file),
+          name: file.name || `receipt_${Date.now()}.jpg`,
+          type: file.type || "image/jpeg",
+        },
+        // placeName returns null on web by design, so a capture made here never
+        // carries a shop location. Passing null is the honest value, not a gap.
+        null
+      );
+      finish();
+    };
+
+    // Dismissing a file dialog fires no change event. Without this the caller
+    // would sit with visible=true and nothing on screen, needing a reload.
+    input.oncancel = finish;
+
+    document.body.appendChild(input);
+    input.click();
+
+    return () => input.remove();
+  }, [visible, onCapture, onClose]);
+
   const enableLocation = useCallback(async () => {
     const allowed = await requestPlacePermission();
     setLocationAllowed(allowed);
@@ -99,6 +151,8 @@ export function CameraCapture({
     setFlash((prev) => (prev === "off" ? "on" : "off"));
   };
 
+  // Nothing to render on web: the effect above drives the browser's own file
+  // dialog, which is the entire UI there.
   if (Platform.OS === "web") {
     return null;
   }
