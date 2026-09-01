@@ -18,7 +18,12 @@ openai>=2.15.0
 
 # --- MCP & Tooling ---
 fastmcp>=2.14.3
-mcp>=1.25.0
+# Capped below 2.0 deliberately. mcp 2.x removed RequestContext from
+# mcp.shared.context, and both fastmcp and langchain-mcp-adapters import it —
+# so an unbounded requirement turned every CI run red overnight without a line
+# of this project's code changing. Raise the cap only alongside versions of
+# those two that support 2.x.
+mcp>=1.25.0,<2
 # langchain-mcp>=0.2.1
 langchain-mcp-adapters>=0.2.1
 ddgs>=7.0.0
