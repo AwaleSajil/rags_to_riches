@@ -98,7 +98,7 @@ module.exports = {
           // Safety form for a capability that is never used. Both are real costs
           // for nothing, and "why does my receipt scanner want my microphone"
           // is a fair question with no good answer.
-          recordAudioAndroidPermission: false,
+          recordAudioAndroid: false,
         },
       ],
       [
